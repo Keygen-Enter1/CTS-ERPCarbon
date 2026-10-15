@@ -80,8 +80,8 @@ wait_healthy() {
 }
 
 wait_healthy postgres 60
-# storage-api creates the storage schema (storage.buckets) before Carbon migrations insert buckets.
 wait_healthy storage 60
+bash "$ROOT/wait-for-service-schemas.sh" 120
 
 echo "Running migrations…"
 docker compose $COMPOSE --profile migrate run --rm migrate
