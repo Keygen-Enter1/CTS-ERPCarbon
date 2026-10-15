@@ -1,0 +1,26 @@
+# Overlay: publish Carbon on host ports in the 30xxx range (same numbering as local dev).
+# Use when 80/443 are already taken by another reverse proxy on this VPS.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.publish-30xxx.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.publish-30xxx.yml --scale caddy=0 up -d
+#
+# Bind to 127.0.0.1 so only the host's nginx/Caddy/Traefik can reach the apps.
+# Change to "30000:3000" if you must hit ERP directly on the public IP (not recommended).
+
+services:
+  erp:
+    ports:
+      - "127.0.0.1:30000:3000"
+
+  mes:
+    ports:
+      - "127.0.0.1:30001:3000"
+
+  kong:
+    ports:
+      - "127.0.0.1:30003:8000"
+
+  # Optional — only if you expose Studio; keep off the public internet.
+  # studio:
+  #   ports:
+  #     - "127.0.0.1:30004:3000"

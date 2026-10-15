@@ -1,0 +1,8 @@
+# SmartSite production: 30xxx host ports + full Carbon stack.
+# TLS terminates on the host reverse proxy (not Carbon Caddy).
+#
+#   docker compose -f docker-compose.smartsite.yml --scale caddy=0 up -d
+
+include:
+  - docker-compose.yml
+  - docker-compose.publish-30xxx.yml

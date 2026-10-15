@@ -1,0 +1,75 @@
+# Carbon @ SmartSite (`*.smartsite.vn`)
+
+Production layout: **prebuilt Docker images**, **30xxx ports** on localhost, **TLS on your existing reverse proxy** (Carbon Caddy is not used).
+
+## Domains & ports
+
+| Service | Public URL | Upstream (host) |
+|---------|------------|-----------------|
+| ERP | https://erpcarbon.smartsite.vn | `127.0.0.1:30000` |
+| MES | https://mescarbon.smartsite.vn | `127.0.0.1:30001` |
+| API | https://apicarbon.smartsite.vn | `127.0.0.1:30003` |
+
+Internal only (do **not** expose on firewall): Postgres `30002`, Redis, Inngest, etc.
+
+## DNS
+
+Create **A** (or AAAA) records → IP VPS:
+
+- `erpcarbon.smartsite.vn`
+- `mescarbon.smartsite.vn`
+- `apicarbon.smartsite.vn`
+
+## 1. Local — build & push images
+
+```powershell
+# Windows (repo root)
+$env:REGISTRY = "ghcr.io/YOUR_ORG/carbon"   # or Docker Hub
+$env:TAG = "smartsite-1"
+.\contrib\deploying\vps-compose-prebuilt\build-and-push.ps1
+```
+
+## 2. VPS — first install
+
+```bash
+sudo git clone <your-repo> /opt/carbon
+cd /opt/carbon/contrib/deploying/vps-compose-prebuilt
+
+cp environments/smartsite/env.template .env
+# Edit .env: CARBON_REPO=/opt/carbon, CARBON_IMAGE_* from build output
+
+./init-secrets.sh
+# Edit secrets/smtp_password; set real SMTP in .env if using email auth
+
+chmod +x environments/smartsite/deploy-smartsite.sh init-secrets.sh
+./environments/smartsite/deploy-smartsite.sh
+```
+
+## 3. Nginx (or existing edge proxy)
+
+Copy/adapt `nginx-carbon.conf` into your nginx on the same VPS. Issue TLS certs for the three hostnames (certbot, etc.). Reload nginx.
+
+OAuth providers (Google/Azure): redirect URI  
+`https://apicarbon.smartsite.vn/auth/v1/callback`
+
+## 4. Updates
+
+Local: bump `TAG`, run `build-and-push` again.
+
+VPS:
+
+```bash
+cd /opt/carbon && git pull
+cd contrib/deploying/vps-compose-prebuilt
+# Update CARBON_IMAGE_* tags in .env if needed
+./environments/smartsite/deploy-smartsite.sh
+```
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `env.template` | Production `.env` template |
+| `nginx-carbon.conf` | Proxy to 30000 / 30001 / 30003 |
+| `deploy-smartsite.sh` | `compose.smartsite.yml` + migrate |
+| `../../docker-compose.smartsite.yml` | Base stack + 30xxx publish |
