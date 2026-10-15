@@ -38,11 +38,19 @@ compose pull erp mes migrate 2>/dev/null || compose pull
 echo "Starting stack (caddy scale=$SCALE_CADDY)…"
 compose up -d --scale "caddy=$SCALE_CADDY"
 
-echo "Waiting for postgres…"
-for _ in $(seq 1 60); do
-  if compose ps postgres 2>/dev/null | grep -q healthy; then break; fi
-  sleep 5
-done
+wait_healthy() {
+  local svc="$1" attempts="${2:-60}"
+  echo "Waiting for $svc…"
+  for _ in $(seq 1 "$attempts"); do
+    if compose ps "$svc" 2>/dev/null | grep -q healthy; then return 0; fi
+    sleep 5
+  done
+  echo "Timed out waiting for $svc" >&2
+  return 1
+}
+
+wait_healthy postgres 60
+wait_healthy storage 60
 
 echo "Running migrations…"
 compose --profile migrate run --rm migrate

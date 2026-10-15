@@ -64,11 +64,24 @@ echo "Starting stack (Caddy scaled to $SCALE_CADDY)…"
 # shellcheck disable=SC2086
 docker compose $COMPOSE up -d --scale "caddy=$SCALE_CADDY"
 
-echo "Waiting for postgres…"
-for _ in $(seq 1 60); do
-  if docker compose $COMPOSE ps postgres 2>/dev/null | grep -q healthy; then break; fi
-  sleep 5
-done
+wait_healthy() {
+  local svc="$1" attempts="${2:-60}"
+  echo "Waiting for $svc to be healthy (up to $((attempts * 5))s)…"
+  for _ in $(seq 1 "$attempts"); do
+    if docker compose $COMPOSE ps "$svc" 2>/dev/null | grep -q healthy; then
+      echo "$svc is healthy"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "Timed out waiting for $svc — check: docker compose $COMPOSE ps $svc" >&2
+  docker compose $COMPOSE logs "$svc" --tail 40 >&2 || true
+  return 1
+}
+
+wait_healthy postgres 60
+# storage-api creates the storage schema (storage.buckets) before Carbon migrations insert buckets.
+wait_healthy storage 60
 
 echo "Running migrations…"
 docker compose $COMPOSE --profile migrate run --rm migrate
