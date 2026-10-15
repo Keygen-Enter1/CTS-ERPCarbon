@@ -9,11 +9,21 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TAG="${TAG:-smartsite-1}"
 
+REPO_FROM_SCRIPT="$(cd "$HERE/../../.." && pwd)"
+
 [ -f "$HERE/.env" ] && set -a && . "$HERE/.env" && set +a
-ROOT="${CARBON_REPO:-$(cd "$HERE/../../.." && pwd)}"
+
+ROOT="${CARBON_REPO:-$REPO_FROM_SCRIPT}"
+if [ ! -f "$ROOT/Dockerfile" ] && [ -f "$REPO_FROM_SCRIPT/Dockerfile" ]; then
+  echo "warn: CARBON_REPO=$ROOT has no Dockerfile; using git checkout at $REPO_FROM_SCRIPT" >&2
+  ROOT="$REPO_FROM_SCRIPT"
+fi
 
 [ -f "$ROOT/Dockerfile" ] || {
-  echo "No Dockerfile at CARBON_REPO=$ROOT — set CARBON_REPO in .env" >&2
+  echo "No Dockerfile at CARBON_REPO=$ROOT" >&2
+  echo "Fix $HERE/.env — example:" >&2
+  echo "  CARBON_REPO=$REPO_FROM_SCRIPT" >&2
+  echo "Then: ls \$CARBON_REPO/Dockerfile" >&2
   exit 1
 }
 

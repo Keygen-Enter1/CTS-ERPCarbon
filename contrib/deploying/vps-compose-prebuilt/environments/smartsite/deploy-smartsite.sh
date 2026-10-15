@@ -31,8 +31,27 @@ set +a
   exit 1
 }
 
-echo "Pulling Carbon images…"
-docker compose $COMPOSE pull erp mes migrate 2>/dev/null || docker compose $COMPOSE pull
+# Images from build-on-server.sh use tags like carbon/erp:tag — not on Docker Hub.
+should_pull() {
+  [ "${SKIP_PULL:-0}" = "1" ] && return 1
+  case "${CARBON_IMAGE_ERP:-}" in
+    carbon/*) return 1 ;;
+  esac
+  return 0
+}
+
+if should_pull; then
+  echo "Pulling Carbon images from registry…"
+  docker compose $COMPOSE pull erp mes migrate 2>/dev/null || docker compose $COMPOSE pull
+else
+  echo "Using local images (carbon/*) — skipping docker pull"
+  for ref in "$CARBON_IMAGE_ERP" "$CARBON_IMAGE_MES" "$CARBON_IMAGE_BOOTSTRAP"; do
+    docker image inspect "$ref" >/dev/null 2>&1 || {
+      echo "Missing local image $ref — run build-on-server.sh or set SKIP_PULL=0 and a registry tag" >&2
+      exit 1
+    }
+  done
+fi
 
 echo "Starting stack (Caddy scaled to $SCALE_CADDY)…"
 # shellcheck disable=SC2086
