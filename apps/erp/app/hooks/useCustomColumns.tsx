@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Json } from "@carbon/database";
+import { Checkbox } from "@carbon/react";
+import { useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { useMemo } from "react";
+import {
+  LuCalendar,
+  LuCaseSensitive,
+  LuContainer,
+  LuHash,
+  LuLink,
+  LuList,
+  LuSquareUser,
+  LuToggleLeft,
+  LuUser
+} from "react-icons/lu";
+import {
+  CustomerAvatar,
+  EmployeeAvatar,
+  LinkValue,
+  SupplierAvatar
+} from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { DataType } from "~/modules/shared";
+import { useCustomers, usePeople, useSuppliers } from "~/stores";
+import { path } from "~/utils/path";
+import { useCustomFieldsSchema } from "./useCustomFieldsSchema";
+
+export function useCustomColumns<T extends { customFields: Json }>(
+  table: string
+) {
+  const { t } = useLingui();
+  const customFieldsSchemas = useCustomFieldsSchema();
+  const schema = customFieldsSchemas?.[table];
+
+  const [people] = usePeople();
+  const [customers] = useCustomers();
+  const [suppliers] = useSuppliers();
+
+  // Returned unmemoized, this array's identity changed every render. It is a
+  // dependency of the `columns` memo in ~50 tables, so every render rebuilt
+  // every column def, which invalidated TanStack's column/row/cell objects and
+  // defeated the Row and Cell memos underneath.
+  return useMemo(() => {
+    const customColumns: ColumnDef<T>[] = [];
+
+    schema?.forEach((field) => {
+      customColumns.push({
+        accessorKey: `customFields->>${field.id}`,
+        header: field.name,
+        meta: {
+          icon: <ColumnIcon dataTypeId={field.dataTypeId} />,
+          filter:
+            field.dataTypeId === DataType.Boolean
+              ? {
+                  type: "static",
+                  options: [
+                    { value: "on", label: t`Yes` },
+                    { value: "", label: t`No` }
+                  ]
+                }
+              : field.dataTypeId === DataType.List
+                ? {
+                    type: "static",
+                    options:
+                      field.listOptions?.map((option) => ({
+                        value: option,
+                        label: <Enumerable value={option} />
+                      })) || []
+                  }
+                : field.dataTypeId === DataType.User
+                  ? {
+                      type: "static",
+                      options: people.map((person) => ({
+                        value: person.id,
+                        label: person.name
+                      }))
+                    }
+                  : field.dataTypeId === DataType.Text ||
+                      field.dataTypeId === DataType.Link
+                    ? {
+                        type: "fetcher",
+                        endpoint: path.to.api.customFieldOptions(
+                          table,
+                          field.id
+                        )
+                      }
+                    : field.dataTypeId === DataType.Customer
+                      ? {
+                          type: "static",
+                          options: customers.map((customer) => ({
+                            value: customer.id,
+                            label: customer.name
+                          }))
+                        }
+                      : field.dataTypeId === DataType.Supplier
+                        ? {
+                            type: "static",
+                            options: suppliers.map((supplier) => ({
+                              value: supplier.id,
+                              label: supplier.name
+                            }))
+                          }
+                        : undefined
+        },
+        cell: (item) => {
+          switch (field.dataTypeId) {
+            case DataType.Boolean:
+              return isObject(item.row.original.customFields) &&
+                field.id in item.row.original.customFields ? (
+                <Checkbox
+                  isChecked={item.row.original?.customFields[field.id] === "on"}
+                />
+              ) : (
+                <Checkbox isChecked={false} />
+              );
+            case DataType.Date:
+              return isObject(item.row.original.customFields) &&
+                field.id in item.row.original.customFields
+                ? item.row.original?.customFields[field.id]
+                : null;
+            case DataType.List:
+              return isObject(item.row.original.customFields) &&
+                field.id in item.row.original.customFields ? (
+                <Enumerable
+                  value={item.row.original.customFields[field.id] as string}
+                />
+              ) : null;
+            case DataType.Numeric:
+              return isObject(item.row.original.customFields) &&
+                field.id in item.row.original.customFields
+                ? item.row.original?.customFields[field.id]
+                : null;
+            case DataType.Text:
+              return isObject(item.row.original.customFields) &&
+                field.id in item.row.original.customFields
+                ? item.row.original?.customFields[field.id]
+                : null;
+            case DataType.Link: {
+              const value = isObject(item.row.original.customFields)
+                ? item.row.original.customFields[field.id]
+                : null;
+              // A long address would stretch the column to the cell's 30dvw
+              // cap; 10rem keeps it near its neighbours, the tooltip has the rest.
+              return typeof value === "string" && value ? (
+                <LinkValue value={value} className="max-w-40" />
+              ) : null;
+            }
+            case DataType.User:
+              if (
+                isObject(item.row.original.customFields) &&
+                field.id in item.row.original.customFields
+              ) {
+                const personId = item.row.original?.customFields[
+                  field.id
+                ] as string;
+
+                return <EmployeeAvatar employeeId={personId} />;
+              } else {
+                return null;
+              }
+            case DataType.Customer:
+              if (
+                isObject(item.row.original.customFields) &&
+                field.id in item.row.original.customFields
+              ) {
+                const customerId = item.row.original?.customFields[
+                  field.id
+                ] as string;
+
+                return <CustomerAvatar customerId={customerId} />;
+              } else {
+                return null;
+              }
+            case DataType.Supplier:
+              if (
+                isObject(item.row.original.customFields) &&
+                field.id in item.row.original.customFields
+              ) {
+                const supplierId = item.row.original?.customFields[
+                  field.id
+                ] as string;
+
+                return <SupplierAvatar supplierId={supplierId} />;
+              } else {
+                return null;
+              }
+            default:
+              return null;
+          }
+        }
+      });
+    });
+
+    return customColumns as ColumnDef<T>[];
+  }, [schema, people, customers, suppliers, t, table]);
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object";
+}
+
+function ColumnIcon({ dataTypeId }: { dataTypeId: DataType }) {
+  switch (dataTypeId) {
+    case DataType.Boolean:
+      return <LuToggleLeft />;
+    case DataType.Date:
+      return <LuCalendar />;
+    case DataType.List:
+      return <LuList />;
+    case DataType.Numeric:
+      return <LuHash />;
+    case DataType.Text:
+      return <LuCaseSensitive />;
+    case DataType.Link:
+      return <LuLink />;
+    case DataType.User:
+      return <LuUser />;
+    case DataType.Customer:
+      return <LuSquareUser />;
+    case DataType.Supplier:
+      return <LuContainer />;
+    default:
+      return null;
+  }
+}

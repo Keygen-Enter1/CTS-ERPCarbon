@@ -1,0 +1,14 @@
+{
+    "name": "Carbon Docs",
+    "short_name": "Docs",
+    "icons": [
+        {
+            "src": "/carbon-mark-dark.png",
+            "type": "image/png",
+            "sizes": "any"
+        }
+    ],
+    "theme_color": "#ffffff",
+    "background_color": "#ffffff",
+    "display": "standalone"
+}

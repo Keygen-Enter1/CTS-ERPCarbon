@@ -1,0 +1,382 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { getLogger } from "@carbon/logger";
+import type { JSONContent } from "@carbon/react";
+import { Menubar, VStack } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { Suspense } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { Await, useLoaderData, useParams } from "react-router";
+import { CadModel, DeferredFiles } from "~/components";
+import { usePermissions, useRouteData } from "~/hooks";
+import type { ItemFile, MakeMethod, ToolSummary } from "~/modules/items";
+import {
+  getItemManufacturing,
+  getMethodMaterialsByMakeMethod,
+  getMethodOperationsByMakeMethodId,
+  itemManufacturingValidator,
+  toolValidator,
+  upsertItemManufacturing,
+  upsertTool
+} from "~/modules/items";
+import {
+  getItemChangeNoticeDataOnce,
+  getMakeMethodByIdOnce,
+  getMakeMethodsOnce,
+  getRevisionLock
+} from "~/modules/items/items.server";
+import {
+  ChangeNoticeDraftLockReason,
+  getChangeNoticeDraftLock,
+  ItemChangeNotices,
+  ItemOpenChangeNoticeAlert,
+  LockedHint
+} from "~/modules/items/ui/ChangeNotice";
+import {
+  BillOfMaterial,
+  BillOfProcess,
+  ItemDocuments,
+  ItemNotes,
+  ItemRiskRegister,
+  MakeMethodTools
+} from "~/modules/items/ui/Item";
+import ItemManufacturingForm from "~/modules/items/ui/Item/ItemManufacturingForm";
+import { replanAfterItemChange } from "~/modules/production/production.server";
+import type { MethodItemType, MethodType } from "~/modules/shared";
+import { getTagsList } from "~/modules/shared";
+import { getDatabaseClient } from "~/services/database.server";
+import { getCustomFields, setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+const logger = getLogger("erp", "itemid-details");
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "parts",
+    bypassRls: true
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const url = new URL(request.url);
+  const requestedMethodId = url.searchParams.get("methodId");
+
+  const [makeMethods, revisionLock, changeNoticeData] = await Promise.all([
+    getMakeMethodsOnce(client, itemId, companyId),
+    getRevisionLock(client, { itemId, companyId }),
+    // Tool → CO traceability (4b): CO history for this tool + type labels.
+    getItemChangeNoticeDataOnce(client, itemId, companyId)
+  ]);
+  const revisionStatus = revisionLock.revisionStatus;
+  const releaseControl = revisionLock.releaseControl;
+  // Include CO-owned draft methods so a revision/new-part item created by an open
+  // Change Notice still shows its BOM/BOP on the item master. The draft is the same
+  // makeMethod the CO edits, so the two surfaces stay in sync. Active is still
+  // preferred below, so a Version CO's item keeps its live method as the default.
+  const selectable = makeMethods.data ?? [];
+  const makeMethod = requestedMethodId
+    ? (selectable.find((m) => m.id === requestedMethodId) ??
+      selectable.find((m) => m.status === "Active") ??
+      selectable[0])
+    : (selectable.find((m) => m.status === "Active") ?? selectable[0]);
+
+  if (!makeMethod) {
+    return {
+      methodData: null,
+      tags: [],
+      revisionStatus,
+      releaseControl,
+      ...changeNoticeData
+    };
+  }
+
+  const fullMethod = await getMakeMethodByIdOnce(
+    client,
+    makeMethod.id,
+    companyId
+  );
+  if (fullMethod.error || !fullMethod.data) {
+    return {
+      methodData: null,
+      tags: [],
+      revisionStatus,
+      releaseControl,
+      ...changeNoticeData
+    };
+  }
+
+  const [methodMaterials, methodOperations, tags, toolManufacturing] =
+    await Promise.all([
+      getMethodMaterialsByMakeMethod(client, fullMethod.data.id),
+      getMethodOperationsByMakeMethodId(client, fullMethod.data.id),
+      getTagsList(client, companyId, "operation"),
+      getItemManufacturing(client, itemId, companyId)
+    ]);
+
+  return {
+    methodData: {
+      makeMethod: fullMethod.data,
+      methodMaterials:
+        methodMaterials.data?.map((m) => ({
+          ...m,
+          description: m.item?.name ?? "",
+          methodType: m.methodType as MethodType,
+          itemType: m.itemType as MethodItemType
+        })) ?? [],
+      methodOperations:
+        methodOperations.data?.map((operation) => ({
+          ...operation,
+          workCenterId: operation.workCenterId ?? undefined,
+          operationSupplierProcessId:
+            operation.operationSupplierProcessId ?? undefined,
+          workInstruction: operation.workInstruction as JSONContent | null
+        })) ?? [],
+      toolManufacturing: toolManufacturing.data
+    },
+    tags: tags.data ?? [],
+    revisionStatus,
+    releaseControl,
+    ...changeNoticeData
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    update: "parts"
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "manufacturing") {
+    const validation = await validator(itemManufacturingValidator).validate(
+      formData
+    );
+
+    if (validation.error) {
+      logger.error(validation.error);
+      return validationError(validation.error);
+    }
+
+    const updateToolManufacturing = await upsertItemManufacturing(client, {
+      ...validation.data,
+      itemId,
+      updatedBy: userId,
+      customFields: setCustomFields(formData)
+    });
+    if (updateToolManufacturing.error) {
+      throw redirect(
+        path.to.tool(itemId),
+        await flash(
+          request,
+          error(
+            updateToolManufacturing.error,
+            "Failed to update tool manufacturing"
+          )
+        )
+      );
+    }
+
+    // The planning pages list MRP's suggestions; re-plan so they follow the
+    // new settings now, not at the next scheduled run.
+    await replanAfterItemChange(getDatabaseClient(), {
+      itemId,
+      companyId,
+      userId
+    });
+
+    throw redirect(
+      path.to.toolDetails(itemId),
+      await flash(request, success("Updated tool manufacturing"))
+    );
+  }
+
+  const validation = await validator(toolValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const updateTool = await upsertTool(client, {
+    ...validation.data,
+    id: itemId,
+    companyId,
+    customFields: setCustomFields(formData),
+    updatedBy: userId
+  });
+  if (updateTool.error) {
+    throw redirect(
+      path.to.tool(itemId),
+      await flash(request, error(updateTool.error, "Failed to update tool"))
+    );
+  }
+
+  throw redirect(
+    path.to.tool(itemId),
+    await flash(request, success("Updated tool"))
+  );
+}
+
+export default function ToolDetailsRoute() {
+  const { t } = useLingui();
+  const { itemId } = useParams();
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const permissions = usePermissions();
+  const {
+    methodData,
+    tags,
+    revisionStatus,
+    releaseControl,
+    changeNotices,
+    changeNoticeTypes
+  } = useLoaderData<typeof loader>();
+
+  const draftLock = getChangeNoticeDraftLock(
+    methodData?.makeMethod.changeOrderId,
+    changeNotices
+  );
+  const lockReason = draftLock ? (
+    <ChangeNoticeDraftLockReason lock={draftLock} />
+  ) : undefined;
+  const lockHint = lockReason ? <LockedHint reason={lockReason} /> : undefined;
+
+  const toolData = useRouteData<{
+    toolSummary: ToolSummary;
+    files: Promise<ItemFile[]>;
+    makeMethods: Promise<PostgrestResponse<MakeMethod>>;
+  }>(path.to.tool(itemId));
+
+  if (!toolData) throw new Error("Could not find tool data");
+
+  const manufacturingInitialValues = methodData?.toolManufacturing
+    ? {
+        ...methodData.toolManufacturing,
+        lotSize: methodData.toolManufacturing.lotSize ?? 0,
+        ...getCustomFields(methodData.toolManufacturing.customFields)
+      }
+    : null;
+
+  return (
+    <VStack spacing={4} className="p-4">
+      {permissions.is("employee") &&
+        methodData &&
+        ["Make", "Buy and Make"].includes(
+          toolData.toolSummary?.replenishmentSystem ?? ""
+        ) && (
+          <Suspense fallback={<Menubar />}>
+            <Await resolve={toolData?.makeMethods}>
+              {(makeMethods) => (
+                <MakeMethodTools
+                  itemId={methodData.makeMethod.itemId}
+                  makeMethods={makeMethods?.data ?? []}
+                  type="Tool"
+                  currentMethodId={methodData.makeMethod.id}
+                />
+              )}
+            </Await>
+          </Suspense>
+        )}
+      {permissions.is("employee") && (
+        <ItemOpenChangeNoticeAlert changeNotices={changeNotices ?? []} />
+      )}
+      {permissions.is("employee") && methodData && (
+        <>
+          {["Make", "Buy and Make"].includes(
+            toolData.toolSummary?.replenishmentSystem ?? ""
+          ) && (
+            <>
+              {manufacturingInitialValues && (
+                <ItemManufacturingForm
+                  key={itemId}
+                  initialValues={manufacturingInitialValues}
+                  withConfiguration={false}
+                />
+              )}
+            </>
+          )}
+          <ItemNotes
+            id={toolData.toolSummary?.id ?? null}
+            title={toolData.toolSummary?.name ?? ""}
+            subTitle={toolData.toolSummary?.readableIdWithRevision ?? ""}
+            notes={toolData.toolSummary?.notes as JSONContent}
+          />
+          {["Make", "Buy and Make"].includes(
+            toolData.toolSummary?.replenishmentSystem ?? ""
+          ) && (
+            <>
+              <BillOfProcess
+                key={`bop:${itemId}`}
+                makeMethod={methodData.makeMethod}
+                // @ts-expect-error
+                operations={methodData.methodOperations ?? []}
+                materials={methodData.methodMaterials ?? []}
+                tags={tags}
+                revisionStatus={revisionStatus}
+                releaseControl={releaseControl}
+                isDisabled={!!draftLock}
+                disabledReason={lockReason}
+              />
+              <BillOfMaterial
+                key={`bom:${itemId}`}
+                makeMethod={methodData.makeMethod}
+                // @ts-expect-error
+                materials={methodData.methodMaterials ?? []}
+                // @ts-expect-error
+                operations={methodData.methodOperations}
+                replenishmentSystem={toolData.toolSummary?.replenishmentSystem}
+                revisionStatus={revisionStatus}
+                releaseControl={releaseControl}
+                isDisabled={!!draftLock}
+                disabledReason={lockReason}
+              />
+            </>
+          )}
+        </>
+      )}
+      {permissions.is("employee") && (
+        <>
+          <DeferredFiles resolve={toolData?.files}>
+            {(resolvedFiles) => (
+              <ItemDocuments
+                files={resolvedFiles}
+                itemId={itemId}
+                modelUpload={toolData.toolSummary ?? undefined}
+                type="Tool"
+                isReadOnly={!!draftLock}
+                titleExtras={lockHint}
+              />
+            )}
+          </DeferredFiles>
+
+          <CadModel
+            isReadOnly={!permissions.can("update", "parts") || !!draftLock}
+            metadata={{ itemId }}
+            modelUpload={toolData?.toolSummary ?? null}
+            title={t`CAD Model`}
+            titleExtras={lockHint}
+          />
+
+          <ItemRiskRegister itemId={itemId} />
+          <ItemChangeNotices
+            changeNotices={changeNotices ?? []}
+            types={changeNoticeTypes ?? []}
+          />
+        </>
+      )}
+    </VStack>
+  );
+}

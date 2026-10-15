@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Table,
+  Tbody,
+  Td,
+  Tfoot,
+  Th,
+  Thead,
+  Tr
+} from "@carbon/react";
+import { round, SCALE_FORMAT } from "@carbon/utils";
+import { Trans } from "@lingui/react/macro";
+import { useNumberFormatter } from "@react-aria/i18n";
+import { DateTime, Hyperlink } from "~/components";
+import { useCurrencyFormatter } from "~/hooks";
+import type { getInvoiceSettlements } from "~/modules/invoicing";
+import { path } from "~/utils/path";
+
+type PaymentApplication = NonNullable<
+  Awaited<ReturnType<typeof getInvoiceSettlements>>["data"]
+>[number];
+
+type PaymentApplicationsProps = {
+  isRefund?: boolean;
+  // An employee payee: every target is a reimbursement.
+  isReimbursement?: boolean;
+  applications: PaymentApplication[];
+  paymentTotal: number;
+  paymentCurrency: string;
+  baseCurrency: string;
+};
+
+// The applied document's human-readable id comes from the embedded
+// salesInvoice/purchaseInvoice/memo/reimbursement relation
+// (getInvoiceSettlements); fall back to the raw FK id if the relation didn't
+// resolve.
+function invoiceLabel(a: PaymentApplication) {
+  const rec = a as unknown as {
+    salesInvoice?:
+      | { invoiceId?: string | null }
+      | { invoiceId?: string | null }[]
+      | null;
+    purchaseInvoice?:
+      | { invoiceId?: string | null }
+      | { invoiceId?: string | null }[]
+      | null;
+    targetSalesInvoiceId?: string | null;
+    targetPurchaseInvoiceId?: string | null;
+    targetMemoId?: string | null;
+    targetMemo?:
+      | { memoId?: string | null }
+      | { memoId?: string | null }[]
+      | null;
+    targetReimbursementId?: string | null;
+    targetReimbursement?:
+      | { reimbursementId?: string | null }
+      | { reimbursementId?: string | null }[]
+      | null;
+  };
+  const pick = (x: typeof rec.salesInvoice) =>
+    Array.isArray(x) ? x[0]?.invoiceId : x?.invoiceId;
+  return (
+    pick(rec.salesInvoice) ??
+    pick(rec.purchaseInvoice) ??
+    (Array.isArray(rec.targetMemo)
+      ? rec.targetMemo[0]?.memoId
+      : rec.targetMemo?.memoId) ??
+    (Array.isArray(rec.targetReimbursement)
+      ? rec.targetReimbursement[0]?.reimbursementId
+      : rec.targetReimbursement?.reimbursementId) ??
+    rec.targetSalesInvoiceId ??
+    rec.targetPurchaseInvoiceId ??
+    rec.targetMemoId ??
+    rec.targetReimbursementId
+  );
+}
+
+const PaymentApplications = ({
+  isRefund = false,
+  isReimbursement = false,
+  applications: splits,
+  paymentCurrency,
+  baseCurrency,
+  paymentTotal
+}: PaymentApplicationsProps) => {
+  const currencyFormatter = useCurrencyFormatter({ currency: baseCurrency });
+  const documentFormatter = useCurrencyFormatter({ currency: paymentCurrency });
+  const byInvoice = new Map<
+    string,
+    PaymentApplication & { sourceRates: number[] }
+  >();
+  for (const a of splits) {
+    const id =
+      a.targetSalesInvoiceId ??
+      a.targetPurchaseInvoiceId ??
+      a.targetMemoId ??
+      a.targetReimbursementId ??
+      a.id;
+    const existing = byInvoice.get(id);
+    if (!existing) {
+      byInvoice.set(id, { ...a, sourceRates: [Number(a.sourceExchangeRate)] });
+      continue;
+    }
+    existing.appliedAmount = round(
+      existing.appliedAmount + Number(a.appliedAmount)
+    );
+    existing.discountAmount = round(
+      existing.discountAmount + Number(a.discountAmount)
+    );
+    existing.writeOffAmount = round(
+      existing.writeOffAmount + Number(a.writeOffAmount)
+    );
+    existing.sourceAmount =
+      (existing.sourceAmount ?? 0) + Number(a.sourceAmount ?? 0);
+    existing.fxGainLossAmount = round(
+      Number(existing.fxGainLossAmount ?? 0) + Number(a.fxGainLossAmount ?? 0)
+    );
+    existing.sourceRates = [
+      ...new Set([...existing.sourceRates, Number(a.sourceExchangeRate)])
+    ];
+  }
+  const applications = [...byInvoice.values()];
+  const rateFormatter = useNumberFormatter(SCALE_FORMAT);
+
+  const total = (
+    field: "appliedAmount" | "discountAmount" | "writeOffAmount"
+  ) => round(applications.reduce((sum, a) => sum + Number(a[field]), 0));
+  const unapplied =
+    paymentTotal -
+    splits.reduce(
+      (s, a) => s + (a.sourcePaymentId ? 0 : Number(a.sourceAmount ?? 0)),
+      0
+    );
+
+  // Discount and write-off only exist on a trade invoice settlement.
+  const hasAdjustments = !isRefund && !isReimbursement;
+  // The rate and FX columns say nothing when every amount is in the base
+  // currency at rate 1 — the common case — so they appear only when one isn't.
+  const isForeign = paymentCurrency !== baseCurrency;
+  const hasFx =
+    isForeign ||
+    applications.some(
+      (a) =>
+        Number(a.targetExchangeRate) !== 1 ||
+        a.sourceRates.some((rate) => rate !== 1) ||
+        Number(a.fxGainLossAmount ?? 0) !== 0
+    );
+  const columnCount = 3 + (hasAdjustments ? 2 : 0) + (hasFx ? 3 : 0);
+
+  return (
+    <Card className="w-full">
+      <CardHeader>
+        <CardTitle>
+          <Trans>Payment Applications</Trans>
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <Table>
+          <Thead>
+            <Tr className="[&>th]:whitespace-nowrap">
+              <Th>
+                {isReimbursement ? (
+                  <Trans>Reimbursement</Trans>
+                ) : isRefund ? (
+                  <Trans>Memo</Trans>
+                ) : (
+                  <Trans>Invoice</Trans>
+                )}
+              </Th>
+              <Th>
+                <Trans>Date</Trans>
+              </Th>
+              <Th className="text-right">
+                <Trans>Applied</Trans>
+              </Th>
+              {hasAdjustments && (
+                <>
+                  <Th className="text-right">
+                    <Trans>Discount</Trans>
+                  </Th>
+                  <Th className="text-right">
+                    <Trans>Write-off</Trans>
+                  </Th>
+                </>
+              )}
+              {hasFx && (
+                <>
+                  <Th className="text-right">
+                    <Trans>Invoice Rate</Trans>
+                  </Th>
+                  <Th className="text-right">
+                    <Trans>Payment Rate</Trans>
+                  </Th>
+                  <Th className="text-right">
+                    <Trans>FX Gain/Loss</Trans>
+                  </Th>
+                </>
+              )}
+            </Tr>
+          </Thead>
+          <Tbody>
+            {applications.length === 0 ? (
+              <Tr>
+                <Td
+                  colSpan={columnCount}
+                  className="text-center text-muted-foreground"
+                >
+                  <Trans>No applications. Payment will be on-account.</Trans>
+                </Td>
+              </Tr>
+            ) : (
+              applications.map((a) => (
+                <Tr key={a.id} className="[&>td]:whitespace-nowrap">
+                  <Td>
+                    {a.targetSalesInvoiceId ? (
+                      <Hyperlink
+                        to={path.to.salesInvoice(a.targetSalesInvoiceId)}
+                      >
+                        {invoiceLabel(a)}
+                      </Hyperlink>
+                    ) : a.targetPurchaseInvoiceId ? (
+                      <Hyperlink
+                        to={path.to.purchaseInvoice(a.targetPurchaseInvoiceId)}
+                      >
+                        {invoiceLabel(a)}
+                      </Hyperlink>
+                    ) : a.targetMemoId ? (
+                      <Hyperlink to={path.to.memo(a.targetMemoId)}>
+                        {invoiceLabel(a)}
+                      </Hyperlink>
+                    ) : a.targetReimbursementId ? (
+                      <Hyperlink
+                        to={path.to.reimbursement(a.targetReimbursementId)}
+                      >
+                        {invoiceLabel(a)}
+                      </Hyperlink>
+                    ) : (
+                      invoiceLabel(a)
+                    )}
+                  </Td>
+                  <Td>
+                    <DateTime value={a.appliedDate} variant="date" />
+                  </Td>
+                  <Td className="text-right tabular-nums">
+                    {currencyFormatter.format(Number(a.appliedAmount))}
+                    {isForeign && (
+                      <div className="text-xs text-muted-foreground">
+                        {documentFormatter.format(Number(a.sourceAmount ?? 0))}
+                      </div>
+                    )}
+                  </Td>
+                  {hasAdjustments && (
+                    <>
+                      <Td className="text-right tabular-nums">
+                        {currencyFormatter.format(Number(a.discountAmount))}
+                      </Td>
+                      <Td className="text-right tabular-nums">
+                        {currencyFormatter.format(Number(a.writeOffAmount))}
+                      </Td>
+                    </>
+                  )}
+                  {hasFx && (
+                    <>
+                      <Td className="text-right tabular-nums">
+                        {rateFormatter.format(Number(a.targetExchangeRate))}
+                      </Td>
+                      <Td className="text-right tabular-nums">
+                        {a.sourceRates
+                          .map((rate) => rateFormatter.format(rate))
+                          .join(" / ")}
+                      </Td>
+                      <Td className="text-right tabular-nums">
+                        {currencyFormatter.format(
+                          Number(a.fxGainLossAmount ?? 0)
+                        )}
+                      </Td>
+                    </>
+                  )}
+                </Tr>
+              ))
+            )}
+          </Tbody>
+          {applications.length > 0 && (
+            <Tfoot>
+              <Tr className="[&>td]:whitespace-nowrap">
+                <Td className="font-semibold">
+                  <Trans>Total</Trans>
+                </Td>
+                <Td />
+                <Td className="text-right tabular-nums font-semibold">
+                  {currencyFormatter.format(total("appliedAmount"))}
+                </Td>
+                {hasAdjustments && (
+                  <>
+                    <Td className="text-right tabular-nums font-semibold">
+                      {currencyFormatter.format(total("discountAmount"))}
+                    </Td>
+                    <Td className="text-right tabular-nums font-semibold">
+                      {currencyFormatter.format(total("writeOffAmount"))}
+                    </Td>
+                  </>
+                )}
+                {hasFx && <Td colSpan={3} />}
+              </Tr>
+              <Tr className="[&>td]:whitespace-nowrap">
+                <Td className="text-muted-foreground">
+                  <Trans>Unapplied</Trans>
+                </Td>
+                <Td />
+                <Td className="text-right tabular-nums">
+                  {documentFormatter.format(unapplied)}
+                </Td>
+                {columnCount > 3 && <Td colSpan={columnCount - 3} />}
+              </Tr>
+            </Tfoot>
+          )}
+        </Table>
+      </CardContent>
+    </Card>
+  );
+};
+
+export default PaymentApplications;

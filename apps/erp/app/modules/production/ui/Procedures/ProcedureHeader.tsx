@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Badge,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  MENU_ITEM_SHORTCUTS,
+  useDisclosure
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { Suspense, useEffect } from "react";
+import { LuTrash } from "react-icons/lu";
+import { Await, useParams } from "react-router";
+import { VersionMenu } from "~/components";
+import { usePanels } from "~/components/Layout";
+import { RecordAction, RecordHeader } from "~/components/Layout/RecordHeader";
+import ConfirmDelete from "~/components/Modals/ConfirmDelete";
+import { usePermissions, useRouteData } from "~/hooks";
+import { useDocumentStore } from "~/stores";
+import { path } from "~/utils/path";
+import type { Procedure } from "../../types";
+import ProcedureForm from "./ProcedureForm";
+import ProcedureStatus from "./ProcedureStatus";
+
+const ProcedureHeader = () => {
+  const { id } = useParams();
+  const { t } = useLingui();
+  if (!id) throw new Error("id not found");
+
+  const routeData = useRouteData<{
+    procedure: Procedure;
+    versions: PostgrestResponse<Procedure>;
+  }>(path.to.procedure(id));
+
+  const permissions = usePermissions();
+  const { toggleExplorer, toggleProperties } = usePanels();
+  // Live title from the editor's locked title block (updates before revalidate).
+  const liveTitle = useDocumentStore((s) => s.liveTitle);
+  const displayName = liveTitle ?? routeData?.procedure?.name ?? "";
+  const newVersionDisclosure = useDisclosure();
+  const deleteDisclosure = useDisclosure();
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  useEffect(() => {
+    newVersionDisclosure.onClose();
+  }, [id]);
+
+  const versionBadge = (
+    <Badge variant="outline">V{routeData?.procedure?.version}</Badge>
+  );
+  const statusBadge = <ProcedureStatus status={routeData?.procedure?.status} />;
+  const menuItems = (
+    <DropdownMenuItem
+      shortcut={MENU_ITEM_SHORTCUTS.delete}
+      disabled={
+        !permissions.can("delete", "production") || !permissions.is("employee")
+      }
+      destructive
+      onClick={deleteDisclosure.onOpen}
+    >
+      <DropdownMenuIcon icon={<LuTrash />} />
+      <Trans>Delete Procedure</Trans>
+    </DropdownMenuItem>
+  );
+
+  return (
+    <>
+      <RecordHeader
+        title={displayName}
+        copyValue={routeData?.procedure?.name ?? ""}
+        menu={menuItems}
+        status={
+          <>
+            {versionBadge}
+            {statusBadge}
+          </>
+        }
+        onToggleExplorer={toggleExplorer}
+        onToggleProperties={toggleProperties}
+        actions={
+          <>
+            <RecordAction slot="overflow">
+              <Suspense fallback={null}>
+                <Await resolve={routeData?.versions}>
+                  {(versions) => {
+                    const allVersions =
+                      versions?.data ??
+                      (routeData?.procedure ? [routeData.procedure] : []);
+                    return (
+                      <VersionMenu
+                        versions={allVersions}
+                        currentVersionId={id}
+                        getKey={(v) => v.id}
+                        getHref={(v) => path.to.procedure(v.id)}
+                        renderLabel={(v) => (
+                          <>
+                            <Badge variant="outline">V{v.version}</Badge>
+                            <span>{v.name}</span>
+                          </>
+                        )}
+                        renderStatus={(v) => (
+                          <ProcedureStatus status={v.status} />
+                        )}
+                        onNewVersion={
+                          permissions.can("create", "production")
+                            ? newVersionDisclosure.onOpen
+                            : undefined
+                        }
+                      />
+                    );
+                  }}
+                </Await>
+              </Suspense>
+            </RecordAction>
+          </>
+        }
+      />
+      {newVersionDisclosure.isOpen && (
+        <ProcedureForm
+          type="copy"
+          initialValues={{
+            name: routeData?.procedure?.name ?? "",
+            version: (routeData?.procedure?.version ?? 0) + 1,
+            processId: routeData?.procedure?.processId ?? "",
+            content: JSON.stringify(routeData?.procedure?.content) ?? "",
+            copyFromId: routeData?.procedure?.id ?? ""
+          }}
+          open={newVersionDisclosure.isOpen}
+          onClose={newVersionDisclosure.onClose}
+        />
+      )}
+      {deleteDisclosure.isOpen && (
+        <ConfirmDelete
+          action={path.to.deleteProcedure(id)}
+          isOpen={deleteDisclosure.isOpen}
+          name={routeData?.procedure?.name ?? "procedure"}
+          text={t`Are you sure you want to delete ${routeData?.procedure?.name}? This cannot be undone.`}
+          onCancel={() => {
+            deleteDisclosure.onClose();
+          }}
+          onSubmit={() => {
+            deleteDisclosure.onClose();
+          }}
+        />
+      )}
+    </>
+  );
+};
+
+export default ProcedureHeader;

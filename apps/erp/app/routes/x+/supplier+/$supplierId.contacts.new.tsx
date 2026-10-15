@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { isUniqueViolation, redirect } from "@carbon/utils";
+import type { ActionFunctionArgs } from "react-router";
+import { data, useNavigate, useParams } from "react-router";
+import {
+  insertSupplierContact,
+  supplierContactValidator
+} from "~/modules/purchasing";
+import SupplierContactForm from "~/modules/purchasing/ui/Supplier/SupplierContactForm";
+import { requireCompanyRecord } from "~/modules/shared/shared.server";
+import { setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { companyId } = await requirePermissions(request, {
+    create: "purchasing"
+  });
+
+  // RLS doesn't work for selecting a contact with no supplier
+  const client = getCarbonServiceRole();
+
+  const { supplierId } = params;
+  if (!supplierId) throw notFound("supplierId not found");
+
+  const formData = await request.formData();
+  const modal = formData.get("type") === "modal";
+
+  const validation = await validator(supplierContactValidator).validate(
+    formData
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  // biome-ignore lint/correctness/noUnusedVariables: suppressed due to migration
+  const { id, contactId, supplierLocationId, ...contact } = validation.data;
+
+  // The contact is written through the service role: the supplier in the URL
+  // (and the location on the form) must belong to this company.
+  await Promise.all([
+    requireCompanyRecord(client, "supplier", companyId, { id: supplierId }),
+    supplierLocationId
+      ? requireCompanyRecord(client, "supplierLocation", companyId, {
+          id: supplierLocationId,
+          supplierId
+        })
+      : null
+  ]);
+
+  const createSupplierContact = await insertSupplierContact(client, {
+    supplierId,
+    companyId,
+    contact,
+    supplierLocationId,
+    customFields: setCustomFields(formData)
+  });
+
+  if (createSupplierContact.error) {
+    let errorMessage = "Failed to create supplier contact";
+    if (isUniqueViolation(createSupplierContact.error)) {
+      const contact = await client
+        .from("contact")
+        .select("id")
+        .eq("email", validation.data.email)
+        .eq("companyId", companyId)
+        .single();
+      if (contact.data) {
+        const supplierContact = await client
+          .from("supplierContact")
+          .select("supplierId")
+          .eq("contactId", contact.data.id)
+          .single();
+        if (supplierContact.data) {
+          const supplier = await client
+            .from("supplier")
+            .select("name")
+            .eq("id", supplierContact.data.supplierId)
+            .single();
+          errorMessage = `Contact ${validation.data.email} already exists for ${supplier.data?.name}`;
+        } else {
+          const customerContact = await client
+            .from("customerContact")
+            .select("customerId")
+            .eq("contactId", contact.data.id)
+            .single();
+          if (customerContact.data) {
+            const customer = await client
+              .from("customer")
+              .select("name")
+              .eq("id", customerContact.data.customerId)
+              .single();
+            errorMessage = `Contact ${validation.data.email} already exists for ${customer.data?.name}`;
+          }
+        }
+      }
+    }
+
+    return modal
+      ? createSupplierContact
+      : redirect(
+          path.to.supplierContacts(supplierId),
+          await flash(request, error(createSupplierContact.error, errorMessage))
+        );
+  }
+
+  return modal
+    ? data(createSupplierContact, { status: 201 })
+    : redirect(
+        path.to.supplierContacts(supplierId),
+        await flash(request, success("Supplier contact created"))
+      );
+}
+
+export default function SupplierContactsNewRoute() {
+  const navigate = useNavigate();
+  const { supplierId } = useParams();
+  if (!supplierId) throw new Error("supplierId not found");
+
+  const initialValues = {
+    firstName: "",
+    lastName: "",
+    email: ""
+  };
+
+  return (
+    <SupplierContactForm
+      supplierId={supplierId}
+      initialValues={initialValues}
+      onClose={() => navigate(path.to.supplierContacts(supplierId))}
+    />
+  );
+}

@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { RecordOutlet } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import { usePlanGate } from "~/hooks/usePlanGate";
+import StorageRulesGroups from "~/modules/inventory/ui/StorageRules/StorageRulesGroups";
+import StorageRulesUpgradeOverlay from "~/modules/inventory/ui/StorageRules/StorageRulesUpgradeOverlay";
+import {
+  getEnforcementRuleAssignmentCounts,
+  getEnforcementRules
+} from "~/modules/shared";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: msg`Storage Rules`,
+  to: path.to.storageRules
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "inventory",
+    role: "employee"
+  });
+
+  const rules = await getEnforcementRules(client, "storage", companyId, {
+    search: null,
+    limit: 1000,
+    offset: 0,
+    sorts: []
+  });
+
+  if (rules.error) {
+    throw redirect(
+      path.to.storageUnits,
+      await flash(request, error(rules.error, "Failed to load storage rules"))
+    );
+  }
+
+  const ids = (rules.data ?? []).map((r) => r.id);
+  const counts = await getEnforcementRuleAssignmentCounts(client, ids);
+
+  const countsData = (counts.data ?? {}) as Record<string, number>;
+  const rows = (rules.data ?? []).map((r) => ({
+    ...r,
+    assignmentCount: countsData[r.id] ?? 0
+  }));
+
+  return { rows };
+}
+
+export default function StorageRulesRoute() {
+  const { rows } = useLoaderData<typeof loader>();
+  const { isGated } = usePlanGate({ feature: "STORAGE_RULES" });
+
+  if (isGated) {
+    return <StorageRulesUpgradeOverlay />;
+  }
+
+  return (
+    <>
+      <StorageRulesGroups rules={rows as never} />
+      <RecordOutlet />
+    </>
+  );
+}

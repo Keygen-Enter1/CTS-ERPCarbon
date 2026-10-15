@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error, notFound } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import {
+  getSuggestion,
+  SuggestionDetails,
+  updateSuggestionEmoji
+} from "~/modules/resources";
+import { getTagsList } from "~/modules/shared";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "resources"
+  });
+
+  const { suggestionId } = params;
+  if (!suggestionId) throw notFound("suggestionId was not found");
+
+  const [suggestion, tags] = await Promise.all([
+    getSuggestion(client, suggestionId),
+    getTagsList(client, companyId, "suggestion")
+  ]);
+
+  if (suggestion.error) {
+    throw redirect(
+      path.to.suggestions,
+      await flash(request, error(suggestion.error, "Failed to get suggestion"))
+    );
+  }
+
+  return {
+    suggestion: suggestion.data,
+    tags: tags.data ?? []
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    update: "resources"
+  });
+
+  const { suggestionId } = params;
+  if (!suggestionId) throw notFound("suggestionId was not found");
+
+  const formData = await request.formData();
+  const emoji = formData.get("emoji")?.toString();
+
+  if (emoji) {
+    const result = await updateSuggestionEmoji(client, suggestionId, emoji);
+    if (result.error) {
+      throw redirect(
+        path.to.suggestion(suggestionId),
+        await flash(request, error(result.error, "Failed to update emoji"))
+      );
+    }
+  }
+
+  return { success: true };
+}
+
+export default function SuggestionRoute() {
+  const { suggestion, tags } = useLoaderData<typeof loader>();
+
+  return <SuggestionDetails suggestion={suggestion} tags={tags} />;
+}

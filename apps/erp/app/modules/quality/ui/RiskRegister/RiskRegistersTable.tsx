@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem,
+  useDisclosure
+} from "@carbon/react";
+import { getItemById, getItemReadableId } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo, useState } from "react";
+import {
+  LuBlocks,
+  LuDice5,
+  LuDna,
+  LuLocateFixed,
+  LuPencil,
+  LuShapes,
+  LuStar,
+  LuTrash,
+  LuTriangleAlert,
+  LuUser
+} from "react-icons/lu";
+import { useNavigate } from "react-router";
+import {
+  EmployeeAvatar,
+  exportOnlyColumn,
+  Hyperlink,
+  New,
+  Table
+} from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { useWorkCenters } from "~/components/Form/WorkCenter";
+import { Confirm } from "~/components/Modals";
+import { usePermissions, useUrlParams } from "~/hooks";
+import {
+  riskRegisterType,
+  riskSource,
+  riskStatus
+} from "~/modules/quality/quality.models";
+import type { Risk } from "~/modules/quality/types";
+import { useItems, usePeople } from "~/stores";
+import { path } from "~/utils/path";
+import { RiskRating } from "./RiskRating";
+import RiskStatus from "./RiskStatus";
+import RiskType from "./RiskType";
+
+type RiskRegistersTableProps = {
+  data: Risk[];
+  count: number;
+};
+
+const defaultColumnVisibility = {
+  itemId: false,
+  description: false,
+  createdAt: true,
+  updatedAt: false
+};
+
+const RiskRegistersTable = memo(({ data, count }: RiskRegistersTableProps) => {
+  const navigate = useNavigate();
+  const [params] = useUrlParams();
+  const workCenters = useWorkCenters({});
+  const [items] = useItems();
+  const [people] = usePeople();
+
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const deleteModal = useDisclosure();
+  const [selectedRisk, setSelectedRisk] = useState<Risk | null>(null);
+
+  const onDelete = useCallback(
+    (risk: Risk) => {
+      setSelectedRisk(risk);
+      deleteModal.onOpen();
+    },
+    [deleteModal]
+  );
+
+  const onCancel = useCallback(() => {
+    setSelectedRisk(null);
+    deleteModal.onClose();
+  }, [deleteModal]);
+
+  const columns = useMemo<ColumnDef<Risk>[]>(() => {
+    const defaultColumns: ColumnDef<Risk>[] = [
+      {
+        accessorKey: "title",
+        header: t`Title`,
+        cell: ({ row }) => (
+          <Hyperlink to={row.original.id!} className="font-medium">
+            <div className="flex flex-col gap-1">
+              <span>{row.original.title}</span>
+              {row.original.itemId && (
+                <span className="text-muted-foreground text-xs">
+                  {getItemReadableId(items, row.original.itemId)}
+                </span>
+              )}
+            </div>
+          </Hyperlink>
+        ),
+        meta: { mobile: "P1" }
+      },
+      {
+        accessorKey: "type",
+        header: t`Type`,
+        cell: ({ row }) => {
+          return <RiskType type={row.original.type} />;
+        },
+        meta: {
+          mobile: "P2",
+          icon: <LuShapes />,
+          filter: {
+            type: "static",
+            options: riskRegisterType.map((t) => ({
+              value: t,
+              label: <RiskType type={t} />
+            }))
+          }
+        }
+      },
+      {
+        accessorKey: "itemId",
+        header: t`Item`,
+        cell: ({ row }) => getItemReadableId(items, row.original.itemId),
+        meta: {
+          icon: <LuBlocks />,
+          filter: {
+            type: "static",
+            options: items.map((item) => ({
+              value: item.id,
+              label: item.readableIdWithRevision
+            }))
+          },
+          // Without this the exporter substitutes the item's name for the id
+          // (Download.tsx idNameMaps), losing the readable id the cell shows.
+          exportValue: (row) => getItemReadableId(items, row.itemId) ?? null
+        }
+      },
+      exportOnlyColumn<Risk>({
+        id: "itemName",
+        header: t`Item Name`,
+        value: (row) =>
+          row.itemId ? (getItemById(items, row.itemId)?.name ?? null) : null
+      }),
+      {
+        accessorKey: "source",
+        header: t`Source`,
+        cell: (item) => <Enumerable value={item.getValue<string>()} />,
+        meta: {
+          mobile: "P3",
+          // Phones: line 2 is muted context, not a second row of pills.
+          mobileCell: (item) => (
+            <span className="text-muted-foreground">
+              {item.getValue<string>()}
+            </span>
+          ),
+          icon: <LuDna />,
+          filter: {
+            type: "static",
+            options: riskSource.map((c) => ({
+              value: c,
+              label: <Enumerable value={c} />
+            }))
+          }
+        }
+      },
+      {
+        accessorKey: "status",
+        header: t`Status`,
+        cell: ({ row }) => <RiskStatus status={row.original.status} />,
+        meta: {
+          mobile: "P2",
+          icon: <LuStar />,
+          filter: {
+            type: "static",
+            options: riskStatus.map((s) => ({
+              value: s,
+              label: <RiskStatus status={s} />
+            }))
+          },
+          pluralHeader: t`Statuses`
+        }
+      },
+      {
+        accessorKey: "severity",
+        header: t`Severity`,
+        cell: ({ row }) => <RiskRating rating={row.original.severity ?? 1} />,
+        meta: {
+          icon: <LuTriangleAlert />,
+          filter: {
+            type: "static",
+            options: [1, 2, 3, 4, 5].map((s) => ({
+              value: s.toString(),
+              label: <RiskRating rating={s} />
+            }))
+          },
+          pluralHeader: t`Severities`
+        }
+      },
+      {
+        accessorKey: "likelihood",
+        header: t`Likelihood`,
+        cell: ({ row }) => <RiskRating rating={row.original.likelihood ?? 1} />,
+        meta: {
+          icon: <LuDice5 />,
+          filter: {
+            type: "static",
+            options: [1, 2, 3, 4, 5].map((s) => ({
+              value: s.toString(),
+              label: <RiskRating rating={s} />
+            }))
+          }
+        }
+      },
+      {
+        accessorKey: "workCenterId",
+        header: t`Work Center`,
+        cell: ({ row }) => <Enumerable value={row.original.workCenterName} />,
+        meta: {
+          icon: <LuLocateFixed />,
+          exportValue: (row) => row.workCenterName,
+          filter: {
+            type: "static",
+            options: workCenters.options.map((wc) => ({
+              value: wc.value,
+              label: <Enumerable value={wc.label} />
+            }))
+          }
+        }
+      },
+
+      {
+        id: "assignee",
+        header: t`Assignee`,
+        cell: ({ row }) => (
+          <EmployeeAvatar employeeId={row.original.assignee} />
+        ),
+        meta: {
+          icon: <LuUser />,
+          filter: {
+            type: "static",
+            options: people.map((employee) => ({
+              value: employee.id,
+              label: employee.name
+            }))
+          }
+        }
+      }
+    ];
+    return defaultColumns;
+  }, [people, items, workCenters.options.map, t]);
+
+  const renderContextMenu = useCallback<(row: Risk) => JSX.Element>(
+    (row) => (
+      <>
+        <MenuItem
+          shortcut={MENU_ITEM_SHORTCUTS.edit}
+          onClick={() => {
+            navigate(`${path.to.risk(row.id!)}?${params?.toString()}`);
+          }}
+        >
+          <MenuIcon icon={<LuPencil />} />
+          Edit Risk
+        </MenuItem>
+        <MenuItem
+          shortcut={MENU_ITEM_SHORTCUTS.delete}
+          destructive
+          disabled={!permissions.can("delete", "quality")}
+          onClick={() => onDelete(row)}
+        >
+          <MenuIcon icon={<LuTrash />} />
+          Delete Risk
+        </MenuItem>
+      </>
+    ),
+    [permissions, navigate, params, onDelete]
+  );
+
+  return (
+    <>
+      <Table<Risk>
+        data={data}
+        defaultColumnVisibility={defaultColumnVisibility}
+        columns={columns}
+        count={count ?? 0}
+        primaryAction={
+          permissions.can("create", "quality") && (
+            <New label={t`Risk`} to={`new?${params.toString()}`} />
+          )
+        }
+        renderContextMenu={renderContextMenu}
+        title={t`Risks`}
+        table="riskRegister"
+        withSavedView
+      />
+
+      {selectedRisk && selectedRisk.id && (
+        <Confirm
+          action={path.to.deleteRisk(selectedRisk.id)}
+          title={`Delete ${selectedRisk?.title} Risk`}
+          text={t`Are you sure you want to delete this risk? This cannot be undone.`}
+          confirmText={t`Delete`}
+          isOpen={deleteModal.isOpen}
+          onCancel={onCancel}
+          onSubmit={onCancel}
+        />
+      )}
+    </>
+  );
+});
+
+RiskRegistersTable.displayName = "RiskRegistersTable";
+export default RiskRegistersTable;

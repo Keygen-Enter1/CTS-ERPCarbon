@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Button,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  ModalOverlay,
+  ModalTitle,
+  SHORTCUTS,
+  toast
+} from "@carbon/react";
+import type { ComponentProps, ReactNode } from "react";
+import { useEffect, useRef } from "react";
+import { useFetcher } from "react-router";
+
+type ConfirmProps = {
+  action?: string;
+  isOpen?: boolean;
+  title: string;
+  text: string;
+  confirmText: string;
+  cancelText?: string;
+  confirmVariant?: ComponentProps<typeof Button>["variant"];
+  onCancel: () => void;
+  onSubmit?: () => void;
+  // Extra hidden fields posted with the confirmation (e.g. a status value),
+  // letting callers reuse this dialog for status changes, not just deletes.
+  children?: ReactNode;
+  // Read-only content shown under the text (e.g. a posting preview).
+  details?: ReactNode;
+};
+
+const Confirm = ({
+  action,
+  isOpen = true,
+  title,
+  text,
+  confirmText = "Confirm",
+  cancelText = "Cancel",
+  confirmVariant,
+  onCancel,
+  onSubmit,
+  children,
+  details
+}: ConfirmProps) => {
+  const fetcher = useFetcher<{ success: boolean; message: string }>();
+  const submitted = useRef(false);
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && submitted.current) {
+      onSubmit?.();
+      submitted.current = false;
+    }
+  }, [fetcher.state, onSubmit]);
+
+  useEffect(() => {
+    if (fetcher.data?.success === true && fetcher?.data?.message) {
+      toast.success(fetcher.data.message);
+    }
+
+    if (fetcher.data?.success === false && fetcher?.data?.message) {
+      toast.error(fetcher.data.message);
+    }
+  }, [fetcher.data?.message, fetcher.data?.success]);
+
+  return (
+    <Modal
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) onCancel();
+      }}
+    >
+      <ModalOverlay />
+      <ModalContent>
+        <ModalHeader>
+          <ModalTitle>{title}</ModalTitle>
+        </ModalHeader>
+        <ModalBody>
+          <p className="text-sm text-muted-foreground">{text}</p>
+          {details}
+        </ModalBody>
+        <ModalFooter>
+          <Button variant="secondary" onClick={onCancel}>
+            {cancelText}
+          </Button>
+          <fetcher.Form
+            method="post"
+            action={action}
+            onSubmit={() => (submitted.current = true)}
+          >
+            {children}
+            {/* Same z-50 tie-break dependency as ConfirmDelete: this modal
+                wins over an open drawer only because it mounts later. */}
+            <Button
+              variant={confirmVariant}
+              isLoading={fetcher.state !== "idle"}
+              isDisabled={fetcher.state !== "idle"}
+              type="submit"
+              shortcut={SHORTCUTS.confirm}
+            >
+              {confirmText}
+            </Button>
+          </fetcher.Form>
+        </ModalFooter>
+      </ModalContent>
+    </Modal>
+  );
+};
+
+export default Confirm;

@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { validationError, validator } from "@carbon/form";
+import { useRouteData } from "@carbon/react";
+import { isUniqueViolation } from "@carbon/utils";
+import type { ActionFunctionArgs } from "react-router";
+import { useNavigate, useParams } from "react-router";
+import type { PartSummary } from "~/modules/items";
+import { supplierPartValidator, upsertSupplierPart } from "~/modules/items";
+import { SupplierPartForm } from "~/modules/items/ui/Item";
+import { setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    create: "parts"
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const formData = await request.formData();
+  const validation = await validator(supplierPartValidator).validate(formData);
+
+  if (validation.error) {
+    return {
+      success: false,
+      message: "Invalid form data"
+    };
+  }
+
+  // biome-ignore lint/correctness/noUnusedVariables: suppressed due to migration
+  const { id, ...d } = validation.data;
+
+  const createPartSupplier = await upsertSupplierPart(client, {
+    ...d,
+    companyId,
+    createdBy: userId,
+    customFields: setCustomFields(formData)
+  });
+
+  // buyMethod_part_supplier_unique: one supplier part per item and supplier
+  if (isUniqueViolation(createPartSupplier.error)) {
+    return validationError({
+      fieldErrors: {
+        supplierId: "This item already has a supplier part for this supplier"
+      }
+    });
+  }
+
+  if (createPartSupplier.error) {
+    return {
+      success: false,
+      message: "Failed to create part supplier"
+    };
+  }
+
+  const newSupplierPartId = createPartSupplier.data?.id;
+  const priceBreaksRaw = formData.get("priceBreaks");
+  if (newSupplierPartId && priceBreaksRaw) {
+    const priceBreaks = JSON.parse(priceBreaksRaw as string) as {
+      quantity: number;
+      supplierUnitPrice: number;
+      leadTime: number;
+    }[];
+    if (priceBreaks.length > 0) {
+      await client.from("supplierPartPrice").insert(
+        priceBreaks.map((pb) => ({
+          supplierPartId: newSupplierPartId,
+          quantity: pb.quantity,
+          supplierUnitPrice: pb.supplierUnitPrice,
+          leadTime: pb.leadTime ?? 0,
+          sourceType: "Manual Entry" as const,
+          companyId,
+          createdBy: userId,
+          updatedBy: userId
+        }))
+      );
+    }
+  }
+
+  return { success: true, message: "Part supplier created" };
+}
+
+export default function NewPartSupplierRoute() {
+  const { itemId } = useParams();
+
+  if (!itemId) throw new Error("itemId not found");
+
+  const routeData = useRouteData<{ partSummary: PartSummary }>(
+    path.to.part(itemId)
+  );
+
+  const initialValues = {
+    itemId: itemId,
+    supplierId: "",
+    supplierPartId: "",
+    supplierUnitPrice: 0,
+    supplierUnitOfMeasureCode: "EA",
+    minimumOrderQuantity: 1,
+    orderMultiple: 1,
+    conversionFactor: 1
+  };
+
+  const navigate = useNavigate();
+  const onClose = () => navigate(path.to.partPurchasing(itemId));
+
+  return (
+    <SupplierPartForm
+      type="Part"
+      initialValues={initialValues}
+      unitOfMeasureCode={routeData?.partSummary?.unitOfMeasureCode ?? ""}
+      onClose={onClose}
+    />
+  );
+}

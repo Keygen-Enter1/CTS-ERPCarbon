@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ValidatedForm } from "@carbon/form";
+import {
+  HStack,
+  ModalDrawer,
+  ModalDrawerBody,
+  ModalDrawerContent,
+  ModalDrawerFooter,
+  ModalDrawerHeader,
+  ModalDrawerProvider,
+  ModalDrawerTitle,
+  toast,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { useEffect, useState } from "react";
+import { useFetcher, useParams } from "react-router";
+import type { z } from "zod";
+import { Hidden, Item, Number, StorageUnit, Submit } from "~/components/Form";
+import { usePermissions, useRouteData } from "~/hooks";
+import {
+  inventoryItemTypes,
+  isStockTransferLocked,
+  type StockTransfer,
+  stockTransferLineValidator
+} from "~/modules/inventory";
+import type { ItemType } from "~/modules/shared/types";
+import { useItems } from "~/stores/items";
+import { path } from "~/utils/path";
+
+type StockTransferLineFormProps = {
+  initialValues: z.infer<typeof stockTransferLineValidator>;
+  locationId: string;
+  type?: "modal" | "drawer";
+  open?: boolean;
+  onClose: (data?: { id: string; name: string }) => void;
+};
+
+const StockTransferLineForm = ({
+  initialValues,
+  locationId,
+  open = true,
+  type = "drawer",
+  onClose
+}: StockTransferLineFormProps) => {
+  const { id } = useParams();
+  if (!id) throw new Error("id not found");
+
+  const permissions = usePermissions();
+  const { t } = useLingui();
+  const routeData = useRouteData<{
+    stockTransfer: StockTransfer;
+  }>(path.to.stockTransfer(id));
+  const fetcher = useFetcher<PostgrestResponse<{ id: string }>>();
+  const [items] = useItems();
+  const [itemId, setItemId] = useState<string | null>(
+    initialValues.itemId ?? null
+  );
+
+  const [itemType, setItemType] = useState<ItemType | "Item">(() => {
+    if (initialValues.itemId) {
+      return (
+        (items.find((item) => item.id === initialValues.itemId)
+          ?.type as ItemType) ?? "Item"
+      );
+    }
+    return "Item";
+  });
+
+  const [itemTrackingType, setItemTrackingType] = useState<string | null>(
+    () => {
+      if (initialValues.itemId) {
+        return (
+          items.find((item) => item.id === initialValues.itemId)
+            ?.itemTrackingType ?? null
+        );
+      }
+      return null;
+    }
+  );
+
+  const onTypeChange = (t: ItemType | "Item") => {
+    setItemType(t);
+    setItemId(null);
+  };
+
+  const onItemChange = (itemId: string) => {
+    setItemId(itemId);
+    const item = items.find((item) => item.id === itemId);
+    const itemType = (item?.type as ItemType) ?? "Item";
+    const trackingType = item?.itemTrackingType ?? null;
+    setItemType(itemType);
+    setItemTrackingType(trackingType);
+  };
+
+  useEffect(() => {
+    if (type !== "modal") return;
+
+    if (fetcher.state === "loading" && fetcher.data?.data) {
+      onClose?.();
+      toast.success(t`Created stock transfer line`);
+    } else if (fetcher.state === "idle" && fetcher.data?.error) {
+      toast.error(
+        t`Failed to create stock transfer line: ${fetcher.data.error.message}`
+      );
+    }
+  }, [fetcher.data, fetcher.state, onClose, type, t]);
+
+  const isEditing = initialValues.id !== undefined;
+  const isLocked = isStockTransferLocked(routeData?.stockTransfer?.status);
+  const isDisabled =
+    isLocked ||
+    (isEditing
+      ? !permissions.can("update", "inventory")
+      : !permissions.can("create", "inventory"));
+
+  return (
+    <ModalDrawerProvider type={type}>
+      <ModalDrawer
+        open={open}
+        onOpenChange={(open) => {
+          if (!open) onClose?.();
+        }}
+      >
+        <ModalDrawerContent>
+          <ValidatedForm
+            validator={stockTransferLineValidator}
+            method="post"
+            action={
+              isEditing
+                ? path.to.stockTransferLine(id, initialValues.id!)
+                : path.to.newStockTransferLine(id)
+            }
+            defaultValues={initialValues}
+            fetcher={fetcher}
+            className="flex flex-col h-full"
+          >
+            <ModalDrawerHeader>
+              <ModalDrawerTitle>
+                {isEditing ? t`Edit Line` : t`New Line`}
+              </ModalDrawerTitle>
+            </ModalDrawerHeader>
+            <ModalDrawerBody>
+              <Hidden name="id" />
+              <Hidden name="stockTransferId" />
+              <Hidden
+                name="requiresSerialTracking"
+                value={itemTrackingType === "Serial" ? "true" : "false"}
+              />
+              <Hidden
+                name="requiresBatchTracking"
+                value={itemTrackingType === "Batch" ? "true" : "false"}
+              />
+              <VStack spacing={4}>
+                <Item
+                  name="itemId"
+                  label={
+                    itemType === "Part"
+                      ? t`Part`
+                      : itemType === "Material"
+                        ? t`Material`
+                        : itemType === "Tool"
+                          ? t`Tool`
+                          : itemType === "Consumable"
+                            ? t`Consumable`
+                            : t`Item`
+                  }
+                  type={itemType}
+                  // Only stockable types can be transferred — Services are
+                  // Non-Inventory and must not be selectable here.
+                  validItemTypes={[...inventoryItemTypes]}
+                  locationId={locationId}
+                  onTypeChange={onTypeChange}
+                  onChange={(value) => {
+                    onItemChange(value?.value as string);
+                  }}
+                  value={itemId ?? undefined}
+                />
+                <Number
+                  name="quantity"
+                  label={t`Quantity`}
+                  minValue={itemTrackingType === "Serial" ? 1 : 0}
+                  maxValue={itemTrackingType === "Serial" ? 1 : undefined}
+                  defaultValue={itemTrackingType === "Serial" ? 1 : undefined}
+                />
+                <StorageUnit
+                  name="fromStorageUnitId"
+                  label={t`From Storage Unit`}
+                  locationId={locationId}
+                  itemId={itemId ?? undefined}
+                />
+                <StorageUnit
+                  name="toStorageUnitId"
+                  label={t`To Storage Unit`}
+                  locationId={locationId}
+                  itemId={itemId ?? undefined}
+                />
+              </VStack>
+            </ModalDrawerBody>
+            <ModalDrawerFooter>
+              <HStack>
+                <Submit isDisabled={isDisabled}>
+                  <Trans>Save</Trans>
+                </Submit>
+              </HStack>
+            </ModalDrawerFooter>
+          </ValidatedForm>
+        </ModalDrawerContent>
+      </ModalDrawer>
+    </ModalDrawerProvider>
+  );
+};
+
+export default StockTransferLineForm;

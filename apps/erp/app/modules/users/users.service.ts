@@ -1,0 +1,661 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+import { fetchAllFromTable } from "@carbon/database";
+import { getLogger } from "@carbon/logger";
+import { datetime } from "@carbon/utils";
+import type { PostgrestError, SupabaseClient } from "@supabase/supabase-js";
+import type { GenericQueryFilters } from "~/utils/query";
+import { LIST_COUNT, setGenericQueryFilters } from "~/utils/query";
+import type { UserSelectGroupMembers } from "./types";
+
+const logger = getLogger("erp", "users");
+
+/**
+ * The ITAR gate: does a valid, unexpired entity Rider acceptance exist for this
+ * company, and a valid user attestation for this user? Both are required before
+ * a person can enter a controlled environment.
+ * @mcp read
+ */
+export async function getItarCertificationStatus(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  userId: string
+): Promise<{ entityCertified: boolean; userCertified: boolean }> {
+  const now = datetime.timestamp();
+
+  const [entity, user] = await Promise.all([
+    client
+      .from("itarCertification")
+      .select("id")
+      .eq("companyId", companyId)
+      .eq("type", "entity")
+      .gt("expiresAt", now)
+      .limit(1)
+      .maybeSingle(),
+    client
+      .from("itarCertification")
+      .select("id")
+      .eq("companyId", companyId)
+      .eq("type", "user")
+      .eq("userId", userId)
+      .gt("expiresAt", now)
+      .limit(1)
+      .maybeSingle()
+  ]);
+
+  return {
+    entityCertified: Boolean(entity.data),
+    userCertified: Boolean(user.data)
+  };
+}
+
+/**
+ * The company's latest entity Rider acceptance, or null when nobody has accepted
+ * one yet. Returned regardless of expiry so the compliance report can tell
+ * "expired, needs re-acceptance" from "never accepted" — the gate blocks on both,
+ * but they are different findings to an auditor.
+ *
+ * Carbon staff never appear here: the Rider binds the customer's own
+ * organization, so only the customer's admin can produce this row.
+ * @mcp read
+ */
+export async function getItarEntityCertification(
+  client: SupabaseClient<Database>,
+  companyId: string
+) {
+  return client
+    .from("itarCertification")
+    .select(
+      "userId, fullLegalName, title, complianceContact, docVersion, certifiedAt, expiresAt"
+    )
+    .eq("companyId", companyId)
+    .eq("type", "entity")
+    .order("certifiedAt", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+}
+
+/**
+ * Compliance report source: every active employee with their latest ITAR
+ * certification (version / date / expiry). Both reads page past the 1000-row
+ * Supabase limit via `fetchAllFromTable` so tenants above 1000 employees (or
+ * certifications) don't silently lose rows; certs are already company-scoped, so
+ * we fetch them all and group in memory rather than passing an unbounded `userId`
+ * array to `.in()`. Last login is layered on in the route from the Auth admin API.
+ * @mcp read
+ */
+export async function getItarCertificationReport(
+  client: SupabaseClient<Database>,
+  companyId: string
+) {
+  const employees = await fetchAllFromTable<{
+    id: string | null;
+    name: string | null;
+    email: string | null;
+  }>(client, "employees", "id, name, email", (query) =>
+    query.eq("companyId", companyId)
+  );
+
+  if (employees.error || !employees.data) {
+    return { data: null, error: employees.error };
+  }
+
+  const certs = await fetchAllFromTable<{
+    userId: string | null;
+    docVersion: string;
+    certifiedAt: string;
+    expiresAt: string;
+  }>(
+    client,
+    "itarCertification",
+    "userId, docVersion, certifiedAt, expiresAt",
+    (query) =>
+      query
+        .eq("companyId", companyId)
+        .eq("type", "user")
+        .order("certifiedAt", { ascending: false })
+  );
+
+  if (certs.error) {
+    return { data: null, error: certs.error };
+  }
+
+  // First row per user is the latest (ordered desc above).
+  const latestByUser = new Map<
+    string,
+    { docVersion: string; certifiedAt: string; expiresAt: string }
+  >();
+  for (const cert of certs.data ?? []) {
+    if (cert.userId && !latestByUser.has(cert.userId)) {
+      latestByUser.set(cert.userId, {
+        docVersion: cert.docVersion,
+        certifiedAt: cert.certifiedAt,
+        expiresAt: cert.expiresAt
+      });
+    }
+  }
+
+  const data = employees.data.map((employee) => {
+    const cert = employee.id ? latestByUser.get(employee.id) : undefined;
+    return {
+      id: employee.id,
+      name: employee.name,
+      email: employee.email,
+      certVersion: cert?.docVersion ?? null,
+      certifiedAt: cert?.certifiedAt ?? null,
+      expiresAt: cert?.expiresAt ?? null
+    };
+  });
+
+  return { data, error: null };
+}
+
+/** @mcp delete */
+export async function deleteGroup(
+  client: SupabaseClient<Database>,
+  groupId: string
+) {
+  return client.from("group").delete().eq("id", groupId);
+}
+
+/** @mcp read */
+export async function getCompaniesForUser(
+  client: SupabaseClient<Database>,
+  userId: string
+) {
+  const { data, error } = await client
+    .from("userToCompany")
+    .select("companyId")
+    .eq("userId", userId);
+
+  if (error) {
+    logger.error("Failed to get companies for user", { userId, error });
+    return [];
+  }
+
+  return data?.map((row) => row.companyId) ?? [];
+}
+
+/** @mcp read */
+export async function getCustomers(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+  }
+) {
+  // TODO: this breaks on customerType filters -- convert to view
+  let query = client
+    .from("customerAccount")
+    .select(
+      `active, user!inner(id, fullName, firstName, lastName, email, avatarUrl),
+      customer!inner(name, customerType!left(name))`,
+      { count: LIST_COUNT }
+    )
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.ilike("user.fullName", `%${args.search}%`);
+  }
+
+  query = setGenericQueryFilters(query, args, [
+    { column: "user(lastName)", ascending: true }
+  ]);
+  return query;
+}
+
+/** @mcp read */
+export async function getEmployee(
+  client: SupabaseClient<Database>,
+  id: string,
+  companyId: string
+) {
+  return client
+    .from("employees")
+    .select("*")
+    .eq("id", id)
+    .eq("companyId", companyId)
+    .single();
+}
+
+// Pending only (mirrors the 'Invited' condition in the `employees` view): counting
+// accepted invites would leave a deactivated employee with no way to be re-invited.
+/** @mcp read */
+export async function getUnrevokedInviteEmails(
+  client: SupabaseClient<Database>,
+  companyId: string
+) {
+  return client
+    .from("invite")
+    .select("email")
+    .eq("companyId", companyId)
+    .is("acceptedAt", null)
+    .is("revokedAt", null);
+}
+
+/**
+ * User ids in this company with a verified authenticator.
+ *
+ * One RPC rather than a per-row lookup: TOTP factors live in Supabase's
+ * `auth.mfa_factors`, so the alternative is an admin-API call per employee —
+ * an N+1 that degrades with headcount.
+ * @mcp read
+ */
+export async function getUsersWithVerifiedMfa(
+  client: SupabaseClient<Database>,
+  companyId: string
+) {
+  return client.rpc("users_with_verified_mfa", { company_id: companyId });
+}
+
+/** @mcp read */
+export async function getEmployees(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+  }
+) {
+  let query = client
+    .from("employees")
+    .select("*", { count: LIST_COUNT })
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.ilike("name", `%${args.search}%`);
+  }
+
+  // Default to Active + Invited so pending invites surface alongside live
+  // users. Previously-deactivated users stay hidden. The explicit status
+  // filter (Active / Invited / Inactive) overrides this default when the
+  // user picks a value from the dropdown.
+  const hasStatusFilter = args.filters?.some((f) => f.column === "status");
+  if (!hasStatusFilter) {
+    query = query.in("status", ["Active", "Invited"]);
+  }
+
+  query = setGenericQueryFilters(query, args, [
+    { column: "lastName", ascending: true }
+  ]);
+  return query;
+}
+
+/**
+ * Gets console operators — users with @console.internal emails.
+ * Uses the employees view (which joins user + employee) and filters
+ * by the synthetic email pattern since there's no FK from employee to user
+ * for PostgREST to use directly.
+ *
+ * TODO: After running db:generate, replace email pattern filter with
+ * .eq("isConsoleOperator", true) once the column is in the employees view.
+ * @mcp read
+ */
+export async function getConsoleOperators(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+  }
+) {
+  let query = client
+    .from("employees")
+    .select("*", { count: LIST_COUNT })
+    .eq("companyId", companyId)
+    .like("email", "%@console.internal");
+
+  if (args.search) {
+    query = query.ilike("name", `%${args.search}%`);
+  }
+
+  query = setGenericQueryFilters(query, args, [
+    { column: "lastName", ascending: true }
+  ]);
+  return query;
+}
+
+/** @mcp read */
+export async function getEmployeeType(
+  client: SupabaseClient<Database>,
+  employeeTypeId: string
+) {
+  return client
+    .from("employeeType")
+    .select("*")
+    .eq("id", employeeTypeId)
+    .single();
+}
+
+/** @mcp read */
+export async function getEmployeeTypes(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args?: GenericQueryFilters & { search: string | null }
+) {
+  let query = client
+    .from("employeeType")
+    .select("*", { count: LIST_COUNT })
+    .eq("companyId", companyId);
+
+  if (args?.search) {
+    query = query.ilike("name", `%${args.search}%`);
+  }
+
+  if (args) {
+    query = setGenericQueryFilters(query, args, [
+      { column: "name", ascending: true }
+    ]);
+  }
+
+  return query;
+}
+
+/** @mcp read */
+export async function getInvitable(
+  client: SupabaseClient<Database>,
+  companyId: string
+) {
+  return client
+    .from("employeesAcrossCompanies")
+    .select("*")
+    .eq("active", true)
+    .not("companyId", "cs", `{"${companyId}"}`)
+    .order("lastName");
+}
+
+/** @mcp read */
+export async function getModules(client: SupabaseClient<Database>) {
+  return client.from("modules").select("name").order("name");
+}
+
+/** @mcp read */
+export async function getGroup(
+  client: SupabaseClient<Database>,
+  groupId: string
+) {
+  return client.from("group").select("id, name").eq("id", groupId).single();
+}
+
+/** @mcp read */
+export async function getGroupMembers(
+  client: SupabaseClient<Database>,
+  groupId: string
+) {
+  return client
+    .from("groupMembers")
+    .select("name, groupId, memberGroupId, memberUserId")
+    .eq("groupId", groupId);
+}
+
+/** @mcp read */
+export async function getGroups(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args?: GenericQueryFilters & {
+    search: string | null;
+    uid: string | null;
+  }
+) {
+  let query = client
+    .rpc("groups_query", {
+      _uid: args?.uid ?? "",
+      _name: args?.search ?? ""
+    })
+    .eq("companyId", companyId);
+
+  if (args) query = setGenericQueryFilters(query, args);
+
+  return query;
+}
+
+/** @mcp read */
+export async function getGroupEmails(
+  client: SupabaseClient<Database>,
+  groupIds: string[]
+): Promise<string[]> {
+  if (!groupIds || groupIds.length === 0) return [];
+
+  const userIdsResult = (await client.rpc("users_for_groups", {
+    groups: groupIds
+  })) as { data: string[]; error: unknown };
+
+  if (userIdsResult.error || !Array.isArray(userIdsResult.data)) return [];
+
+  return getUserEmails(client, userIdsResult.data);
+}
+
+/** @mcp read */
+export async function getUserSelectGroups(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: { type?: string; search?: string; limit: number; offset: number }
+) {
+  return client.rpc("get_user_select_groups", {
+    p_company_id: companyId,
+    p_limit: args.limit,
+    p_offset: args.offset,
+    ...(args.type ? { p_type: args.type } : {}),
+    ...(args.search ? { p_search: args.search } : {})
+  });
+}
+
+/** @mcp read */
+export async function getUserSelectGroupMembers(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  groupId: string
+): Promise<{
+  data: UserSelectGroupMembers | null;
+  error: PostgrestError | null;
+}> {
+  const result = await client.rpc("get_user_select_group_members", {
+    p_company_id: companyId,
+    p_group_id: groupId
+  });
+  return {
+    data: result.data as unknown as UserSelectGroupMembers | null,
+    error: result.error
+  };
+}
+
+/** @mcp read */
+export async function searchUsersForSelect(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: {
+    q: string;
+    type?: string;
+    excludeSelf?: boolean;
+    allowedIds?: string[];
+    userId: string;
+  }
+) {
+  // Search exactly the population the user-select tree can reach: active
+  // users who are members of this company's groups (the groupMembers view
+  // joins active users only — same visibility rule as expanding a group),
+  // filtered by the same type flags as get_user_select_groups. Rows repeat
+  // per group membership — the caller dedupes by memberUserId.
+  let query = client
+    .from("groupMembers")
+    .select("memberUserId, user")
+    .eq("companyId", companyId)
+    .not("memberUserId", "is", null)
+    .ilike("user->>fullName", `%${args.q}%`)
+    .limit(100);
+
+  if (args.type === "customer") {
+    query = query.or("isCustomerTypeGroup.eq.true,isCustomerOrgGroup.eq.true");
+  } else if (args.type === "supplier") {
+    query = query.or("isSupplierTypeGroup.eq.true,isSupplierOrgGroup.eq.true");
+  } else {
+    query = query
+      .eq("isCustomerTypeGroup", false)
+      .eq("isCustomerOrgGroup", false)
+      .eq("isSupplierTypeGroup", false)
+      .eq("isSupplierOrgGroup", false);
+  }
+
+  if (args.excludeSelf) {
+    query = query.neq("memberUserId", args.userId);
+  }
+
+  if (args.allowedIds && args.allowedIds.length > 0) {
+    query = query.in("memberUserId", args.allowedIds);
+  }
+
+  return query;
+}
+
+/** @mcp action */
+export async function resolveUserSelectIds(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  ids: string[]
+) {
+  const [users, groups] = await Promise.all([
+    client
+      .from("user")
+      .select("id, firstName, lastName, fullName, email, avatarUrl")
+      .in("id", ids),
+    client
+      .from("group")
+      .select("id, name")
+      .in("id", ids)
+      .eq("companyId", companyId)
+      .eq("isIdentityGroup", false)
+  ]);
+  return { users, groups };
+}
+
+/** @mcp read */
+export async function getPermissionsByEmployeeType(
+  client: SupabaseClient<Database>,
+  employeeTypeId: string
+) {
+  return client
+    .from("employeeTypePermission")
+    .select("view, create, update, delete, module")
+    .eq("employeeTypeId", employeeTypeId);
+}
+
+/** @mcp read */
+export async function getSuppliers(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+  }
+) {
+  // TODO: this breaks on supplierType filters -- convert to view
+  let query = client
+    .from("supplierAccount")
+    .select(
+      `active, user!inner(id, fullName, firstName, lastName, email, avatarUrl),
+      supplier!inner(name, supplierType!left(name))`,
+      { count: LIST_COUNT }
+    )
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.ilike("user.fullName", `%${args.search}%`);
+  }
+
+  query = setGenericQueryFilters(query, args, [
+    { column: "user(lastName)", ascending: true }
+  ]);
+  return query;
+}
+
+/** @mcp read */
+export async function getUsers(client: SupabaseClient<Database>) {
+  return fetchAllFromTable<{
+    id: string;
+    firstName: string;
+    lastName: string;
+    fullName: string;
+    email: string;
+    avatarUrl: string | null;
+  }>(
+    client,
+    "user",
+    "id, firstName, lastName, fullName, email, avatarUrl",
+    (query) => query.eq("active", true).order("lastName")
+  );
+}
+
+/** @mcp read */
+export async function getUserEmails(
+  client: SupabaseClient<Database>,
+  userIds: string[]
+): Promise<string[]> {
+  if (!userIds || userIds.length === 0) return [];
+
+  const result = await client
+    .from("user")
+    .select("email")
+    .in("id", userIds)
+    .eq("active", true);
+
+  if (result.error || !result.data) return [];
+
+  return result.data
+    .map((u) => u.email)
+    .filter((email): email is string => !!email);
+}
+
+/** @mcp create */
+export async function insertGroup(
+  client: SupabaseClient<Database>,
+  group: { name: string; companyId: string }
+) {
+  return client.from("group").insert(group).select("*").single();
+}
+
+/** @mcp upsert */
+export async function upsertGroup(
+  client: SupabaseClient<Database>,
+  {
+    id,
+    name,
+    companyId
+  }: {
+    id: string;
+    name: string;
+    companyId: string;
+  }
+) {
+  return client.from("group").upsert([{ id, name, companyId }]);
+}
+
+/** @mcp upsert destructive */
+export async function upsertGroupMembers(
+  client: SupabaseClient<Database>,
+  groupId: string,
+  selections: string[]
+) {
+  const deleteExisting = await client
+    .from("membership")
+    .delete()
+    .eq("groupId", groupId);
+
+  if (deleteExisting.error) return deleteExisting;
+
+  // separate each id according to whether it is a group or a user
+  const memberGroups = selections
+    .filter((id) => id.startsWith("group_"))
+    .map((id) => ({
+      groupId,
+      memberGroupId: id.slice(6)
+    }));
+
+  const memberUsers = selections
+    .filter((id) => id.startsWith("user_"))
+    .map((id) => ({
+      groupId,
+      memberUserId: id.slice(5)
+    }));
+
+  return client.from("membership").insert([...memberGroups, ...memberUsers]);
+}

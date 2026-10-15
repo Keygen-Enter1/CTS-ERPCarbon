@@ -1,0 +1,1733 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { getQuoteDisplayId } from "@carbon/documents/utils";
+import { Input, ValidatedForm } from "@carbon/form";
+import type { JSONContent } from "@carbon/react";
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  ClientOnly,
+  cn,
+  DisabledReason,
+  generateHTML,
+  Heading,
+  HStack,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalDescription,
+  ModalFooter,
+  ModalHeader,
+  ModalOverlay,
+  ModalTitle,
+  RadioGroup,
+  RadioGroupItem,
+  Separator,
+  Table,
+  Tbody,
+  Td,
+  Th,
+  Thead,
+  Tr,
+  TruncatedTooltipText,
+  toast,
+  useDisclosure,
+  useMode,
+  VStack
+} from "@carbon/react";
+import { formatCityStatePostalCode, moneyFormatOptions } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useLocale } from "@react-aria/i18n";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { motion } from "motion/react";
+import type { Dispatch, SetStateAction } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useDropzone } from "react-dropzone";
+import {
+  LuChevronRight,
+  LuCircleX,
+  LuCreditCard,
+  LuImage,
+  LuTruck,
+  LuUpload
+} from "react-icons/lu";
+import type { LoaderFunctionArgs } from "react-router";
+import { useFetcher, useLoaderData, useParams } from "react-router";
+import { DateTime, MotionMoney } from "~/components";
+import {
+  CompanySettingsProvider,
+  CurrenciesProvider,
+  useCurrencyDecimals,
+  useCurrencyFormatter,
+  usePercentFormatter
+} from "~/hooks";
+import { getCurrenciesList, getPaymentTermsList } from "~/modules/accounting";
+import { getShippingMethodsList } from "~/modules/inventory";
+import type { SalesOrderLine } from "~/modules/sales";
+import {
+  externalQuoteValidator,
+  getOpportunity,
+  getQuoteByExternalId,
+  getQuoteCustomerDetails,
+  getQuoteLinePricesByQuoteId,
+  getQuoteLines,
+  getQuotePayment,
+  getQuoteShipment,
+  getSalesOrderLines,
+  getSalesTerms
+} from "~/modules/sales";
+import QuoteStatus from "~/modules/sales/ui/Quotes/QuoteStatus";
+import { getCompany, getCompanySettings } from "~/modules/settings";
+import { getBase64ImageFromSupabase } from "~/modules/shared";
+import type { action } from "~/routes/api+/sales.digital-quote.$id";
+import { path } from "~/utils/path";
+
+export const meta = () => {
+  return [{ title: "Digital Quote" }];
+};
+
+enum QuoteState {
+  Valid,
+  Expired,
+  NotFound
+}
+
+export async function loader({ params, request }: LoaderFunctionArgs) {
+  const { id } = params;
+  if (!id) {
+    return {
+      state: QuoteState.NotFound,
+      data: null
+    };
+  }
+
+  const serviceRole = getCarbonServiceRole();
+  const quote = await getQuoteByExternalId(serviceRole, id);
+
+  if (quote.error) {
+    return {
+      state: QuoteState.NotFound,
+      data: null
+    };
+  }
+
+  if (
+    quote.data.expirationDate &&
+    new Date(quote.data.expirationDate) < new Date() &&
+    quote.data.status === "Sent"
+  ) {
+    return {
+      state: QuoteState.Expired,
+      data: null
+    };
+  }
+
+  const [
+    company,
+    companySettings,
+    quoteLines,
+    quoteLinePrices,
+    customerDetails,
+    quotePayment,
+    quoteShipment,
+    paymentTerms,
+    terms,
+    shippingMethods,
+    opportunity
+  ] = await Promise.all([
+    getCompany(serviceRole, quote.data.companyId),
+    getCompanySettings(serviceRole, quote.data.companyId),
+    getQuoteLines(serviceRole, quote.data.id),
+    getQuoteLinePricesByQuoteId(serviceRole, quote.data.id),
+    getQuoteCustomerDetails(serviceRole, quote.data.id),
+    getQuotePayment(serviceRole, quote.data.id),
+    getQuoteShipment(serviceRole, quote.data.id),
+    getPaymentTermsList(serviceRole, quote.data.companyId),
+    getSalesTerms(serviceRole, quote.data.companyId),
+    getShippingMethodsList(serviceRole, quote.data.companyId),
+    getOpportunity(serviceRole, quote.data.opportunityId)
+  ]);
+
+  // A No Quote line is the company's own decision not to bid — the customer
+  // never sees it, its prices, or its thumbnail.
+  const quotedLines = (quoteLines.data ?? []).filter(
+    (line) => line.status !== "No Quote"
+  );
+  const quotedLineIds = new Set(quotedLines.map((line) => line.id));
+
+  // Started before the conditional await below so this costs no extra round trip.
+  // The group's configured currency.decimalPlaces is authoritative over CLDR, and
+  // useCurrencies' own fetcher is permission-gated, so a public page has to carry
+  // the list itself or every amount here silently falls back to CLDR.
+  const currenciesPromise = company.data?.companyGroupId
+    ? getCurrenciesList(serviceRole, company.data.companyGroupId)
+    : null;
+
+  let salesOrderLines: PostgrestResponse<SalesOrderLine> | null = null;
+  if (
+    opportunity.data?.salesOrders?.length &&
+    opportunity.data.salesOrders[0]?.id
+  ) {
+    salesOrderLines = await getSalesOrderLines(
+      serviceRole,
+      opportunity.data.salesOrders[0].id
+    );
+  }
+
+  const thumbnailPaths = quotedLines.reduce<Record<string, string | null>>(
+    (acc, line) => {
+      if (line.thumbnailPath) {
+        acc[line.id!] = line.thumbnailPath;
+      }
+      return acc;
+    },
+    {}
+  );
+
+  const thumbnails: Record<string, string | null> =
+    (thumbnailPaths
+      ? await Promise.all(
+          Object.entries(thumbnailPaths).map(([id, path]) => {
+            if (!path) {
+              return null;
+            }
+            return getBase64ImageFromSupabase(serviceRole, path).then(
+              (data) => ({
+                id,
+                data
+              })
+            );
+          })
+        )
+      : []
+    )?.reduce<Record<string, string | null>>((acc, thumbnail) => {
+      if (thumbnail) {
+        acc[thumbnail.id] = thumbnail.data;
+      }
+      return acc;
+    }, {}) ?? {};
+
+  // Anyone holding the share link receives this payload, so it carries only
+  // what the page renders — never whole rows (unit cost, price trace, pricing
+  // rule, category markups, internal notes, notification groups…).
+  const { internalNotes: _internalNotes, ...publicQuote } = quote.data;
+
+  return {
+    state: QuoteState.Valid,
+    data: {
+      quote: publicQuote,
+      company: company.data,
+      companySettings: companySettings.data
+        ? {
+            digitalQuoteEnabled: companySettings.data.digitalQuoteEnabled,
+            digitalQuoteIncludesPurchaseOrders:
+              companySettings.data.digitalQuoteIncludesPurchaseOrders,
+            showCurrencyTrailingZeros:
+              companySettings.data.showCurrencyTrailingZeros
+          }
+        : null,
+      currencies: (await currenciesPromise)?.data ?? [],
+      quoteLines: quotedLines.map((line) => ({
+        id: line.id,
+        description: line.description,
+        itemReadableId: line.itemReadableId,
+        quantity: line.quantity,
+        additionalCharges: line.additionalCharges,
+        taxPercent: line.taxPercent,
+        unitPricePrecision: line.unitPricePrecision,
+        externalNotes: line.externalNotes
+      })),
+      thumbnails: thumbnails,
+      quoteLinePrices:
+        quoteLinePrices.data
+          ?.filter((price) => quotedLineIds.has(price.quoteLineId))
+          .map((price) => ({
+            quoteLineId: price.quoteLineId,
+            quantity: price.quantity,
+            unitPrice: price.unitPrice,
+            convertedUnitPrice: price.convertedUnitPrice,
+            netUnitPrice: price.netUnitPrice,
+            convertedNetUnitPrice: price.convertedNetUnitPrice,
+            discountPercent: price.discountPercent,
+            shippingCost: price.shippingCost,
+            convertedShippingCost: price.convertedShippingCost,
+            leadTime: price.leadTime
+          })) ?? null,
+      customerDetails: customerDetails.data,
+      quotePayment: quotePayment.data,
+      quoteShipment: quoteShipment.data,
+      paymentTerm: paymentTerms.data?.find(
+        (term) => term.id === quotePayment.data?.paymentTermId
+      )?.name,
+      terms: terms.data?.salesTerms ?? "",
+      shippingMethod: shippingMethods.data?.find(
+        (method) => method.id === quoteShipment.data?.shippingMethodId
+      )?.name,
+      salesOrderLines:
+        salesOrderLines?.data?.map((line) => ({
+          id: line.id,
+          saleQuantity: line.saleQuantity
+        })) ?? null
+    }
+  };
+}
+
+const Header = ({
+  company,
+  quote,
+  customer,
+  locale
+}: {
+  company: QuoteData["company"];
+  quote: QuoteData["quote"];
+  customer: QuoteData["customerDetails"];
+  locale: string;
+}) => (
+  <div className="flex justify-between">
+    <div className="flex items-center space-x-4 tracking-tight">
+      <div>
+        <CardTitle className="text-3xl">{company?.name ?? ""}</CardTitle>
+        {quote?.quoteId && (
+          <p className="text-lg text-muted-foreground">
+            {getQuoteDisplayId(quote)}
+          </p>
+        )}
+        {quote?.expirationDate && (
+          <p className="text-lg text-muted-foreground">
+            <Trans>Expires</Trans>{" "}
+            <DateTime value={quote.expirationDate} variant="date" />
+          </p>
+        )}
+      </div>
+    </div>
+    <div className="flex flex-col gap-2 items-end justify-start">
+      <p className="text-xl font-medium">{customer?.customerName ?? ""}</p>
+      {customer?.contactName && (
+        <p className="text-base text-muted-foreground">
+          {customer.contactName ?? ""}
+        </p>
+      )}
+      {customer?.customerAddressLine1 && (
+        <div className="text-right">
+          <p className="text-xs text-muted-foreground">
+            {customer.customerAddressLine1}
+          </p>
+
+          {customer?.customerAddressLine2 && (
+            <p className="text-xs text-muted-foreground">
+              {customer.customerAddressLine2}
+            </p>
+          )}
+          <p className="text-xs text-muted-foreground">
+            {formatCityStatePostalCode(
+              customer?.customerCity ?? "",
+              customer?.customerStateProvince ?? "",
+              customer?.customerPostalCode ?? ""
+            )}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {customer?.customerCountryName ?? ""}
+          </p>
+        </div>
+      )}
+    </div>
+  </div>
+);
+
+type SelectedLine = {
+  quantity: number;
+  netUnitPrice: number;
+  convertedNetUnitPrice: number;
+  addOn: number;
+  convertedAddOn: number;
+  taxableAddOn: number;
+  convertedTaxableAddOn: number;
+  leadTime: number;
+  shippingCost: number;
+  convertedShippingCost: number;
+  taxPercent: number;
+  discountPercent: number;
+  unitPrice: number;
+  convertedUnitPrice: number;
+};
+
+const deselectedLine: SelectedLine = {
+  addOn: 0,
+  convertedAddOn: 0,
+  taxableAddOn: 0,
+  convertedTaxableAddOn: 0,
+  netUnitPrice: 0,
+  convertedNetUnitPrice: 0,
+  quantity: 0,
+  leadTime: 0,
+  shippingCost: 0,
+  convertedShippingCost: 0,
+  taxPercent: 0,
+  discountPercent: 0,
+  unitPrice: 0,
+  convertedUnitPrice: 0
+};
+
+const LineItems = ({
+  currencyCode,
+  formatter,
+  locale,
+  selectedLines,
+  setSelectedLines
+}: {
+  currencyCode: string;
+  formatter: Intl.NumberFormat;
+  locale: string;
+  selectedLines: Record<string, SelectedLine>;
+  setSelectedLines: Dispatch<SetStateAction<Record<string, SelectedLine>>>;
+}) => {
+  // Settlement money at the document currency's configured decimals.
+  const currencyDecimals = useCurrencyDecimals(currencyCode);
+  const { company, quote, quoteLines, quoteLinePrices, thumbnails } =
+    useLoaderData<typeof loader>().data!;
+
+  const [openItems, setOpenItems] = useState<string[]>(() => {
+    if (!Array.isArray(quoteLines) || quoteLines.length === 0) {
+      return [];
+    }
+    if (["Ordered", "Partial", "Expired", "Cancelled"].includes(quote.status)) {
+      return [];
+    }
+    return quoteLines.filter((line) => !!line.id).map((line) => line.id!);
+  });
+  const pricingByLine = useMemo(
+    () =>
+      quoteLines?.reduce<Record<string, QuoteLinePriceOption[]>>(
+        (acc, line) => {
+          if (!line.id) {
+            return acc;
+          }
+          // Scope to the breaks the line actually offers. A removed break can
+          // leave its price row behind, and an orphan here becomes a selectable
+          // option the customer was never meant to see.
+          acc[line.id!] =
+            quoteLinePrices
+              ?.filter(
+                (p) =>
+                  p.quoteLineId === line.id &&
+                  Array.isArray(line.quantity) &&
+                  line.quantity.includes(p.quantity)
+              )
+              .sort((a, b) => a.quantity - b.quantity) ?? [];
+          return acc;
+        },
+        {}
+      ) ?? {},
+    [quoteLines, quoteLinePrices]
+  );
+
+  const toggleOpen = (id: string) => {
+    setOpenItems((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
+
+  const shouldConvertCurrency =
+    quote.currencyCode !== company?.baseCurrencyCode;
+
+  return (
+    <VStack spacing={8} className="w-full">
+      {quoteLines?.map((line) => {
+        if (!line || !line.id) {
+          return null;
+        }
+
+        return (
+          <motion.div
+            key={line.id}
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="border-b border-input py-6 w-full"
+          >
+            <HStack spacing={4} className="items-start">
+              {thumbnails[line.id!] ? (
+                <img
+                  alt={line.itemReadableId!}
+                  className="w-24 h-24 shrink-0 bg-gradient-to-bl from-muted to-muted/40 rounded-lg"
+                  src={thumbnails[line.id!] ?? undefined}
+                />
+              ) : (
+                <div className="w-24 h-24 shrink-0 bg-gradient-to-bl from-muted to-muted/40 rounded-lg p-4">
+                  <LuImage className="w-16 h-16 text-muted-foreground" />
+                </div>
+              )}
+
+              {/* flex-1 + min-w-0, not w-full: `width: 100%` on a flex item
+                  resolves against the row's full width and ignores the
+                  thumbnail beside it, pushing the description and price
+                  past the card edge. min-w-0 is what lets truncate bite. */}
+              <VStack spacing={0} className="flex-1 min-w-0">
+                <div
+                  className="flex flex-col cursor-pointer w-full min-w-0"
+                  onClick={() => toggleOpen(line.id!)}
+                >
+                  <div className="flex items-center gap-x-4 justify-between flex-grow min-w-0">
+                    {/* min-w-0 so a long item id wraps inside the card
+                        instead of shoving the price out of it. */}
+                    <div className="flex min-w-0 items-center gap-2">
+                      <Heading className="min-w-0">
+                        {line.itemReadableId}
+                      </Heading>
+                      {selectedLines[line.id!]?.quantity === 0 &&
+                        (pricingByLine[line.id!]?.length ?? 0) > 0 &&
+                        ![
+                          "Ordered",
+                          "Partial",
+                          "Expired",
+                          "Cancelled"
+                        ].includes(quote.status) && (
+                          <Badge variant="secondary" className="shrink-0">
+                            <Trans>Removed</Trans>
+                          </Badge>
+                        )}
+                    </div>
+                    <HStack spacing={4} className="shrink-0">
+                      <MotionMoney
+                        className="font-semibold text-xl whitespace-nowrap"
+                        value={
+                          (selectedLines[line.id!]?.convertedNetUnitPrice ??
+                            0) *
+                            (selectedLines[line.id!]?.quantity ?? 0) +
+                          (selectedLines[line.id!]?.convertedAddOn ?? 0) +
+                          (selectedLines[line.id!]?.convertedShippingCost ??
+                            0) +
+                          ((selectedLines[line.id!]?.convertedNetUnitPrice ??
+                            0) *
+                            (selectedLines[line.id!]?.quantity ?? 0) +
+                            (selectedLines[line.id!]?.convertedTaxableAddOn ??
+                              0) +
+                            (selectedLines[line.id!]?.convertedShippingCost ??
+                              0)) *
+                            (selectedLines[line.id!]?.taxPercent ?? 0)
+                        }
+                        currency={currencyCode}
+                        decimalPlaces={currencyDecimals}
+                      />
+                      <motion.div
+                        animate={{
+                          rotate: openItems.includes(line.id) ? 90 : 0
+                        }}
+                        transition={{ duration: 0.3 }}
+                      >
+                        <LuChevronRight size={24} />
+                      </motion.div>
+                    </HStack>
+                  </div>
+                  <TruncatedTooltipText
+                    className="text-muted-foreground text-base truncate"
+                    tooltip={line.description}
+                  >
+                    {line.description}
+                  </TruncatedTooltipText>
+                  {Object.keys(line.externalNotes ?? {}).length > 0 && (
+                    <div
+                      className="prose dark:prose-invert mt-2 text-muted-foreground"
+                      dangerouslySetInnerHTML={{
+                        __html: generateHTML(line.externalNotes as JSONContent)
+                      }}
+                    />
+                  )}
+                </div>
+              </VStack>
+            </HStack>
+
+            <motion.div
+              initial="collapsed"
+              animate={openItems.includes(line.id) ? "open" : "collapsed"}
+              variants={{
+                open: { opacity: 1, height: "auto", marginTop: 16 },
+                collapsed: { opacity: 0, height: 0, marginTop: 0 }
+              }}
+              transition={{ duration: 0.3 }}
+              className="w-full overflow-hidden"
+            >
+              <LinePricingOptions
+                formatter={formatter}
+                line={line}
+                options={pricingByLine[line.id!]}
+                quoteCurrency={quote.currencyCode ?? "USD"}
+                quoteExchangeRate={quote.exchangeRate ?? 1}
+                shouldConvertCurrency={shouldConvertCurrency}
+                locale={locale}
+                selectedLine={selectedLines[line.id!]}
+                setSelectedLines={setSelectedLines}
+              />
+            </motion.div>
+          </motion.div>
+        );
+      })}
+    </VStack>
+  );
+};
+
+type LinePricingOptionsProps = {
+  line: QuoteData["quoteLines"][number];
+  options: QuoteLinePriceOption[];
+  quoteCurrency: string;
+  shouldConvertCurrency: boolean;
+  quoteExchangeRate: number;
+  locale: string;
+  formatter: Intl.NumberFormat;
+  selectedLine: SelectedLine;
+  setSelectedLines: Dispatch<SetStateAction<Record<string, SelectedLine>>>;
+};
+
+const LinePricingOptions = ({
+  line,
+  options,
+  quoteCurrency,
+  shouldConvertCurrency,
+  quoteExchangeRate,
+  locale,
+  formatter,
+  selectedLine,
+  setSelectedLines
+}: LinePricingOptionsProps) => {
+  // Settlement money at the document currency's configured decimals.
+  const currencyDecimals = useCurrencyDecimals(quoteCurrency);
+  const percentFormatter = usePercentFormatter();
+  const { quote, quoteLines } = useLoaderData<typeof loader>().data!;
+  // Removing the only item would just empty the quote; Reject covers that.
+  const canRemoveLine =
+    (quoteLines?.filter((quoteLine) => !!quoteLine.id).length ?? 0) > 1;
+
+  const [selectedValue, setSelectedValue] = useState<string | null>(
+    selectedLine?.quantity?.toString() ?? null
+  );
+
+  const additionalChargesByQuantity =
+    line.quantity?.reduce(
+      (acc, quantity) => {
+        const charges = Object.values(line.additionalCharges ?? {}).reduce(
+          (chargeAcc, charge) => {
+            const amount = charge.amounts?.[quantity];
+            return chargeAcc + amount;
+          },
+          0
+        );
+        acc[quantity] = charges;
+        return acc;
+      },
+      { 0: 0 } as Record<number, number>
+    ) ?? {};
+
+  const convertedAdditionalChargesByQuantity = Object.entries(
+    additionalChargesByQuantity
+  ).reduce<Record<number, number>>(
+    (acc, [quantity, amount]) => {
+      acc[Number(quantity)] = amount * quoteExchangeRate;
+      return acc;
+    },
+    { 0: 0 }
+  );
+
+  const taxableAdditionalChargesByQuantity =
+    line.quantity?.reduce(
+      (acc, quantity) => {
+        const charges = Object.values(line.additionalCharges ?? {}).reduce(
+          (chargeAcc, charge) => {
+            if (charge.taxable === false) return chargeAcc;
+            const amount = charge.amounts?.[quantity];
+            return chargeAcc + amount;
+          },
+          0
+        );
+        acc[quantity] = charges;
+        return acc;
+      },
+      { 0: 0 } as Record<number, number>
+    ) ?? {};
+
+  const convertedTaxableAdditionalChargesByQuantity = Object.entries(
+    taxableAdditionalChargesByQuantity
+  ).reduce<Record<number, number>>(
+    (acc, [quantity, amount]) => {
+      acc[Number(quantity)] = amount * quoteExchangeRate;
+      return acc;
+    },
+    { 0: 0 }
+  );
+
+  const additionalCharges: { name: string; amount: number }[] = [];
+  if (selectedLine.convertedShippingCost) {
+    additionalCharges.push({
+      name: "Shipping",
+      amount: selectedLine.convertedShippingCost
+    });
+  }
+  Object.entries(line.additionalCharges ?? {}).forEach(([name, charge]) => {
+    additionalCharges.push({
+      name: charge.description,
+      amount: charge.amounts?.[selectedLine.quantity] * quoteExchangeRate
+    });
+  });
+
+  const unitPriceformatter = useMemo(
+    () =>
+      new Intl.NumberFormat(
+        locale,
+        moneyFormatOptions(line.unitPricePrecision ?? 2, {
+          currency: quote.currencyCode ?? "USD"
+        })
+      ),
+    [locale, quote.currencyCode, line.unitPricePrecision]
+  );
+
+  const hasAnyDiscount = options.some((option) => option.discountPercent > 0);
+  const hasAnyShipping = options.some(
+    (option) => (option.convertedShippingCost ?? 0) > 0
+  );
+  const hasAnyFees = options.some(
+    (option) => (convertedAdditionalChargesByQuantity[option.quantity] ?? 0) > 0
+  );
+
+  return (
+    <VStack spacing={4}>
+      <RadioGroup
+        className="w-full"
+        value={selectedValue ?? undefined}
+        disabled={["Ordered", "Partial", "Expired", "Cancelled"].includes(
+          quote.status
+        )}
+        onValueChange={(value) => {
+          const selectedOption =
+            value === "0"
+              ? deselectedLine
+              : options.find((opt) => opt.quantity.toString() === value);
+
+          if (selectedOption) {
+            setSelectedLines((prev) => ({
+              ...prev,
+              [line.id!]: {
+                quantity: selectedOption.quantity,
+                netUnitPrice: selectedOption.netUnitPrice ?? 0,
+                convertedNetUnitPrice:
+                  selectedOption.convertedNetUnitPrice ?? 0,
+                addOn:
+                  additionalChargesByQuantity[selectedOption.quantity] || 0,
+                convertedAddOn:
+                  convertedAdditionalChargesByQuantity[
+                    selectedOption.quantity
+                  ] || 0,
+                taxableAddOn:
+                  taxableAdditionalChargesByQuantity[selectedOption.quantity] ||
+                  0,
+                convertedTaxableAddOn:
+                  convertedTaxableAdditionalChargesByQuantity[
+                    selectedOption.quantity
+                  ] || 0,
+                leadTime: selectedOption.leadTime,
+                shippingCost: selectedOption.shippingCost ?? 0,
+                convertedShippingCost:
+                  selectedOption.convertedShippingCost ?? 0,
+                taxPercent: line.taxPercent ?? 0,
+                discountPercent: selectedOption.discountPercent ?? 0,
+                unitPrice: selectedOption.unitPrice ?? 0,
+                convertedUnitPrice: selectedOption.convertedUnitPrice ?? 0
+              }
+            }));
+            setSelectedValue(value);
+          }
+        }}
+      >
+        <Table>
+          <Thead>
+            <Tr>
+              <Th />
+              <Th>
+                <Trans>Quantity</Trans>
+              </Th>
+              <Th>
+                <Trans>Unit Price</Trans>
+              </Th>
+              {hasAnyDiscount && (
+                <Th>
+                  <Trans>Discount</Trans>
+                </Th>
+              )}
+              {hasAnyShipping && (
+                <Th>
+                  <Trans>Shipping</Trans>
+                </Th>
+              )}
+              {hasAnyFees && (
+                <Th>
+                  <Trans>Fees</Trans>
+                </Th>
+              )}
+              <Th>
+                <Trans>Lead Time</Trans>
+              </Th>
+              <Th>
+                <Trans>Subtotal</Trans>
+              </Th>
+            </Tr>
+          </Thead>
+          <Tbody>
+            {!Array.isArray(options) || options.length === 0 ? (
+              <Tr>
+                <Td
+                  colSpan={
+                    5 +
+                    (hasAnyDiscount ? 1 : 0) +
+                    (hasAnyShipping ? 1 : 0) +
+                    (hasAnyFees ? 1 : 0)
+                  }
+                  className="text-center py-8"
+                >
+                  <Trans>No pricing options found</Trans>
+                </Td>
+              </Tr>
+            ) : (
+              options.map(
+                (option, index) =>
+                  (line?.quantity?.includes(option.quantity) ||
+                    option.quantity === 0) && (
+                    <Tr key={index}>
+                      <Td>
+                        <RadioGroupItem
+                          value={option.quantity.toString()}
+                          id={`${line.id}:${option.quantity.toString()}`}
+                        />
+                        <label
+                          htmlFor={`${line.id}:${option.quantity.toString()}`}
+                          className="sr-only"
+                        >
+                          {option.quantity}
+                        </label>
+                      </Td>
+                      <Td>{option.quantity}</Td>
+                      <Td>
+                        {unitPriceformatter.format(
+                          option.convertedUnitPrice ?? 0
+                        )}
+                      </Td>
+                      {hasAnyDiscount && (
+                        <Td>
+                          {option.discountPercent > 0
+                            ? percentFormatter.format(option.discountPercent)
+                            : "-"}
+                        </Td>
+                      )}
+                      {hasAnyShipping && (
+                        <Td>
+                          {(option.convertedShippingCost ?? 0) > 0
+                            ? formatter.format(
+                                option.convertedShippingCost ?? 0
+                              )
+                            : "-"}
+                        </Td>
+                      )}
+                      {hasAnyFees && (
+                        <Td>
+                          {(convertedAdditionalChargesByQuantity[
+                            option.quantity
+                          ] ?? 0) > 0
+                            ? formatter.format(
+                                convertedAdditionalChargesByQuantity[
+                                  option.quantity
+                                ]
+                              )
+                            : "-"}
+                        </Td>
+                      )}
+                      <Td>
+                        {new Intl.NumberFormat(locale, {
+                          style: "unit",
+                          unit: "day"
+                        }).format(option.leadTime)}
+                      </Td>
+                      <Td>
+                        {formatter.format(
+                          (option.convertedNetUnitPrice ?? 0) *
+                            option.quantity +
+                            convertedAdditionalChargesByQuantity[
+                              option.quantity
+                            ] +
+                            (option.convertedShippingCost ?? 0)
+                        )}
+                      </Td>
+                    </Tr>
+                  )
+              )
+            )}
+          </Tbody>
+        </Table>
+      </RadioGroup>
+
+      {selectedLine.quantity !== 0 && (
+        <div className="w-full">
+          <Table>
+            <Tbody>
+              <Tr key="extended-price" className="border-b border-border">
+                <Td>
+                  <Trans>Extended Price</Trans>
+                </Td>
+                <Td className="text-right">
+                  <MotionMoney
+                    value={
+                      (selectedLine.convertedUnitPrice ?? 0) *
+                      selectedLine.quantity
+                    }
+                    currency={quoteCurrency}
+                    decimalPlaces={currencyDecimals}
+                  />
+                </Td>
+              </Tr>
+
+              {selectedLine.discountPercent > 0 && (
+                <Tr key="discount" className="border-b border-border">
+                  <Td>
+                    Discount (
+                    {percentFormatter.format(selectedLine.discountPercent)})
+                  </Td>
+                  <Td className="text-right">
+                    -
+                    <MotionMoney
+                      value={
+                        (selectedLine.convertedUnitPrice ?? 0) *
+                        selectedLine.quantity *
+                        selectedLine.discountPercent
+                      }
+                      currency={quoteCurrency}
+                      decimalPlaces={currencyDecimals}
+                    />
+                  </Td>
+                </Tr>
+              )}
+
+              {additionalCharges.length > 0 &&
+                additionalCharges.map((charge) => (
+                  <Tr
+                    key={charge.name}
+                    className={
+                      additionalCharges[additionalCharges.length - 1] === charge
+                        ? "border-b border-border"
+                        : ""
+                    }
+                  >
+                    <Td>{charge.name}</Td>
+                    <Td className="text-right">
+                      <MotionMoney
+                        value={charge.amount}
+                        currency={quoteCurrency}
+                        decimalPlaces={currencyDecimals}
+                      />
+                    </Td>
+                  </Tr>
+                ))}
+
+              <Tr key="subtotal">
+                <Td>
+                  <Trans>Subtotal</Trans>
+                </Td>
+                <Td className="text-right">
+                  <MotionMoney
+                    value={
+                      (selectedLine.convertedNetUnitPrice ?? 0) *
+                        selectedLine.quantity +
+                      selectedLine.convertedAddOn +
+                      selectedLine.convertedShippingCost
+                    }
+                    currency={quoteCurrency}
+                    decimalPlaces={currencyDecimals}
+                  />
+                </Td>
+              </Tr>
+
+              <Tr key="tax" className="border-b border-border">
+                <Td>
+                  <Trans>Tax</Trans> (
+                  {percentFormatter.format(selectedLine.taxPercent)})
+                </Td>
+                <Td className="text-right">
+                  <MotionMoney
+                    value={
+                      ((selectedLine.convertedNetUnitPrice ?? 0) *
+                        selectedLine.quantity +
+                        (selectedLine.convertedTaxableAddOn ?? 0) +
+                        selectedLine.convertedShippingCost) *
+                      selectedLine.taxPercent
+                    }
+                    currency={quoteCurrency}
+                    decimalPlaces={currencyDecimals}
+                  />
+                </Td>
+              </Tr>
+
+              <Tr key="total" className="font-semibold">
+                <Td>
+                  <Trans>Total</Trans>
+                </Td>
+                <Td className="text-right">
+                  <MotionMoney
+                    value={
+                      (selectedLine.convertedNetUnitPrice ?? 0) *
+                        selectedLine.quantity +
+                      selectedLine.convertedAddOn +
+                      selectedLine.convertedShippingCost +
+                      ((selectedLine.convertedNetUnitPrice ?? 0) *
+                        selectedLine.quantity +
+                        (selectedLine.convertedTaxableAddOn ?? 0) +
+                        selectedLine.convertedShippingCost) *
+                        selectedLine.taxPercent
+                    }
+                    currency={quoteCurrency}
+                    decimalPlaces={currencyDecimals}
+                  />
+                </Td>
+              </Tr>
+            </Tbody>
+          </Table>
+        </div>
+      )}
+
+      {canRemoveLine &&
+        selectedLine.quantity !== 0 &&
+        !["Ordered", "Partial", "Expired", "Cancelled"].includes(
+          quote.status
+        ) && (
+          <HStack spacing={2} className="w-full justify-end items-center">
+            <Button
+              variant="secondary"
+              leftIcon={<LuCircleX />}
+              onClick={() => {
+                setSelectedValue("0");
+                setSelectedLines((prev) => ({
+                  ...prev,
+                  [line.id!]: deselectedLine
+                }));
+              }}
+            >
+              <Trans>Remove this item</Trans>
+            </Button>
+          </HStack>
+        )}
+    </VStack>
+  );
+};
+
+const Quote = ({ data }: { data: QuoteData }) => {
+  const {
+    company,
+    companySettings,
+    customerDetails,
+    paymentTerm,
+    quote,
+    quoteLines,
+    quoteLinePrices,
+    quoteShipment,
+    salesOrderLines,
+    shippingMethod,
+    terms
+  } = data;
+  const { t } = useLingui();
+  const { locale } = useLocale();
+  const formatter = useCurrencyFormatter({
+    currency: quote.currencyCode ?? "USD"
+  });
+  // Settlement money at the document currency's configured decimals.
+  const currencyDecimals = useCurrencyDecimals(quote.currencyCode ?? "USD");
+
+  const { id } = useParams();
+  if (!id) throw new Error("Could not find external quote id");
+
+  const confirmQuoteModal = useDisclosure();
+  const rejectQuoteModal = useDisclosure();
+
+  const fetcher = useFetcher<typeof action>();
+  const submitted = useRef<boolean>(false);
+  const mode = useMode();
+  const logo = mode === "dark" ? company?.logoDark : company?.logoLight;
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  useEffect(() => {
+    if (fetcher.state === "idle" && submitted.current) {
+      confirmQuoteModal.onClose();
+      rejectQuoteModal.onClose();
+      submitted.current = false;
+    }
+  }, [fetcher.state]);
+
+  useEffect(() => {
+    if (fetcher.data?.success === true && fetcher?.data?.message) {
+      toast.success(fetcher.data.message);
+    }
+
+    if (fetcher.data?.success === false && fetcher?.data?.message) {
+      toast.error(fetcher.data.message);
+    }
+  }, [fetcher.data?.message, fetcher.data?.success]);
+
+  const [selectedLines, setSelectedLines] = useState<
+    Record<string, SelectedLine>
+  >(() => {
+    return (
+      quoteLines?.reduce<Record<string, SelectedLine>>(
+        (acc: Record<string, SelectedLine>, line: any) => {
+          const salesOrderLine = salesOrderLines?.find(
+            (salesOrderLine: any) => salesOrderLine.id === line.id
+          );
+
+          if (
+            Array.isArray(salesOrderLines) &&
+            salesOrderLines.length > 0 &&
+            !salesOrderLine
+          ) {
+            acc[line.id!] = deselectedLine;
+            return acc;
+          }
+
+          const price = salesOrderLine
+            ? quoteLinePrices?.find(
+                (price: any) =>
+                  price.quoteLineId === salesOrderLine.id &&
+                  price.quantity === salesOrderLine.saleQuantity
+              )
+            : quoteLinePrices?.find(
+                (price: any) =>
+                  price.quoteLineId === line.id &&
+                  line.quantity?.includes(price.quantity)
+              );
+
+          if (!line.id) {
+            return acc;
+          }
+
+          if (!price) {
+            acc[line.id] = deselectedLine;
+            return acc;
+          }
+
+          const additionalChargesByQuantity =
+            line.quantity?.reduce(
+              (acc: Record<number, number>, quantity: number) => {
+                const charges = Object.values(
+                  line.additionalCharges ?? {}
+                ).reduce((chargeAcc: number, charge: any) => {
+                  const amount = charge.amounts?.[quantity] ?? 0;
+                  return chargeAcc + amount;
+                }, 0);
+                acc[quantity] = charges;
+                return acc;
+              },
+              {} as Record<number, number>
+            ) ?? {};
+
+          const convertedAdditionalChargesByQuantity =
+            Object.entries(additionalChargesByQuantity).reduce<
+              Record<number, number>
+            >(
+              (acc, [quantity, amount]) => {
+                acc[Number(quantity)] =
+                  (amount as number) * (quote.exchangeRate ?? 1);
+                return acc;
+              },
+              {} as Record<number, number>
+            ) ?? {};
+
+          const taxableAdditionalChargesByQuantity =
+            line.quantity?.reduce(
+              (acc: Record<number, number>, quantity: number) => {
+                const charges = Object.values(
+                  line.additionalCharges ?? {}
+                ).reduce((chargeAcc: number, charge: any) => {
+                  if (charge.taxable === false) return chargeAcc;
+                  const amount = charge.amounts?.[quantity] ?? 0;
+                  return chargeAcc + amount;
+                }, 0);
+                acc[quantity] = charges;
+                return acc;
+              },
+              {} as Record<number, number>
+            ) ?? {};
+
+          const convertedTaxableAdditionalChargesByQuantity =
+            Object.entries(taxableAdditionalChargesByQuantity).reduce<
+              Record<number, number>
+            >(
+              (acc, [quantity, amount]) => {
+                acc[Number(quantity)] =
+                  (amount as number) * (quote.exchangeRate ?? 1);
+                return acc;
+              },
+              {} as Record<number, number>
+            ) ?? {};
+
+          acc[line.id] = {
+            quantity: price.quantity ?? 0,
+            netUnitPrice: price.netUnitPrice ?? 0,
+            convertedNetUnitPrice: price.convertedNetUnitPrice ?? 0,
+            addOn: additionalChargesByQuantity[price.quantity] || 0,
+            convertedAddOn:
+              convertedAdditionalChargesByQuantity[price.quantity] || 0,
+            taxableAddOn:
+              taxableAdditionalChargesByQuantity[price.quantity] || 0,
+            convertedTaxableAddOn:
+              convertedTaxableAdditionalChargesByQuantity[price.quantity] || 0,
+            leadTime: price.leadTime,
+            shippingCost: price.shippingCost ?? 0,
+            convertedShippingCost: price.convertedShippingCost ?? 0,
+            taxPercent: line.taxPercent ?? 0,
+            discountPercent: price.discountPercent ?? 0,
+            unitPrice: price.unitPrice ?? 0,
+            convertedUnitPrice: price.convertedUnitPrice ?? 0
+          };
+          return acc;
+        },
+        {}
+      ) ?? {}
+    );
+  });
+
+  const subtotal = Object.values(selectedLines).reduce((acc, line) => {
+    return (
+      acc +
+      line.convertedNetUnitPrice * line.quantity +
+      line.convertedAddOn +
+      line.convertedShippingCost
+    );
+  }, 0);
+  const totalDiscount = Object.values(selectedLines).reduce((acc, line) => {
+    return (
+      acc +
+      (line.convertedUnitPrice ?? 0) *
+        line.quantity *
+        (line.discountPercent ?? 0)
+    );
+  }, 0);
+  const tax = Object.values(selectedLines).reduce((acc, line) => {
+    return (
+      acc +
+      (line.convertedNetUnitPrice * line.quantity +
+        (line.convertedTaxableAddOn ?? 0) +
+        line.convertedShippingCost) *
+        (line.taxPercent ?? 0)
+    );
+  }, 0);
+  const convertedShippingCost =
+    (quote.exchangeRate ?? 1) * (quoteShipment?.shippingCost ?? 0);
+  const total = subtotal + tax + convertedShippingCost;
+  // Gate on items, not money: quote-level shipping keeps the total above zero
+  // even after the customer removes every item.
+  const hasSelectedItem = Object.values(selectedLines).some(
+    (line) => line.quantity > 0
+  );
+
+  const termsHTML = generateHTML(terms as JSONContent);
+
+  const [file, setFile] = useState<File | null>(null);
+  const onDrop = (acceptedFiles: File[]) => {
+    setFile(acceptedFiles[0]);
+  };
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: { "application/pdf": [".pdf"] },
+    maxFiles: 1,
+    maxSize: 25 * 1024 * 1024 // 25MB limit
+  });
+
+  return (
+    <VStack spacing={8} className="w-full items-center p-2 md:p-8">
+      {logo && (
+        <img
+          src={logo}
+          alt={company?.name ?? ""}
+          className="w-auto mx-auto max-w-5xl"
+        />
+      )}
+      <Card className="w-full max-w-5xl mx-auto">
+        <CardHeader>
+          <div className="w-full text-center">
+            {!["Sent", "Lost"].includes(quote.status) && (
+              <QuoteStatus status={quote.status} />
+            )}
+            {quote?.status === "Lost" && <Badge variant="red">Rejected</Badge>}
+          </div>
+
+          <Header
+            company={company}
+            quote={quote}
+            customer={customerDetails}
+            locale={locale}
+          />
+        </CardHeader>
+        <CardContent>
+          <LineItems
+            currencyCode={quote.currencyCode ?? "USD"}
+            locale={locale}
+            formatter={formatter}
+            selectedLines={selectedLines}
+            setSelectedLines={setSelectedLines}
+          />
+
+          {Object.keys(quote?.externalNotes ?? {}).length > 0 && (
+            <div className="mt-6 mb-2">
+              <Heading size="h4" className="mb-2">
+                <Trans>Notes</Trans>
+              </Heading>
+              <div
+                className="prose dark:prose-invert text-muted-foreground"
+                dangerouslySetInnerHTML={{
+                  __html: generateHTML(quote.externalNotes as JSONContent)
+                }}
+              />
+            </div>
+          )}
+
+          <VStack spacing={2} className="mt-8">
+            {shippingMethod && (
+              <HStack className="justify-between text-sm text-muted-foreground w-full">
+                <HStack spacing={2}>
+                  <LuTruck className="w-5 h-5" />
+                  <span>
+                    <Trans>Shipping Method</Trans>:
+                  </span>
+                </HStack>
+                <span className="text-foreground font-semibold">
+                  {shippingMethod}
+                </span>
+              </HStack>
+            )}
+            {paymentTerm && (
+              <HStack className="justify-between text-sm text-muted-foreground w-full">
+                <HStack spacing={2}>
+                  <LuCreditCard className="w-5 h-5" />
+                  <span>
+                    <Trans>Payment Term</Trans>:
+                  </span>
+                </HStack>
+                <span className="text-foreground font-semibold">
+                  {paymentTerm}
+                </span>
+              </HStack>
+            )}
+            {(shippingMethod || paymentTerm) && <Separator />}
+            <HStack className="justify-between text-base w-full">
+              <span>
+                <Trans>Subtotal</Trans>:
+              </span>
+              <MotionMoney
+                value={subtotal + totalDiscount}
+                currency={quote.currencyCode ?? "USD"}
+                decimalPlaces={currencyDecimals}
+              />
+            </HStack>
+            {totalDiscount > 0 && (
+              <HStack className="justify-between text-base w-full">
+                <span>Discount:</span>
+                <span className="text-muted-foreground">
+                  -
+                  <MotionMoney
+                    value={totalDiscount}
+                    currency={quote.currencyCode ?? "USD"}
+                    decimalPlaces={currencyDecimals}
+                  />
+                </span>
+              </HStack>
+            )}
+            <HStack className="justify-between text-base w-full">
+              <span>
+                <Trans>Tax</Trans>:
+              </span>
+              <MotionMoney
+                value={tax}
+                currency={quote.currencyCode ?? "USD"}
+                decimalPlaces={currencyDecimals}
+              />
+            </HStack>
+            {convertedShippingCost > 0 && (
+              <HStack className="justify-between text-base w-full">
+                <span>
+                  <Trans>Shipping</Trans>:
+                </span>
+                <MotionMoney
+                  value={convertedShippingCost}
+                  currency={quote.currencyCode ?? "USD"}
+                  decimalPlaces={currencyDecimals}
+                />
+              </HStack>
+            )}
+            <Separator className="my-2" />
+            <HStack className="justify-between text-xl font-semibold w-full">
+              <span>
+                <Trans>Total</Trans>:
+              </span>
+              <MotionMoney
+                value={total}
+                currency={quote.currencyCode ?? "USD"}
+                decimalPlaces={currencyDecimals}
+              />
+            </HStack>
+          </VStack>
+          <div className="flex flex-col gap-2">
+            {companySettings?.digitalQuoteEnabled &&
+              quote?.status === "Sent" && (
+                <>
+                  <DisabledReason
+                    className="w-full mt-8"
+                    reason={
+                      hasSelectedItem
+                        ? undefined
+                        : t`Select at least one item to accept the quote`
+                    }
+                  >
+                    <Button
+                      onClick={confirmQuoteModal.onOpen}
+                      size="lg"
+                      variant="primary"
+                      isDisabled={!hasSelectedItem}
+                      className="w-full text-lg"
+                    >
+                      <Trans>Accept Quote</Trans>
+                    </Button>
+                  </DisabledReason>
+                  <Button
+                    onClick={rejectQuoteModal.onOpen}
+                    size="lg"
+                    variant="link"
+                  >
+                    <Trans>Reject Quote</Trans>
+                  </Button>
+                </>
+              )}
+          </div>
+        </CardContent>
+      </Card>
+      {/* generateHTML returns nothing on the server, so the server never
+          renders this block: rendering it during hydration would not match. */}
+      <ClientOnly>
+        {() =>
+          termsHTML ? (
+            <div
+              className="prose dark:prose-invert text-muted-foreground max-w-5xl mx-auto"
+              dangerouslySetInnerHTML={{
+                __html: termsHTML
+              }}
+            />
+          ) : null
+        }
+      </ClientOnly>
+      {confirmQuoteModal.isOpen && (
+        <Modal
+          open
+          onOpenChange={(open) => {
+            if (!open) confirmQuoteModal.onClose();
+          }}
+        >
+          <ModalOverlay />
+          <ModalContent>
+            <ValidatedForm
+              action={path.to.api.digitalQuote(id)}
+              validator={externalQuoteValidator}
+              method="post"
+              fetcher={fetcher}
+              onSubmit={() => {
+                submitted.current = true;
+              }}
+              encType="multipart/form-data"
+            >
+              <ModalHeader>
+                <ModalTitle>
+                  <Trans>Accept Quote</Trans>
+                </ModalTitle>
+                <ModalDescription>
+                  <Trans>
+                    Are you sure you want to accept quote{" "}
+                    {getQuoteDisplayId(quote)} for {formatter.format(total)}?
+                  </Trans>
+                </ModalDescription>
+              </ModalHeader>
+              <ModalBody>
+                {!companySettings?.digitalQuoteIncludesPurchaseOrders && (
+                  <input type="hidden" name="file" />
+                )}
+                <input type="hidden" name="type" value="accept" />
+                <div className="space-y-4 py-4">
+                  <Input
+                    name="digitalQuoteAcceptedBy"
+                    label={t`Please enter your name`}
+                  />
+                  <Input
+                    name="digitalQuoteAcceptedByEmail"
+                    label={t`Please enter your email address`}
+                  />
+                  {companySettings?.digitalQuoteIncludesPurchaseOrders && (
+                    <div
+                      {...getRootProps()}
+                      className={cn(
+                        "w-full border-2 border-dashed rounded-lg p-8 text-center cursor-pointer",
+                        isDragActive ? "border-primary" : "border-muted"
+                      )}
+                    >
+                      <input name="file" {...getInputProps()} />
+                      {file ? (
+                        <>
+                          <p>{file.name}</p>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => setFile(null)}
+                          >
+                            <Trans>Change</Trans>
+                          </Button>
+                        </>
+                      ) : (
+                        <>
+                          <p>
+                            <Trans>
+                              Drag and drop a Purchase Order PDF here, or click
+                              to select a file
+                            </Trans>
+                          </p>
+                          <LuUpload className="mx-auto mt-4 h-12 w-12 text-muted-foreground" />
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="secondary" onClick={confirmQuoteModal.onClose}>
+                  <Trans>Cancel</Trans>
+                </Button>
+                <input
+                  type="hidden"
+                  name="selectedLines"
+                  value={JSON.stringify(selectedLines)}
+                />
+
+                <Button
+                  isLoading={fetcher.state !== "idle"}
+                  isDisabled={fetcher.state !== "idle"}
+                  type="submit"
+                >
+                  <Trans>Yes, Accept</Trans>
+                </Button>
+              </ModalFooter>
+            </ValidatedForm>
+          </ModalContent>
+        </Modal>
+      )}
+
+      {rejectQuoteModal.isOpen && (
+        <Modal
+          open
+          onOpenChange={(open) => {
+            if (!open) rejectQuoteModal.onClose();
+          }}
+        >
+          <ModalOverlay />
+          <ModalContent>
+            <ValidatedForm
+              action={path.to.api.digitalQuote(id)}
+              validator={externalQuoteValidator}
+              method="post"
+              fetcher={fetcher}
+              onSubmit={() => {
+                submitted.current = true;
+              }}
+            >
+              <ModalHeader>
+                <ModalTitle>
+                  <Trans>Reject Quote</Trans>
+                </ModalTitle>
+                <ModalDescription>
+                  <Trans>Are you sure you want to reject this quote?</Trans>
+                </ModalDescription>
+              </ModalHeader>
+              <ModalBody>
+                <input type="hidden" name="type" value="reject" />
+                <div className="space-y-4 py-4">
+                  <Input
+                    name="digitalQuoteRejectedBy"
+                    label={t`Please enter your name`}
+                  />
+                  <Input
+                    name="digitalQuoteRejectedByEmail"
+                    label={t`Please enter your email address`}
+                  />
+                </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="secondary" onClick={rejectQuoteModal.onClose}>
+                  <Trans>Cancel</Trans>
+                </Button>
+
+                <Button
+                  isLoading={fetcher.state !== "idle"}
+                  isDisabled={fetcher.state !== "idle"}
+                  variant="destructive"
+                  type="submit"
+                >
+                  <Trans>Yes, Reject</Trans>
+                </Button>
+              </ModalFooter>
+            </ValidatedForm>
+          </ModalContent>
+        </Modal>
+      )}
+    </VStack>
+  );
+};
+
+export const ErrorMessage = ({
+  title,
+  message
+}: {
+  title: string;
+  message: string;
+}) => {
+  const containerVariants = {
+    hidden: { opacity: 0 },
+    visible: {
+      opacity: 1,
+      transition: {
+        delay: 0.3,
+        when: "beforeChildren",
+        staggerChildren: 0.2
+      }
+    }
+  };
+
+  const itemVariants = {
+    hidden: { y: 20, opacity: 0 },
+    visible: {
+      y: 0,
+      opacity: 1
+    }
+  };
+
+  return (
+    <motion.div
+      className="flex min-h-screen flex-col items-center justify-center p-4 text-center"
+      initial="hidden"
+      animate="visible"
+      variants={containerVariants}
+    >
+      <motion.div
+        className="w-full max-w-md space-y-8"
+        variants={containerVariants}
+      >
+        <motion.div
+          className="relative mx-auto h-24 w-24"
+          variants={itemVariants}
+        >
+          <svg
+            className="absolute inset-0"
+            viewBox="0 0 100 100"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <motion.circle
+              cx="50"
+              cy="50"
+              r="45"
+              stroke="hsl(var(--muted))"
+              strokeWidth="10"
+              initial={{ pathLength: 0 }}
+              animate={{ pathLength: 1 }}
+              transition={{ duration: 2, ease: "easeInOut" }}
+            />
+            <motion.path
+              d="M50 5 A45 45 0 0 1 95 50"
+              stroke="hsl(var(--primary))"
+              strokeWidth="10"
+              strokeLinecap="round"
+              initial={{ pathLength: 0 }}
+              animate={{ pathLength: 1 }}
+              transition={{
+                duration: 2,
+                ease: "easeInOut"
+              }}
+            />
+          </svg>
+          <motion.div
+            className="absolute inset-0 flex items-center justify-center"
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            transition={{
+              delay: 0.5,
+              type: "spring",
+              stiffness: 200,
+              damping: 10
+            }}
+          >
+            <span className="text-2xl font-semibold text-muted-foreground">
+              !
+            </span>
+          </motion.div>
+        </motion.div>
+        <motion.h1
+          className="text-3xl font-semibold tracking-tight text-foreground sm:text-4xl"
+          variants={itemVariants}
+        >
+          {title}
+        </motion.h1>
+        <motion.p
+          className="text-lg text-muted-foreground"
+          variants={itemVariants}
+        >
+          {message}
+        </motion.p>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+type QuoteData = NonNullable<Awaited<ReturnType<typeof loader>>["data"]>;
+type QuoteLinePriceOption = NonNullable<QuoteData["quoteLinePrices"]>[number];
+
+export default function ExternalQuote() {
+  const { state, data } = useLoaderData<typeof loader>();
+  const { t } = useLingui();
+
+  switch (state) {
+    case QuoteState.Valid:
+      if (data) {
+        // The authenticated route this would otherwise be read from isn't mounted
+        // here, so hand the loader's own copy down — otherwise the customer-facing
+        // quote ignores the company's currency display preferences.
+        return (
+          <CompanySettingsProvider value={data.companySettings ?? undefined}>
+            <CurrenciesProvider value={data.currencies ?? []}>
+              <Quote data={data as QuoteData} />
+            </CurrenciesProvider>
+          </CompanySettingsProvider>
+        );
+      }
+      return (
+        <ErrorMessage
+          title={t`Quote not found`}
+          message={t`Oops! The link you're trying to access is not valid.`}
+        />
+      );
+    case QuoteState.Expired:
+      return (
+        <ErrorMessage
+          title={t`Quote expired`}
+          message={t`Oops! The link you're trying to access has expired or is no longer valid.`}
+        />
+      );
+    case QuoteState.NotFound:
+      return (
+        <ErrorMessage
+          title={t`Quote not found`}
+          message={t`Oops! The link you're trying to access is not valid.`}
+        />
+      );
+  }
+}

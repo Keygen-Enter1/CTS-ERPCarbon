@@ -1,0 +1,61 @@
+---
+title: Plan supply from demand
+description: Convert orders and forecasts into production jobs and purchase orders.
+label: "(III)"
+index: 2
+---
+
+Creating a <Term>job</Term> generates demand for its materials and capacity. <Term id="sales-order">Sales orders</Term> provide confirmed demand, while forecasts represent expected demand that is not yet ordered.
+
+Carbon plans against both sources and applies each part's replenishment policy.
+
+## Demand forecasting
+
+Under **Production**, open **Projections** and enter expected weekly quantities. In this example, demand for SAT-1000 increases from two units per week to four by week six, with corresponding demand for ADCS-001 and EPS-001. <Term id="demand-forecast">Forecasting</Term> adds these quantities to the plan without creating sales orders.
+
+<Figure illustration="demand-forecast" caption="Confirmed orders (weeks 1–3) plus forecasted demand (weeks 4–5), the full picture Carbon plans against." />
+
+<Screenshot src="/screens/plan-projections.png" label="Production → Projections" caption="Entering projected weekly quantities from the sales pipeline: the SAT-1000 bus at 2, 2, 3, 3, 4, 4 over the first six weeks, with ADCS-001 and EPS-001 alongside it." ratio="wide" />
+
+## Reordering policy
+
+Each part has a <Term>reordering policy</Term> that controls when and how much Carbon proposes to replenish:
+
+- **Manual Reorder**: Carbon creates no proposal; a planner decides when and how much to order.
+- **Demand-Based Reorder**: replenish net demand, grouped by the configured demand-accumulation period.
+- **Fixed Reorder Quantity**: when on-hand reaches the <Term>reorder point</Term>, propose the configured reorder quantity.
+- **Maximum Quantity**: when on-hand reaches the reorder point, propose enough to reach the maximum inventory quantity.
+
+<Figure illustration="reorder-policy" caption="Reorder point in action: on-hand falls to the trigger, and an order tops it back up." />
+
+<Callout tone="blue" badge="BUY OR MAKE" title="The policy decides how much; the replenishment system decides what kind of order.">
+The policy determines quantity. The replenishment system determines the document: **Buy** creates a <Term id="purchase-order">purchase order</Term>, while **Make** creates a job. Reorder, minimum, and maximum quantities adjust the proposed quantity to an orderable amount.
+</Callout>
+
+<Screenshot src="/screens/plan-part-planning.png" label="Part: Planning tab" caption="A part's Reordering Policy, Reorder Point, and Reorder Quantity that drive every suggestion." ratio="wide" />
+
+## Into jobs & POs
+
+Carbon nets order and forecast demand against on-hand inventory, open jobs, and open purchase orders. [Production planning](/docs/reference/planning) proposes jobs for manufactured parts; purchasing planning proposes purchase orders for purchased parts.
+
+<Figure illustration="planning-engine" caption="Demand in, plan out: production planning suggests jobs, purchasing planning suggests POs." />
+
+Purchasing planning applies <Term id="conversion-factor">conversion factors</Term> to translate inventory units into purchasing units. A proposal becomes a job or purchase order only after confirmation.
+
+<Callout tone="neutral" badge="BY LOCATION" title="Demand and planning can differ by location.">
+Run plans by location. The same part can use different replenishment settings at different sites.
+</Callout>
+
+<Screenshot src="/screens/plan-production-planning.png" label="Production planning" caption="Suggested jobs for the parts you make, with the weekly shortfall that triggered each one." ratio="wide" />
+
+<Screenshot src="/screens/plan-purchasing-planning.png" label="Purchasing planning" caption="The same view for the parts you buy: suggested purchase orders, ready to confirm." ratio="wide" />
+
+## Receiving
+
+When a purchase order arrives, create a <Term>receipt</Term>. Carbon initializes the Draft receipt from the order and validates its quantities. <Term id="posting">Posting</Term> the receipt adds the goods to on-hand inventory.
+
+For a <Term id="batch">batch-tracked</Term> item, record the batch number on the receipt line. The conversion factor converts the purchased quantity to the inventory quantity. Carbon retains the batch identity for later genealogy queries.
+
+<Figure illustration="conversion-factor" caption="A conversion factor reconciles units: one purchased box of ten lands as ten stocked Each." />
+
+<Screenshot src="/screens/plan-receive-po.png" label="Receiving a purchase order" caption="Receiving a batch-tracked battery-pack shipment against PO000001, batch LOT-BAT-2609 captured on the line." ratio="wide" />

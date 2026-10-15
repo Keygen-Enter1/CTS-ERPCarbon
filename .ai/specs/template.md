@@ -1,0 +1,98 @@
+# {Title}
+
+> Status: draft | in-progress | implemented
+> Author: {name}
+> Date: {YYYY-MM-DD}
+
+## TLDR
+
+One paragraph summary of what this spec proposes.
+
+## Overview diagram
+
+One Mermaid diagram that explains the whole change. Choose its type with the
+table in `/spec-writing` Step 6. Replace this sample.
+
+```mermaid
+flowchart LR
+    A["Current step"] --> B["Changed step"]:::hot --> C["New step"]:::new
+    classDef hot stroke-width:3px
+    classDef new stroke-dasharray:4 3
+```
+
+## Problem Statement
+
+What's wrong or what's missing. Include concrete examples if possible.
+
+## Proposed Solution
+
+How we'll solve it.
+
+### Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| {decision} | {choice} | {why} |
+
+## Data Model Changes
+
+Tables, columns, migrations needed. Include SQL sketches for new tables.
+
+```sql
+-- Example:
+CREATE TABLE "newEntity" (
+    "id" TEXT NOT NULL DEFAULT id('prefix'),
+    "companyId" TEXT NOT NULL,
+    -- Business columns
+    "createdBy" TEXT NOT NULL REFERENCES "user"("id"),
+    "createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    "updatedBy" TEXT REFERENCES "user"("id"),
+    "updatedAt" TIMESTAMP WITH TIME ZONE,
+    "customFields" JSONB,
+    CONSTRAINT "newEntity_pkey" PRIMARY KEY ("id", "companyId"),
+    CONSTRAINT "newEntity_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "company"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+-- RLS
+ALTER TABLE "newEntity" ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "newEntity_SELECT" ON "newEntity" FOR SELECT USING (has_role());
+```
+
+## API / Service Changes
+
+New or modified service functions, route loaders/actions.
+
+## Closest Sibling
+
+The existing record type users would call the same kind of thing (lease ↔
+rental agreement ↔ contract, sales order ↔ purchase order). List the files
+this feature copies: routes, `ui/` components, server functions. Each
+deviation from the sibling is a Design Decision. Write N/A only when no
+sibling exists, and say why.
+
+## UI Changes
+
+New or modified pages, forms, tables. Name the page archetype
+(`carbon-design` → `references/page-archetypes.md`) — the sibling's.
+
+## Acceptance Criteria
+
+- [ ] Criterion 1
+- [ ] Criterion 2
+- [ ] Criterion 3
+
+## Risks
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| {risk} | Low/Med/High | {mitigation} |
+
+## Open Questions
+
+> HARD STOP: Do not proceed with implementation until these are answered.
+
+- [ ] {question 1}
+- [ ] {question 2}
+
+## Changelog
+
+- {YYYY-MM-DD}: Created

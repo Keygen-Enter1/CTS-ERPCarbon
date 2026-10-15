@@ -1,0 +1,56 @@
+---
+title: Items
+description: "The master record for everything you make, buy, or stock: parts, materials, tools, and more."
+---
+
+An **item** is the master record for a finished part, raw material, tool, consumable, fixture, or service. Orders, <Term id="method">methods</Term>, <Term id="job">jobs</Term>, and inventory reference it. The **part number** is its readable ID; Carbon uses a separate internal key.
+
+Item type, replenishment system, and tracking type determine whether the item is made or purchased, whether it contributes to stock, and whether units require <Term id="serial">serial</Term> or batch identifiers.
+
+## Fields
+
+<FieldTable>
+  <Field name="Part number" type="text">The readable id; with a non-zero revision it reads as `id.rev`.</Field>
+  <Field name="Type" type="enum">*Part*, *Material*, *Tool*, *Consumable*, *Service*, or *Fixture*.</Field>
+  <Field name="Replenishment system" type="enum">How it's sourced overall: *Buy*, *Make*, or *Buy and Make*.</Field>
+  <Field name="Default method type" type="enum">The default per-line fulfillment: *Purchase to Order*, *Pull from Inventory*, or *Make to Order*.</Field>
+  <Field name="Tracking type" type="enum">*Inventory*, *Non-Inventory*, *Serial*, or *Batch*.</Field>
+  <Field name="Unit of measure" type="reference">The stock unit.</Field>
+  <Field name="Active" type="boolean">Whether it can be used on new documents.</Field>
+</FieldTable>
+
+<Callout type="note">
+**<Term>Replenishment system</Term>** is the high-level strategy; **<Term id="method-type">default method type</Term>** is the line-level default it allows. A *Buy* item defaults to purchasing; a *Make* item can be built to order or pulled from stock. The two are related but distinct.
+</Callout>
+
+## Tracking
+
+The tracking type sets how units are counted. *Inventory* items are quantity-tracked stock; *Non-Inventory* items aren't counted; *Serial* items carry one record per unit; *<Term id="batch">Batch</Term>* items are lot-tracked with their own batch numbers and dates.
+
+## Revisions
+
+Each part revision is a separate item record with the same part number and a different revision. Creating a revision preserves the item used by existing jobs.
+
+A new revision starts as a copy of the revision you created it from, so you don't set it up again. Along with the item's properties and its method, it carries over:
+
+- **Batch Size**, **Scrap Percent**, and <Term id="lead-time">lead time</Term>
+- each location's <Term id="reordering-policy">reordering policy</Term> with its parameters, such as the accumulation period and safety stock
+- the <Term id="item-group">item group</Term>
+- the preferred supplier, and every supplier part with its price breaks
+
+Costs, the sale price, and stock are not copied. They belong to the revision they were recorded against. Change anything on the new revision and the old one is left as it was.
+
+<Callout type="info">
+An item's <Term>costing method</Term>, one of *Standard*, *Average*, *FIFO*, or *LIFO*, lives on its cost record, not the item itself, and decides how consumption is valued.
+</Callout>
+
+## Related
+
+<Cards>
+  <Card title="Methods & sourcing" href="/docs/reference/methods">
+    How an item's bill of materials and routing are defined.
+  </Card>
+  <Card title="Jobs" href="/docs/reference/jobs">
+    A make-to-order item becomes a job that builds it.
+  </Card>
+</Cards>

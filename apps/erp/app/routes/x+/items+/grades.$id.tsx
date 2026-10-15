@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { useCloseRoute } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { data, useLoaderData } from "react-router";
+import {
+  getMaterialGrade,
+  materialGradeValidator,
+  upsertMaterialGrade
+} from "~/modules/items";
+import MaterialGradeForm from "~/modules/items/ui/MaterialGrades/MaterialGradeForm";
+import { getParams, path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    view: "parts",
+    role: "employee"
+  });
+
+  const { id } = params;
+  if (!id) throw notFound("id not found");
+
+  const materialGrade = await getMaterialGrade(client, id);
+
+  if (materialGrade.data?.companyId === null) {
+    throw redirect(
+      path.to.materialGrades,
+      await flash(
+        request,
+        error(new Error("Access denied"), "Cannot edit global material grade")
+      )
+    );
+  }
+
+  return {
+    materialGrade: materialGrade?.data ?? null
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId } = await requirePermissions(request, {
+    update: "parts"
+  });
+
+  const { id } = params;
+  if (!id) throw new Error("Could not find id");
+
+  const formData = await request.formData();
+  const validation = await validator(materialGradeValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const updateMaterialGrade = await upsertMaterialGrade(client, {
+    id: id,
+    companyId,
+    ...validation.data
+  });
+
+  if (updateMaterialGrade.error) {
+    return data(
+      {},
+      await flash(
+        request,
+        error(updateMaterialGrade.error, "Failed to update material grade")
+      )
+    );
+  }
+
+  throw redirect(
+    `${path.to.materialGrades}?${getParams(request)}`,
+    await flash(request, success("Updated material grade"))
+  );
+}
+
+export default function EditMaterialGradesRoute() {
+  const { materialGrade } = useLoaderData<typeof loader>();
+  const closeRoute = useCloseRoute();
+
+  const initialValues = {
+    id: materialGrade?.id ?? undefined,
+    name: materialGrade?.name ?? "",
+    materialSubstanceId: materialGrade?.materialSubstanceId ?? ""
+  };
+
+  return (
+    <MaterialGradeForm
+      key={initialValues.id}
+      initialValues={initialValues}
+      onClose={() => closeRoute()}
+    />
+  );
+}

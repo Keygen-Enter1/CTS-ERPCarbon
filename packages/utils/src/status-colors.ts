@@ -1,0 +1,466 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+/* Single source of truth for status enum → UI color across Carbon. The ERP renders
+ * these via `@carbon/react`'s <Status color> (and Badge variants); the docs site renders
+ * a colored dot from the same map, so the documentation can't drift from the app.
+ *
+ * Colors are the 7 semantic names the Status/Badge components accept — framework-agnostic,
+ * so the standalone docs site can consume them too. `STATUS_COLOR_HEX` gives a representative
+ * solid hex per name (matching the Status/Badge hues) for a dot/indicator.
+ *
+ * Each entity's map is grounded in its ERP `*Status.tsx` component; that component imports its
+ * map from here (keeping its own icon / display-text / conditional logic). */
+
+export type StatusColor =
+  | "green"
+  | "orange"
+  | "red"
+  | "yellow"
+  | "blue"
+  | "gray"
+  | "purple";
+
+export const STATUS_COLOR_HEX: Record<StatusColor, string> = {
+  green: "#10b981",
+  orange: "#f97316",
+  red: "#ef4444",
+  yellow: "#eab308",
+  blue: "#3b82f6",
+  gray: "#8b8985",
+  purple: "#8b5cf6"
+};
+
+export const JOB_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Planned: "yellow",
+  Ready: "blue",
+  "In Progress": "orange",
+  Paused: "orange",
+  "Due Today": "orange",
+  Completed: "green",
+  Closed: "gray",
+  Overdue: "red",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+/* jobOperation statuses (production.models.ts `jobOperationStatus`). Hues mirror the
+ * parent JOB map so an operation reads consistently with its job: Ready is a go signal,
+ * Waiting is a pending hold, In Progress/Paused share the active hue, Done is complete,
+ * Canceled is dead. The MES DAG uses richer per-status shades; this collapses them to the
+ * 7 semantic tokens the Status/Badge components and the docs dot accept. */
+export const JOB_OPERATION_STATUS_COLOR_MAP = {
+  Todo: "gray",
+  Ready: "blue",
+  Waiting: "yellow",
+  "In Progress": "orange",
+  Paused: "orange",
+  Done: "green",
+  Canceled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+// Operation batch lifecycle. `Active` is DISPLAYED as "Released"; the colors
+// mirror the job map (Planned=yellow, Released/Ready=blue, in-flight=orange,
+// done=green) so a batch reads the same as the jobs it dispatches. "Released"
+// is a display alias for Active (BatchStatus rewrites the label) so consumers
+// that render the display name — the docs StatusFlow — resolve the same blue.
+/* assemblyInstruction statuses (AssemblyInstructionStatus.tsx): an editable Draft is gray, the
+ * active Published version green, a superseded Archived version red. */
+export const ASSEMBLY_INSTRUCTION_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Published: "green",
+  Archived: "red"
+} as const satisfies Record<string, StatusColor>;
+
+/* assemblyInstructionStep statuses (production.models.ts `assemblyStepStatuses`): a step
+ * not started yet is gray, one waiting on a reviewer is yellow, a finished one is green. */
+export const ASSEMBLY_STEP_STATUS_COLOR_MAP = {
+  Todo: "gray",
+  Review: "yellow",
+  Done: "green"
+} as const satisfies Record<string, StatusColor>;
+
+export const BATCH_STATUS_COLOR_MAP = {
+  Planned: "yellow",
+  Active: "blue",
+  Released: "blue",
+  Completing: "orange",
+  Completed: "green"
+} as const satisfies Record<string, StatusColor>;
+
+export const QUOTE_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Sent: "blue",
+  Ordered: "green",
+  Partial: "green",
+  Cancelled: "red",
+  Expired: "red",
+  Lost: "orange"
+} as const satisfies Record<string, StatusColor>;
+
+// salesOrderStatus — kept named SALES_STATUS_COLOR_MAP to match the existing ERP export.
+export const SALES_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Cancelled: "red",
+  Closed: "red",
+  "To Ship and Invoice": "orange",
+  "To Ship": "orange",
+  "To Invoice": "blue",
+  Confirmed: "blue",
+  "Needs Approval": "yellow",
+  "In Progress": "yellow",
+  Invoiced: "gray",
+  Completed: "green"
+} as const satisfies Record<string, StatusColor>;
+
+export const SALES_RETURN_ORDER_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  "To Receive": "blue",
+  Completed: "green",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const PURCHASE_ORDER_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Planned: "yellow",
+  "To Review": "yellow",
+  "Needs Approval": "yellow",
+  "To Receive": "orange",
+  "To Receive and Invoice": "orange",
+  "To Invoice": "blue",
+  Completed: "green",
+  Closed: "red",
+  Rejected: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const PURCHASE_RETURN_ORDER_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  "To Ship": "blue",
+  Completed: "green",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const RECEIPT_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Pending: "orange",
+  Posted: "green",
+  Voided: "red"
+} as const satisfies Record<string, StatusColor>;
+
+// Shipment adds a conditional "Invoiced" (blue) the component derives from a flag.
+export const SHIPMENT_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Pending: "orange",
+  Posted: "green",
+  Voided: "red",
+  Invoiced: "blue"
+} as const satisfies Record<string, StatusColor>;
+
+export const MAINTENANCE_DISPATCH_STATUS_COLOR_MAP = {
+  Open: "gray",
+  Assigned: "yellow",
+  "In Progress": "blue",
+  Completed: "green",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const FIXED_ASSET_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  "Under Construction": "blue",
+  Active: "green",
+  "Fully Depreciated": "yellow",
+  Disposed: "red"
+} as const satisfies Record<string, StatusColor>;
+
+// Customer contract badges. The palette has no muted token; an Ended
+// contract is gray like a Draft, matching the people table's Inactive.
+export const CUSTOMER_CONTRACT_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Active: "green",
+  Ended: "gray"
+} as const satisfies Record<string, StatusColor>;
+
+// A contract revenue month (contractRevenueStatus). Recognized externally is
+// blue like a contract invoice that was Billed Externally.
+export const CUSTOMER_CONTRACT_REVENUE_STATUS_COLOR_MAP = {
+  Planned: "gray",
+  Recognized: "green",
+  "Recognized Externally": "blue"
+} as const satisfies Record<string, StatusColor>;
+
+// Mirrors RentalStatus.tsx (sales/ui/Rentals) — the agreement header statuses.
+export const RENTAL_AGREEMENT_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Active: "blue",
+  Closed: "green",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const TRACKED_ENTITY_STATUS_COLOR_MAP = {
+  Available: "green",
+  Reserved: "gray",
+  "On Hold": "orange",
+  Rejected: "red",
+  Consumed: "blue",
+  Scrapped: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const SALES_INVOICE_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Return: "gray",
+  Submitted: "blue",
+  Pending: "yellow",
+  "Partially Paid": "yellow",
+  Voided: "red",
+  Overdue: "orange",
+  "Credit Note Issued": "green",
+  Paid: "green"
+} as const satisfies Record<string, StatusColor>;
+
+export const PURCHASE_INVOICE_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Open: "blue",
+  Pending: "orange",
+  "Partially Paid": "orange",
+  Overdue: "red",
+  Voided: "red",
+  "Debit Note Issued": "green",
+  Paid: "green"
+} as const satisfies Record<string, StatusColor>;
+
+export const SALES_RFQ_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  "Ready for Quote": "green",
+  Quoted: "blue",
+  Closed: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const SUPPLIER_QUOTE_STATUS_COLOR_MAP = {
+  Active: "green",
+  Draft: "gray",
+  Declined: "orange",
+  Expired: "red",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const PURCHASING_RFQ_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Requested: "green",
+  Closed: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const ISSUE_STATUS_COLOR_MAP = {
+  Registered: "gray",
+  "In Progress": "blue",
+  Closed: "green"
+} as const satisfies Record<string, StatusColor>;
+
+export const JOURNAL_ENTRY_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Posted: "green",
+  Reversed: "red",
+  Provisional: "yellow",
+  Superseded: "gray"
+} as const satisfies Record<string, StatusColor>;
+
+export const PERIOD_CLOSE_STATUS_COLOR_MAP = {
+  Open: "gray",
+  Locked: "orange",
+  Closed: "green"
+} as const satisfies Record<string, StatusColor>;
+
+export const RISK_STATUS_COLOR_MAP = {
+  Open: "gray",
+  "In Review": "blue",
+  Mitigating: "orange",
+  Accepted: "green",
+  Closed: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const STOCK_TRANSFER_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Released: "orange",
+  "In Progress": "blue",
+  Completed: "green"
+} as const satisfies Record<string, StatusColor>;
+
+export const GAUGE_STATUS_COLOR_MAP = {
+  Active: "gray",
+  Inactive: "red"
+} as const satisfies Record<string, StatusColor>;
+
+export const GAUGE_CALIBRATION_STATUS_COLOR_MAP = {
+  Pending: "orange",
+  "In-Calibration": "green",
+  "Out-of-Calibration": "red"
+} as const satisfies Record<string, StatusColor>;
+
+/* Step rows use the same names, minus Queued and Blocked, so one map covers both. */
+export const WORKFLOW_RUN_STATUS_COLOR_MAP = {
+  Queued: "gray",
+  Running: "blue",
+  Succeeded: "green",
+  Failed: "red",
+  Blocked: "orange",
+  Skipped: "purple"
+} as const satisfies Record<string, StatusColor>;
+
+export const GAUGE_ROLE_COLOR_MAP = {
+  Master: "blue",
+  Standard: "gray"
+} as const satisfies Record<string, StatusColor>;
+
+// ChangeNoticeStatus.tsx — Done is success; open stages step gray → blue → yellow → orange.
+export const CHANGE_ORDER_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Start: "blue",
+  "Engineering Complete": "yellow",
+  Implementation: "orange",
+  Done: "green",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+// QualityDocumentStatus.tsx
+export const QUALITY_DOCUMENT_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Active: "green",
+  Archived: "red"
+} as const satisfies Record<string, StatusColor>;
+
+// InspectionStatus.tsx (`getInspectionStatusVariant`; the fallback variant covers Pending).
+export const INSPECTION_STATUS_COLOR_MAP = {
+  Pending: "gray",
+  "In Progress": "blue",
+  Passed: "green",
+  Failed: "red",
+  Partial: "yellow"
+} as const satisfies Record<string, StatusColor>;
+
+// PaymentStatus.tsx
+export const PAYMENT_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Posted: "green",
+  Voided: "red"
+} as const satisfies Record<string, StatusColor>;
+
+// TrainingStatus.tsx (course lifecycle).
+export const TRAINING_COURSE_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  Active: "green",
+  Archived: "red"
+} as const satisfies Record<string, StatusColor>;
+
+// TrainingAssignmentForm.tsx StatusBadge ("Not Required" renders outline → gray token).
+export const TRAINING_ASSIGNMENT_STATUS_COLOR_MAP = {
+  Pending: "gray",
+  Completed: "green",
+  Overdue: "red",
+  "Not Required": "gray"
+} as const satisfies Record<string, StatusColor>;
+
+// IntercompanyTransactionStatus.tsx
+export const INTERCOMPANY_TRANSACTION_STATUS_COLOR_MAP = {
+  Unmatched: "orange",
+  Matched: "green",
+  Eliminated: "gray"
+} as const satisfies Record<string, StatusColor>;
+
+// PickingListStatus.tsx
+export const PICKING_LIST_STATUS_COLOR_MAP = {
+  Draft: "gray",
+  "In Progress": "blue",
+  Partial: "orange",
+  Completed: "green",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+/* Pick lines have no dedicated component; PickingListLines badges render picked=green,
+ * short=orange. Pending/Cancelled follow the house not-started/dead conventions. */
+export const PICKING_LIST_LINE_STATUS_COLOR_MAP = {
+  Pending: "gray",
+  Picked: "green",
+  Short: "orange",
+  Cancelled: "red"
+} as const satisfies Record<string, StatusColor>;
+
+// PeopleTable.tsx account-status badges (Inactive renders secondary → gray token).
+export const EMPLOYEE_ACCOUNT_STATUS_COLOR_MAP = {
+  Active: "green",
+  Invited: "yellow",
+  Inactive: "gray"
+} as const satisfies Record<string, StatusColor>;
+
+// TimecardsTable.tsx (Complete renders secondary → gray token).
+export const TIMECARD_STATUS_COLOR_MAP = {
+  Active: "green",
+  Complete: "gray"
+} as const satisfies Record<string, StatusColor>;
+
+/* Registry keyed by a short entity id — lets a generic consumer (e.g. the docs StatusFlow)
+ * resolve a status name to its color without importing each map by hand. Every map above is
+ * registered; `inventoryCount` aliases the receipt map because InventoryCountStatus.tsx
+ * deliberately shares the Draft / Pending / Posted lifecycle with receipts. */
+export const statusColorMaps = {
+  job: JOB_STATUS_COLOR_MAP,
+  jobOperation: JOB_OPERATION_STATUS_COLOR_MAP,
+  jobOperationBatch: BATCH_STATUS_COLOR_MAP,
+  assemblyInstruction: ASSEMBLY_INSTRUCTION_STATUS_COLOR_MAP,
+  assemblyStep: ASSEMBLY_STEP_STATUS_COLOR_MAP,
+  quote: QUOTE_STATUS_COLOR_MAP,
+  salesOrder: SALES_STATUS_COLOR_MAP,
+  salesReturnOrder: SALES_RETURN_ORDER_STATUS_COLOR_MAP,
+  salesRfq: SALES_RFQ_STATUS_COLOR_MAP,
+  purchaseOrder: PURCHASE_ORDER_STATUS_COLOR_MAP,
+  purchaseReturnOrder: PURCHASE_RETURN_ORDER_STATUS_COLOR_MAP,
+  purchasingRfq: PURCHASING_RFQ_STATUS_COLOR_MAP,
+  supplierQuote: SUPPLIER_QUOTE_STATUS_COLOR_MAP,
+  receipt: RECEIPT_STATUS_COLOR_MAP,
+  shipment: SHIPMENT_STATUS_COLOR_MAP,
+  inventoryCount: RECEIPT_STATUS_COLOR_MAP,
+  stockTransfer: STOCK_TRANSFER_STATUS_COLOR_MAP,
+  pickingList: PICKING_LIST_STATUS_COLOR_MAP,
+  pickingListLine: PICKING_LIST_LINE_STATUS_COLOR_MAP,
+  maintenanceDispatch: MAINTENANCE_DISPATCH_STATUS_COLOR_MAP,
+  fixedAsset: FIXED_ASSET_STATUS_COLOR_MAP,
+  customerContract: CUSTOMER_CONTRACT_STATUS_COLOR_MAP,
+  rentalAgreement: RENTAL_AGREEMENT_STATUS_COLOR_MAP,
+  trackedEntity: TRACKED_ENTITY_STATUS_COLOR_MAP,
+  salesInvoice: SALES_INVOICE_STATUS_COLOR_MAP,
+  purchaseInvoice: PURCHASE_INVOICE_STATUS_COLOR_MAP,
+  payment: PAYMENT_STATUS_COLOR_MAP,
+  journalEntry: JOURNAL_ENTRY_STATUS_COLOR_MAP,
+  accountingPeriod: PERIOD_CLOSE_STATUS_COLOR_MAP,
+  intercompanyTransaction: INTERCOMPANY_TRANSACTION_STATUS_COLOR_MAP,
+  issue: ISSUE_STATUS_COLOR_MAP,
+  inspection: INSPECTION_STATUS_COLOR_MAP,
+  qualityDocument: QUALITY_DOCUMENT_STATUS_COLOR_MAP,
+  risk: RISK_STATUS_COLOR_MAP,
+  gauge: GAUGE_STATUS_COLOR_MAP,
+  gaugeCalibration: GAUGE_CALIBRATION_STATUS_COLOR_MAP,
+  changeOrder: CHANGE_ORDER_STATUS_COLOR_MAP,
+  trainingCourse: TRAINING_COURSE_STATUS_COLOR_MAP,
+  trainingAssignment: TRAINING_ASSIGNMENT_STATUS_COLOR_MAP,
+  employeeAccount: EMPLOYEE_ACCOUNT_STATUS_COLOR_MAP,
+  timecard: TIMECARD_STATUS_COLOR_MAP,
+  workflowRun: WORKFLOW_RUN_STATUS_COLOR_MAP
+} as const;
+
+export type StatusEntity = keyof typeof statusColorMaps;
+
+/** The semantic color for a status, or undefined if the status isn't in the entity's map. */
+export function statusColor(
+  entity: StatusEntity,
+  status: string
+): StatusColor | undefined {
+  return (statusColorMaps[entity] as Record<string, StatusColor>)[status];
+}
+
+/** The solid hex for a status's dot/indicator, or undefined if unknown. */
+export function statusColorHex(
+  entity: StatusEntity,
+  status: string
+): string | undefined {
+  const color = statusColor(entity, status);
+  return color ? STATUS_COLOR_HEX[color] : undefined;
+}

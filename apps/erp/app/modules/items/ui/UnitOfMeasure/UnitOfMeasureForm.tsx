@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ValidatedForm } from "@carbon/form";
+import {
+  Button,
+  HStack,
+  ModalDrawer,
+  ModalDrawerBody,
+  ModalDrawerContent,
+  ModalDrawerFooter,
+  ModalDrawerHeader,
+  ModalDrawerProvider,
+  ModalDrawerTitle,
+  toast,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { useEffect, useState } from "react";
+import { useFetcher } from "react-router";
+import type { z } from "zod";
+import {
+  CustomFormFields,
+  Hidden,
+  Input,
+  InputControlled,
+  Submit
+} from "~/components/Form";
+import { usePermissions } from "~/hooks";
+import { path } from "~/utils/path";
+import {
+  EACH_UNIT_OF_MEASURE_CODE,
+  unitOfMeasureValidator
+} from "../../items.models";
+
+type UnitOfMeasureFormProps = {
+  initialValues: z.infer<typeof unitOfMeasureValidator>;
+  type?: "modal" | "drawer";
+  open?: boolean;
+  onClose: (data?: { id: string; name: string }) => void;
+};
+
+const UnitOfMeasureForm = ({
+  initialValues,
+  open = true,
+  type = "drawer",
+  onClose
+}: UnitOfMeasureFormProps) => {
+  const permissions = usePermissions();
+  const { t } = useLingui();
+  const fetcher = useFetcher<PostgrestResponse<{ id: string }>>();
+  const [code, setCode] = useState<string>(initialValues.code);
+
+  useEffect(() => {
+    if (type !== "modal") return;
+
+    if (fetcher.state === "loading" && fetcher.data?.data) {
+      onClose?.();
+      toast.success(t`Created unit of measure`);
+    } else if (fetcher.state === "idle" && fetcher.data?.error) {
+      toast.error(
+        `Failed to create unit of measure: ${fetcher.data.error.message}`
+      );
+    }
+  }, [fetcher.data, fetcher.state, onClose, type, t]);
+
+  const isEditing = initialValues.id !== undefined;
+  // Each is built in: the database refuses to rename it (custom fields stay
+  // editable).
+  const isBuiltIn =
+    isEditing && initialValues.code === EACH_UNIT_OF_MEASURE_CODE;
+  const isDisabled = isEditing
+    ? !permissions.can("update", "parts")
+    : !permissions.can("create", "parts");
+
+  return (
+    <ModalDrawerProvider type={type}>
+      <ModalDrawer
+        open={open}
+        onOpenChange={(open) => {
+          if (!open) onClose?.();
+        }}
+      >
+        <ModalDrawerContent>
+          <ValidatedForm
+            validator={unitOfMeasureValidator}
+            method="post"
+            action={isEditing ? path.to.uom(initialValues.id!) : path.to.newUom}
+            defaultValues={initialValues}
+            fetcher={fetcher}
+            className="flex flex-col h-full"
+          >
+            <ModalDrawerHeader>
+              <ModalDrawerTitle>
+                {isEditing ? t`Edit Unit of Measure` : t`New Unit of Measure`}
+              </ModalDrawerTitle>
+            </ModalDrawerHeader>
+            <ModalDrawerBody>
+              <Hidden name="id" />
+              <Hidden name="type" value={type} />
+              <VStack spacing={4}>
+                <Input
+                  name="name"
+                  label={t`Unit of Measure`}
+                  characterLimit={50}
+                  isReadOnly={isBuiltIn}
+                  helperText={
+                    isBuiltIn
+                      ? t`Each is built in and can't be renamed or deleted`
+                      : undefined
+                  }
+                />
+                <InputControlled
+                  name="code"
+                  label={t`Code`}
+                  value={code}
+                  onChange={(value) =>
+                    setCode(value.toUpperCase().replace(/\s/g, ""))
+                  }
+                  characterLimit={10}
+                  isReadOnly={isBuiltIn}
+                  helperText={
+                    isBuiltIn
+                      ? undefined
+                      : t`Unique, uppercase, without spaces (max 10 characters)`
+                  }
+                />
+                <CustomFormFields table="unitOfMeasure" />
+              </VStack>
+            </ModalDrawerBody>
+            <ModalDrawerFooter>
+              <HStack>
+                <Submit isDisabled={isDisabled}>
+                  <Trans>Save</Trans>
+                </Submit>
+                <Button size="md" variant="solid" onClick={() => onClose()}>
+                  <Trans>Cancel</Trans>
+                </Button>
+              </HStack>
+            </ModalDrawerFooter>
+          </ValidatedForm>
+        </ModalDrawerContent>
+      </ModalDrawer>
+    </ModalDrawerProvider>
+  );
+};
+
+export default UnitOfMeasureForm;

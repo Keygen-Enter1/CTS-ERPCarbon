@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  cn,
+  DateRangePicker,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  ToggleGroup,
+  ToggleGroupItem
+} from "@carbon/react";
+import type { CalendarDate } from "@internationalized/date";
+import { useLingui } from "@lingui/react/macro";
+import type { DateRange } from "@react-types/datepicker";
+import { forwardRef, useMemo, useState } from "react";
+import { LuCalendar, LuChevronDown } from "react-icons/lu";
+
+type DateSelectOption = {
+  value: string;
+  label: string;
+};
+
+interface DateSelectProps {
+  value: string;
+  onValueChange: (value: string) => void;
+  options?: DateSelectOption[];
+  showCustom?: boolean;
+  dateRange?: DateRange | null;
+  onDateRangeChange?: (dateRange: DateRange | null) => void;
+  /** Days to flag with a dot in the custom-range calendar. */
+  isDateMarked?: (date: CalendarDate) => boolean;
+  className?: string;
+}
+
+const DateSelect = forwardRef<HTMLDivElement, DateSelectProps>(
+  (
+    {
+      value,
+      onValueChange,
+      options,
+      showCustom = true,
+      dateRange,
+      onDateRangeChange,
+      isDateMarked,
+      className
+    },
+    ref
+  ) => {
+    const { t } = useLingui();
+    // Picking "custom" opens the calendar straight away; a page that merely
+    // loads on "custom" (e.g. from the URL) leaves it closed.
+    const [openCalendar, setOpenCalendar] = useState(false);
+    const onChange = (next: string) => {
+      setOpenCalendar(next === "custom");
+      onValueChange(next);
+    };
+    const resolvedOptions = useMemo(() => {
+      if (options) return options;
+      return [
+        { value: "week", label: t`7D` },
+        { value: "month", label: t`30D` },
+        { value: "quarter", label: t`90D` },
+        { value: "year", label: t`1Y` }
+      ];
+    }, [options, t]);
+
+    const allOptions = useMemo(() => {
+      if (!showCustom) return resolvedOptions;
+      return [...resolvedOptions, { value: "custom", label: t`Custom` }];
+    }, [resolvedOptions, showCustom, t]);
+
+    return (
+      <div
+        ref={ref}
+        className={cn("inline-flex items-center gap-2", className)}
+      >
+        {/* Compact dropdown for small screens */}
+        <Select value={value} onValueChange={onChange}>
+          {/* Phones: a period chip with a ⌄ picker indicator,
+              32pt visual with a 44pt hit area like its neighbouring buttons. */}
+          <SelectTrigger
+            hideIcon
+            className={cn(
+              "md:hidden w-auto h-8 text-xs",
+              "max-md:relative max-md:h-8 max-md:rounded-full max-md:space-x-1 max-md:text-sm max-md:after:absolute max-md:after:-inset-[max(0px,calc((44px-100%)/2))]"
+            )}
+          >
+            <SelectValue />
+            <LuChevronDown className="size-4 shrink-0 opacity-50" />
+          </SelectTrigger>
+          <SelectContent>
+            {allOptions.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        {/* Segmented control for md+ screens */}
+        <ToggleGroup
+          type="single"
+          value={value}
+          onValueChange={(v) => {
+            if (v) onChange(v);
+          }}
+          className="hidden md:inline-flex gap-0 rounded-full border border-border bg-muted p-0.5 shadow-sm"
+        >
+          {resolvedOptions.map((option) => (
+            <ToggleGroupItem
+              key={option.value}
+              value={option.value}
+              className={cn(
+                "h-7 rounded-full px-3 text-xs font-medium",
+                "bg-transparent text-muted-foreground",
+                "hover:bg-active hover:text-active-foreground hover:data-[state=on]:bg-active",
+                "data-[state=on]:bg-active data-[state=on]:text-active-foreground data-[state=on]:shadow-sm",
+                "transition-all duration-200"
+              )}
+            >
+              {option.label}
+            </ToggleGroupItem>
+          ))}
+          {showCustom && (
+            <ToggleGroupItem
+              value="custom"
+              className={cn(
+                "h-7 w-7 rounded-full p-0",
+                "bg-transparent text-muted-foreground",
+                "hover:bg-active hover:text-active-foreground hover:data-[state=on]:bg-active",
+                "data-[state=on]:bg-active data-[state=on]:text-active-foreground data-[state=on]:shadow-sm",
+                "transition-all duration-200"
+              )}
+            >
+              <LuCalendar className="size-3.5" />
+            </ToggleGroupItem>
+          )}
+        </ToggleGroup>
+
+        {value === "custom" && onDateRangeChange && (
+          <DateRangePicker
+            value={dateRange}
+            onChange={onDateRangeChange}
+            size="sm"
+            defaultOpen={openCalendar}
+            isDateMarked={isDateMarked}
+          />
+        )}
+      </div>
+    );
+  }
+);
+
+DateSelect.displayName = "DateSelect";
+
+export { DateSelect };
+export type { DateSelectProps, DateSelectOption };

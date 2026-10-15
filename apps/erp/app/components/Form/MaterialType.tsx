@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { CreatableCombobox } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import { useDisclosure } from "@carbon/react";
+import { useLingui } from "@lingui/react/macro";
+import { useMemo, useRef, useState } from "react";
+import type { getMaterialTypeList } from "~/modules/items";
+import MaterialTypeForm from "~/modules/items/ui/MaterialTypes/MaterialTypeForm";
+import { path } from "~/utils/path";
+import { useEmptyState } from "./emptyStates";
+
+type MaterialTypeSelectProps = Omit<
+  ComboboxProps,
+  "options" | "onChange" | "inline"
+> & {
+  substanceId?: string;
+  formId?: string;
+  inline?: boolean;
+  onChange?: (
+    materialType: {
+      label: string;
+      value: string;
+      code: string;
+    } | null
+  ) => void;
+};
+
+const MaterialTypePreview = (
+  value: string,
+  options: { value: string; label: string | JSX.Element }[]
+) => {
+  const materialType = options.find((o) => o.value === value);
+  if (!materialType) return null;
+  return <span>{materialType.label}</span>;
+};
+
+const MaterialType = (props: MaterialTypeSelectProps) => {
+  const { t } = useLingui();
+  const newTypeModal = useDisclosure();
+  const [created, setCreated] = useState<string>("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const options = useMaterialTypes(props.substanceId!, props.formId!);
+
+  const onChange = (
+    newValue: { label: string | JSX.Element; value: string } | null
+  ) => {
+    const materialType =
+      options.find((materialType) => materialType.value === newValue?.value) ??
+      null;
+
+    props.onChange?.(materialType);
+  };
+
+  const emptyMessage = useEmptyState("materialType", {
+    onCreate: () => newTypeModal.onOpen()
+  });
+
+  return (
+    <>
+      <CreatableCombobox
+        ref={triggerRef}
+        options={options}
+        emptyMessage={emptyMessage}
+        {...props}
+        disabled={props.disabled || !props.substanceId || !props.formId}
+        helperText={
+          props.helperText ??
+          (!props.inline && (!props.substanceId || !props.formId)
+            ? t`Select a substance and shape first to see available options`
+            : undefined)
+        }
+        inline={props?.inline ? MaterialTypePreview : undefined}
+        isOptional={props?.isOptional ?? true}
+        label={props?.label ?? "Type"}
+        onChange={onChange}
+        onCreateOption={(option) => {
+          newTypeModal.onOpen();
+          setCreated(option);
+        }}
+      />
+      {newTypeModal.isOpen && (
+        <MaterialTypeForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newTypeModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            name: created,
+            materialSubstanceId: props.substanceId!,
+            materialFormId: props.formId!,
+            code: created
+          }}
+        />
+      )}
+    </>
+  );
+};
+
+export const useMaterialTypes = (substanceId?: string, formId?: string) => {
+  const materialTypes = useLoaderQuery<
+    Awaited<ReturnType<typeof getMaterialTypeList>>
+  >(
+    substanceId && formId
+      ? path.to.api.materialTypes(substanceId, formId)
+      : null
+  );
+
+  const options = useMemo(() => {
+    return (materialTypes.data?.data ?? []).map((c) => ({
+      value: c.id,
+      label: c.name,
+      helper: c.companyId === null ? "Standard" : "Custom",
+      code: c.code
+    }));
+  }, [materialTypes.data?.data]);
+
+  return options;
+};
+
+export default MaterialType;

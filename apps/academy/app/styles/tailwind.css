@@ -1,0 +1,114 @@
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=Fira+Code:wght@300..700&display=swap");
+@import "tailwindcss";
+@import "../../../../packages/config/tailwind/theme.css";
+@import "./editorial-tokens.css";
+@import "./editorial.css";
+
+/* Swap the site typeface to DM Sans / Fira Code (matches the docs editorial surface).
+ * Overrides theme.css's Geist font utilities site-wide. */
+@theme {
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Fira Code", ui-monospace, monospace;
+  --font-headline: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  :root {
+    /* Warm paper editorial palette — matches the docs Guide (#F5F5F2 paper, #262323 ink).
+     * @carbon/react components (dropdowns, toasts, auth forms) read these tokens, so they
+     * pick up the warm surface automatically. Light-only. */
+    --background: 0 0% 96%;
+    --foreground: 0 4% 14%;
+    --card: 0 0% 99%;
+    --card-foreground: 0 4% 14%;
+    --popover: 0 0% 99%;
+    --popover-foreground: 0 4% 14%;
+    --active: 0 0% 90%;
+    --active-foreground: 0 4% 14%;
+    --primary: 0 4% 14%;
+    --primary-foreground: 0 0% 96%;
+    --secondary: 0 0% 93%;
+    --secondary-foreground: 0 4% 14%;
+    --muted: 0 0% 93%;
+    --muted-foreground: 0 0% 44%;
+    --accent: 0 0% 90%;
+    --accent-foreground: 0 4% 14%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 90%;
+    --input: 0 0% 90%;
+    --ring: 0 4% 30%;
+    --success: 142 60% 40%;
+    --success-foreground: 0 0% 98%;
+    --radius: 0.5rem;
+    --sidebar-background: 0 0% 99%;
+    --sidebar-foreground: 0 4% 26%;
+    --sidebar-primary: 0 4% 14%;
+    --sidebar-primary-foreground: 0 0% 96%;
+    --sidebar-accent: 0 0% 90%;
+    --sidebar-accent-foreground: 0 4% 14%;
+    --sidebar-border: 0 0% 90%;
+    --sidebar-ring: 199 100% 50%;
+
+    /* Editorial highlight accent — the docs #00B0FF blue. */
+    --brand: 199 100% 50%;
+
+    --base-shadow-color: rgb(0 0 0 / 0.05);
+
+    --button-drop-shadow: rgb(0 0 0 / 0);
+    --button-shadow: inset 0px 1px 0px 0px rgb(255 255 255 / 1),
+      0px 0px 0px 1px rgb(0 0 0 / 0.06), 0px 1px 0px 0px rgb(0 0 0 / 0.08),
+      0px 2px 2px 0px rgb(0 0 0 / 0.04), 0px 3px 3px 0px rgb(0 0 0 / 0.02),
+      0px 4px 4px 0px rgb(0 0 0 / 0.01);
+    --popover-shadow: 0px 0px 3.6px rgba(0, 0, 0, 0.04),
+      0px 0px 10px rgba(0, 0, 0, 0.04), 0px 0px 24.1px rgba(0, 0, 0, 0.05),
+      0px 0px 80px rgba(0, 0, 0, 0.08);
+    --dropdown-item-shadow: inset 0px 1px 0px rgb(255 255 255 / 0.02),
+      inset 0px 0px 0px 1px rgb(255 255 255 / 0.02),
+      0px 1px 2px rgb(0 0 0 / 0.12), 0px 2px 4px rgb(0 0 0 / 0.08),
+      0px 0px 0px 0.5px rgb(0 0 0 / 0.24);
+    --button-base-shadow: 0px 1px 1px -1px rgb(0 0 0 / 0.08),
+      0px 2px 2px -1px rgb(0 0 0 / 0.08), 0px 0px 0px 1px rgb(0 0 0 / 0.06),
+      inset 0px 1px 0px #fff, inset 0px 1px 2px 1px #fff,
+      inset 0px 1px 2px rgb(0 0 0 / 0.06);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Site-wide keyboard focus ring in the brand accent (matches docs). */
+  :focus-visible {
+    outline: 2px solid hsl(var(--brand));
+    outline-offset: 2px;
+  }
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+}
+
+.font-display {
+  font-family: "DM Sans", sans-serif;
+}
+
+@keyframes spinner-fade {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.15;
+  }
+}
+
+.animate-spinner {
+  animation: spinner-fade 1.2s linear infinite;
+}

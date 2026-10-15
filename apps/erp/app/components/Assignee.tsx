@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  buttonVariants,
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  cn,
+  HStack,
+  IconButton,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { ComponentPropsWithoutRef } from "react";
+import { forwardRef, useMemo, useState } from "react";
+import { LuSettings2, LuUser } from "react-icons/lu";
+import { RxCheck } from "react-icons/rx";
+import { useFetcher, useFetchers } from "react-router";
+import { usePermissions, useUser } from "~/hooks";
+import { usePeople } from "~/stores";
+import { path } from "~/utils/path";
+import EmployeeAvatar from "./EmployeeAvatar";
+
+type AssigneeVariants = "button" | "inline";
+
+export type AssigneeProps = Omit<
+  ComponentPropsWithoutRef<"button">,
+  "onChange"
+> & {
+  id: string;
+  table: string;
+  size?: "sm" | "md";
+  value?: string;
+  isReadOnly?: boolean;
+  placeholder?: string;
+  variant?: AssigneeVariants;
+  onChange?: (selected: string) => void;
+  /** Controlled picker state. Omit both to let the trigger open it. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  /** Saves the choice through the caller instead of the generic assign
+   *  route — for a record whose assignment has rules of its own (a planning
+   *  action marks a hand-set assignee so MRP never re-resolves it). */
+  onAssign?: (selected: string) => void;
+};
+
+const Assign = forwardRef<HTMLButtonElement, AssigneeProps>(
+  (
+    {
+      id,
+      table,
+      value,
+      size = "md",
+      isReadOnly,
+      placeholder,
+      variant = "button",
+      onChange,
+      open: controlledOpen,
+      onOpenChange,
+      onAssign,
+      className,
+      ...props
+    },
+    ref
+  ) => {
+    const { t } = useLingui();
+    const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+    const open = controlledOpen ?? uncontrolledOpen;
+    const setOpen = (next: boolean) => {
+      if (controlledOpen === undefined) setUncontrolledOpen(next);
+      onOpenChange?.(next);
+    };
+    const [people] = usePeople();
+    const fetcher = useFetcher<{}>();
+    const user = useUser();
+    const permissions = usePermissions();
+
+    const handleChange = (value: string) => {
+      if (onAssign) {
+        onAssign(value);
+        return;
+      }
+      const formData = new FormData();
+      formData.append("id", id);
+      formData.append("assignee", value);
+      formData.append("table", table);
+
+      fetcher.submit(formData, {
+        method: "post",
+        action: path.to.api.assign
+      });
+    };
+
+    const options = useMemo(() => {
+      const base =
+        people
+          .filter((person) => person.id !== user.id && person.active !== false)
+          .map((person) => ({
+            value: person.id,
+            label: person.name
+          })) ?? [];
+
+      return [
+        { value: "", label: t`Unassigned` },
+        { value: user.id, label: `${user.firstName} ${user.lastName}` },
+        ...base
+      ];
+    }, [people, user, t]);
+
+    return (
+      <VStack spacing={2}>
+        {variant === "inline" && (
+          <span className="text-xs text-muted-foreground">
+            <Trans>Assignee</Trans>
+          </span>
+        )}
+        <HStack className="w-full justify-between">
+          {variant === "inline" &&
+            (value ? (
+              <EmployeeAvatar
+                size={size === "sm" ? "xxs" : "xs"}
+                employeeId={value ?? null}
+              />
+            ) : (
+              <span className="text-sm">
+                <Trans>Unassigned</Trans>
+              </span>
+            ))}
+
+          <Popover open={open} onOpenChange={setOpen}>
+            <PopoverTrigger asChild>
+              {variant === "button" ? (
+                <button
+                  className={cn(
+                    buttonVariants({
+                      variant: "secondary",
+                      size: size,
+                      isDisabled: isReadOnly || !permissions.is("employee"),
+                      isLoading: fetcher.state !== "idle",
+                      isIcon: false,
+                      className
+                    })
+                  )}
+                  role="combobox"
+                  aria-expanded={open}
+                  aria-controls="assignee-options"
+                  ref={ref}
+                  onClick={() => setOpen(true)}
+                  disabled={isReadOnly}
+                  {...props}
+                >
+                  {value ? (
+                    <EmployeeAvatar
+                      size={size === "sm" ? "xxs" : "xs"}
+                      employeeId={value ?? null}
+                    />
+                  ) : (
+                    <div className="flex items-center justify-start gap-2">
+                      <LuUser
+                        className={size === "sm" ? "w-3 h-3" : "w-4 h-4"}
+                      />
+                      <span>
+                        <Trans>Unassigned</Trans>
+                      </span>
+                    </div>
+                  )}
+                </button>
+              ) : (
+                <IconButton
+                  aria-label={t`Toggle Assignee`}
+                  icon={<LuSettings2 />}
+                  size="sm"
+                  variant="secondary"
+                  isDisabled={isReadOnly || !permissions.is("employee")}
+                />
+              )}
+            </PopoverTrigger>
+            <PopoverContent
+              align="start"
+              className="min-w-[var(--radix-popover-trigger-width)] p-0"
+            >
+              <Command id="assignee-options">
+                <CommandInput placeholder={t`Search...`} className="h-9" />
+                <CommandList>
+                  <CommandEmpty>
+                    <Trans>No option found.</Trans>
+                  </CommandEmpty>
+                  <CommandGroup>
+                    {options.map((option) => (
+                      <CommandItem
+                        value={
+                          typeof option.label === "string"
+                            ? option.label
+                            : undefined
+                        }
+                        key={option.value}
+                        onSelect={() => {
+                          handleChange(option.value);
+                          onChange?.(option.value);
+                          setOpen(false);
+                        }}
+                      >
+                        {option.label}
+
+                        <RxCheck
+                          className={cn(
+                            "ml-auto h-4 w-4",
+                            option.value === value ? "opacity-100" : "opacity-0"
+                          )}
+                        />
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                </CommandList>
+              </Command>
+            </PopoverContent>
+          </Popover>
+        </HStack>
+      </VStack>
+    );
+  }
+);
+Assign.displayName = "Assign";
+
+export default Assign;
+
+export function useOptimisticAssignment({
+  id,
+  table
+}: {
+  id: string;
+  table: string;
+}) {
+  const fetchers = useFetchers();
+  const assignFetcher = fetchers.find(
+    (f) => f.formAction === path.to.api.assign
+  );
+
+  if (assignFetcher && assignFetcher.formData) {
+    if (
+      assignFetcher.formData.get("id") === id &&
+      assignFetcher.formData.get("table") === table
+    ) {
+      return assignFetcher.formData.get("assignee") as string;
+    }
+  }
+}

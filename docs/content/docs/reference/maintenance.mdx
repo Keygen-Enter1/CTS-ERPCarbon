@@ -1,0 +1,64 @@
+---
+title: Maintenance
+description: "Keeping work centers running: reactive and preventive maintenance dispatches."
+---
+
+A maintenance **dispatch** records work against a **<Term>work center</Term>**. Dispatches are created reactively for failures or generated from preventive schedules. Operators execute them in MES; configuration and reporting are under Resources in the ERP.
+
+## Dispatches
+
+A **maintenance dispatch** records the problem, work center, assignee, time, and parts. It uses this lifecycle:
+
+<StatusFlow entity="maintenanceDispatch">
+  <Status name="Open">Raised, not yet picked up.</Status>
+  <Status name="Assigned">Given to someone.</Status>
+  <Status name="In Progress">Being worked, with the clock running.</Status>
+  <Status name="Completed" accent>Done. Any running time entries are closed automatically.</Status>
+  <Status name="Cancelled" terminal>Dropped without completing.</Status>
+</StatusFlow>
+
+Every dispatch carries a **priority** (Low, Medium, High, Critical) and a **source** that says where it came from: **Reactive** (a breakdown, the default), **Scheduled** (generated from a preventive schedule), or **Non-Conformance** (raised from a <Term id="nonconformance">quality issue</Term>). It also carries a **severity** that says who handles it: **Preventive**, **Operator Performed**, **Support Required**, or **OEM Required**. Time is tracked as events against the dispatch, and parts as dispatch items.
+
+## What it's against
+
+A dispatch is attached to a **work center** and its location — the machine being maintained.
+
+<Callout type="note">
+Maintenance targets a **work center**, not a <Term id="fixed-asset">fixed asset</Term> or an equipment record. The same physical machine may also be a depreciable fixed asset, but Carbon keeps those independent. Maintenance is about keeping the *production resource* available, not about the asset's book value.
+</Callout>
+
+## Preventive schedules
+
+A **maintenance schedule** defines a work center, frequency (Daily, Weekly, Monthly, Quarterly, or Annual), required parts, and generation lead time. A daily background job creates an **Open** dispatch when an active schedule enters its advance window. The dispatch has source `Scheduled`, severity `Preventive`, and a copy of the scheduled parts. Daily schedules can select weekdays and exclude holidays.
+
+## Blocking and OEE impact
+
+Each dispatch declares its **OEE impact**: `Down`, `Planned`, `Impact`, or `No Impact`. This is an **availability gate**, not a metric.
+
+<Callout type="warn">
+A dispatch marked **Down** or **Planned** blocks its work center: on the floor, a blocked work center **cannot start a production operation** until the maintenance clears. There is no OEE percentage or uptime ratio in Carbon. The impact value exists to gate work, not to score it. Maintenance analytics are reliability KPIs (MTTR, MTBF, spare-part cost) computed from dispatch event durations.
+</Callout>
+
+## Material and cost
+
+Parts used in maintenance are issued from inventory, drawing stock down through the <Term id="item-ledger">item ledger</Term> as a *Maintenance Consumption* movement.
+
+<Callout type="info">
+Maintenance material is an **expense**. Issuing it relieves the part's cost at its costing method. It posts a journal that debits the **Maintenance** default account and credits inventory, tagged with the dispatch's work center. Unissuing a part reverses it at the cost the dispatch booked. A part issued before maintenance consumption was valued comes back as a stock movement only, because nothing was expensed for it.
+
+Maintenance time is an expense too. Each timecard on a dispatch is costed at its work center's **labor rate** (no overhead), and posts a journal that debits the **Maintenance** default account and credits **Labor Absorption**, tagged with the employee, work center and location. It posts when the timecard ends (pausing or completing in MES, or saving a timecard with an end time in the back office). Editing a timecard posts the difference and deleting one reverses it.
+</Callout>
+
+## Related
+
+<Cards>
+  <Card title="Work centers" href="/docs/reference/work-centers">
+    The machine a dispatch maintains — and that a Down dispatch blocks.
+  </Card>
+  <Card title="Jobs" href="/docs/reference/jobs">
+    The production a blocked work center can't run until maintenance clears.
+  </Card>
+  <Card title="Quality" href="/docs/reference/quality">
+    Where a Non-Conformance dispatch originates.
+  </Card>
+</Cards>

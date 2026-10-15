@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import type { JSONContent } from "@carbon/react";
+import { VStack } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs } from "react-router";
+import { useParams } from "react-router";
+import { DeferredFiles } from "~/components";
+import { usePermissions, useRouteData } from "~/hooks";
+import type { ItemFile, MaterialSummary } from "~/modules/items";
+import { materialValidator, upsertMaterial } from "~/modules/items";
+import {
+  ItemDocuments,
+  ItemNotes,
+  ItemRiskRegister
+} from "~/modules/items/ui/Item";
+import { getDatabaseClient } from "~/services/database.server";
+import { setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    update: "parts"
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const formData = await request.formData();
+  const validation = await validator(materialValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  // A new size is a new item revision, so it also needs create.
+  if (validation.data.sizes?.length) {
+    await requirePermissions(request, { create: "parts" });
+  }
+
+  const updateMaterial = await upsertMaterial(client, getDatabaseClient(), {
+    ...validation.data,
+    id: itemId,
+    companyId,
+    customFields: setCustomFields(formData),
+    updatedBy: userId
+  });
+  if (updateMaterial.error) {
+    throw redirect(
+      path.to.material(itemId),
+      await flash(
+        request,
+        error(updateMaterial.error, "Failed to update material")
+      )
+    );
+  }
+
+  throw redirect(
+    path.to.material(itemId),
+    await flash(request, success("Updated material"))
+  );
+}
+
+export default function MaterialDetailsRoute() {
+  const { itemId } = useParams();
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const materialData = useRouteData<{
+    materialSummary: MaterialSummary;
+    files: Promise<ItemFile[]>;
+  }>(path.to.material(itemId));
+
+  if (!materialData) throw new Error("Could not find material data");
+  const permissions = usePermissions();
+
+  return (
+    <VStack spacing={4} className="p-4">
+      <ItemNotes
+        id={materialData.materialSummary?.id ?? null}
+        title={materialData.materialSummary?.name ?? ""}
+        subTitle={materialData.materialSummary?.readableIdWithRevision ?? ""}
+        notes={materialData.materialSummary?.notes as JSONContent}
+      />
+      {permissions.is("employee") && (
+        <>
+          <DeferredFiles resolve={materialData?.files}>
+            {(resolvedFiles) => (
+              <ItemDocuments
+                files={resolvedFiles}
+                itemId={itemId}
+                type="Material"
+              />
+            )}
+          </DeferredFiles>
+
+          <ItemRiskRegister itemId={itemId} />
+        </>
+      )}
+    </VStack>
+  );
+}

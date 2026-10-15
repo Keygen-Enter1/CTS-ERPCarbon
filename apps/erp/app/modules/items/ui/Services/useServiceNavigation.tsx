@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useLingui } from "@lingui/react/macro";
+import {
+  LuClipboardCheck,
+  LuFileText,
+  LuReceipt,
+  LuShoppingCart,
+  LuTags
+} from "react-icons/lu";
+import { useParams } from "react-router";
+import { usePermissions, useRouteData } from "~/hooks";
+import { DETAIL_TAB_SHORTCUTS } from "~/shortcuts";
+import type { Role } from "~/types";
+import { path } from "~/utils/path";
+import type { ServiceSummary } from "../../types";
+
+export function useServiceNavigation() {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const { itemId } = useParams();
+  if (!itemId) throw new Error("itemId not found");
+
+  const routeData = useRouteData<{
+    serviceSummary: ServiceSummary;
+  }>(path.to.service(itemId));
+  if (!routeData?.serviceSummary?.replenishmentSystem)
+    throw new Error("Could not find replenishmentSystem in routeData");
+
+  const replenishment = routeData.serviceSummary.replenishmentSystem;
+
+  return [
+    {
+      name: t`Details`,
+      to: path.to.serviceDetails(itemId),
+      icon: LuFileText,
+      shortcut: DETAIL_TAB_SHORTCUTS.details
+    },
+    {
+      name: t`Purchasing`,
+      to: path.to.servicePurchasing(itemId),
+      isDisabled: replenishment === "Make",
+      role: ["employee", "supplier"],
+      permission: "purchasing",
+      icon: LuShoppingCart,
+      shortcut: DETAIL_TAB_SHORTCUTS.purchasing
+    },
+    {
+      name: t`Sales`,
+      to: path.to.serviceSales(itemId),
+      role: ["employee", "customer"],
+      icon: LuReceipt,
+      shortcut: DETAIL_TAB_SHORTCUTS.sales
+    },
+    {
+      name: t`Accounting`,
+      to: path.to.serviceCosting(itemId),
+      role: ["employee"],
+      permission: "purchasing",
+      icon: LuTags,
+      shortcut: DETAIL_TAB_SHORTCUTS.accounting
+    },
+    {
+      name: t`Quality`,
+      to: path.to.serviceQuality(itemId),
+      role: ["employee"],
+      permission: "quality",
+      icon: LuClipboardCheck,
+      shortcut: DETAIL_TAB_SHORTCUTS.quality
+    }
+  ].filter(
+    (item) =>
+      !item.isDisabled &&
+      (item.role === undefined ||
+        item.role.some((role) => permissions.is(role as Role))) &&
+      (item.permission === undefined ||
+        permissions.can("view", item.permission))
+  );
+}

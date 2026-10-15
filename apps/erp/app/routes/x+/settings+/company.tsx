@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import {
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  Copy,
+  Heading,
+  HStack,
+  ScrollArea
+} from "@carbon/react";
+import { msg } from "@lingui/core/macro";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { LuKeySquare, LuRocket } from "react-icons/lu";
+import type { ActionFunctionArgs } from "react-router";
+import { data, Link } from "react-router";
+import { AppBarActions } from "~/components/Layout/Mobile";
+import { SettingsPage } from "~/components/SettingsPage";
+import { useRouteData } from "~/hooks";
+import { useImplementationReopenItem } from "~/hooks/useImplementationNavItem";
+import type { Company as CompanyType } from "~/modules/settings";
+import {
+  CompanyForm,
+  companyValidator,
+  updateCompany,
+  updateCompanyWithBaseCurrencyChange
+} from "~/modules/settings";
+import { invalidateCompanyTimeZone } from "~/modules/shared/timezone.server";
+import { getDatabaseClient } from "~/services/database.server";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: msg`Company`,
+  to: path.to.company
+};
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    update: "settings"
+  });
+  const formData = await request.formData();
+
+  const validation = await validator(companyValidator).validate(formData);
+  console.log(validation.error);
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const existing = await client
+    .from("company")
+    .select("baseCurrencyCode")
+    .eq("id", companyId)
+    .single();
+
+  const baseCurrencyChanged =
+    !!existing.data?.baseCurrencyCode &&
+    existing.data.baseCurrencyCode !== validation.data.baseCurrencyCode;
+
+  if (baseCurrencyChanged) {
+    // Overrides are denominated in the company's base currency — after a base
+    // change they'd silently resolve against the wrong anchor. Clear them in
+    // the SAME transaction as the base flip; market rates take over until the
+    // user re-pins.
+    try {
+      await updateCompanyWithBaseCurrencyChange(
+        getDatabaseClient(),
+        companyId,
+        {
+          ...validation.data,
+          updatedBy: userId
+        }
+      );
+    } catch (err) {
+      console.error(err);
+      return data(
+        {},
+        await flash(request, error(err, "Failed to update company"))
+      );
+    }
+  } else {
+    const update = await updateCompany(client, companyId, {
+      ...validation.data,
+      updatedBy: userId
+    });
+    console.log(update.error);
+    if (update.error)
+      return data(
+        {},
+        await flash(request, error(update.error, "Failed to update company"))
+      );
+  }
+
+  // company.timezone may have changed — drop the cached resolution.
+  await invalidateCompanyTimeZone(companyId);
+
+  return data({}, await flash(request, success("Updated company")));
+}
+
+export default function Company() {
+  const { t } = useLingui();
+  const routeData = useRouteData<{ company: CompanyType }>(
+    path.to.authenticatedRoot
+  );
+
+  const company = routeData?.company;
+  if (!company) throw new Error("Company not found");
+
+  // Buried reopen entry for a finished implementation hub — only present once the
+  // company was enrolled and onboarding was wrapped up (status complete/archived).
+  const reopenHub = useImplementationReopenItem();
+
+  const initialValues = {
+    name: company.name,
+    taxId: company.taxId ?? undefined,
+    vatNumber: company.vatNumber ?? undefined,
+    eori: company.eori ?? undefined,
+    registrationNumber: company.registrationNumber ?? undefined,
+    addressLine1: company.addressLine1 ?? "",
+    addressLine2: company.addressLine2 ?? undefined,
+    city: company.city ?? "",
+    stateProvince: company.stateProvince ?? "",
+    postalCode: company.postalCode ?? "",
+    countryCode: company.countryCode ?? "",
+    timezone: company.timezone ?? "UTC",
+    baseCurrencyCode: company.baseCurrencyCode ?? undefined,
+    phone: company.phone ?? undefined,
+    email: company.email ?? undefined,
+    website: company.website ?? undefined
+  };
+
+  return (
+    <ScrollArea className="w-full h-[calc(100dvh-var(--topbar-height)-var(--content-inset))]">
+      <SettingsPage className="gap-4">
+        <HStack spacing={1} className="items-center max-md:hidden">
+          <Heading size="h3">
+            <Trans>Company</Trans>
+          </Heading>
+          <Copy
+            text={company.id ?? ""}
+            label={t`Copy company unique identifier`}
+            icon={<LuKeySquare className="size-3" />}
+            variant="ghost"
+            className="w-auto"
+          />
+        </HStack>
+        <AppBarActions>
+          <Copy
+            text={company.id ?? ""}
+            label={t`Copy company unique identifier`}
+            icon={<LuKeySquare />}
+            variant="ghost"
+            size="lg"
+          />
+        </AppBarActions>
+        <Card>
+          <CardHeader>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex flex-col gap-1.5">
+                <CardTitle>
+                  <Trans>Basic Information</Trans>
+                </CardTitle>
+                <CardDescription>
+                  <Trans>
+                    This information will be used on document headers
+                  </Trans>
+                </CardDescription>
+              </div>
+              {reopenHub ? (
+                <Button
+                  asChild
+                  variant="secondary"
+                  size="sm"
+                  leftIcon={<LuRocket />}
+                  className="shrink-0"
+                >
+                  <Link to={reopenHub.to}>
+                    <Trans>Go to implementation hub</Trans>
+                  </Link>
+                </Button>
+              ) : null}
+            </div>
+          </CardHeader>
+          <CardContent>
+            {/* @ts-expect-error */}
+            <CompanyForm company={initialValues} />
+          </CardContent>
+        </Card>
+      </SettingsPage>
+    </ScrollArea>
+  );
+}

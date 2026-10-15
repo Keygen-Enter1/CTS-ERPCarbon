@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ValidatedForm } from "@carbon/form";
+import {
+  Button,
+  Drawer,
+  DrawerBody,
+  DrawerContent,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+  Heading,
+  HStack,
+  useCloseRoute,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useState } from "react";
+import type { z } from "zod";
+import { Hidden, Input, Number, Submit } from "~/components/Form";
+import { useCompanyTimeZone, usePermissions } from "~/hooks";
+import { sequenceValidator } from "~/modules/settings";
+import { path } from "~/utils/path";
+import { interpolateSequenceDate } from "~/utils/string";
+
+type SequenceFormProps = {
+  initialValues: z.infer<typeof sequenceValidator> & {
+    name: string;
+  };
+};
+
+const SequenceForm = ({ initialValues }: SequenceFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const closeRoute = useCloseRoute();
+  const onClose = () => closeRoute();
+
+  const [prefix, setPrefix] = useState(initialValues.prefix ?? "");
+  const [suffix, setSuffix] = useState(initialValues.suffix ?? "");
+  const [next, setNext] = useState(initialValues.next ?? "1");
+  const [size, setSize] = useState(initialValues.size ?? 5);
+
+  // Preview in the company timezone — the same calendar get_next_sequence
+  // issues numbers in — not the browser's.
+  const timezone = useCompanyTimeZone();
+  const makePreview = () => {
+    const p = interpolateSequenceDate(prefix, timezone);
+    const s = interpolateSequenceDate(suffix, timezone);
+
+    return `${p}${next.toString().padStart(size, "0")}${s}`;
+  };
+
+  const isDisabled = !permissions.can("update", "settings");
+
+  return (
+    <Drawer
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DrawerContent>
+        <ValidatedForm
+          validator={sequenceValidator}
+          method="post"
+          action={path.to.tableSequence(initialValues.table)}
+          defaultValues={initialValues}
+          className="flex flex-col h-full"
+        >
+          <DrawerHeader>
+            <DrawerTitle>{`${initialValues.name}`} Sequence</DrawerTitle>
+          </DrawerHeader>
+          <DrawerBody>
+            <Hidden name="table" />
+            <VStack spacing={4}>
+              <Heading size="h2">{makePreview()}</Heading>
+
+              <Input
+                name="prefix"
+                label={t`Prefix`}
+                onChange={(e) => setPrefix(e.target.value)}
+              />
+              <Number
+                name="next"
+                minValue={0}
+                label={t`Current`}
+                onChange={setNext}
+              />
+              <Number
+                name="size"
+                minValue={0}
+                maxValue={30}
+                label={t`Size`}
+                onChange={setSize}
+              />
+              <Number
+                name="step"
+                minValue={0}
+                maxValue={10000}
+                label={t`Step`}
+              />
+              <Input
+                name="suffix"
+                label={t`Suffix`}
+                onChange={(e) => setSuffix(e.target.value)}
+              />
+              <VStack spacing={0}>
+                <p className="text-muted-foreground text-sm">{`%{yyyy} = Full Year`}</p>
+                <p className="text-muted-foreground text-sm">{`%{yy} = Year`}</p>
+                <p className="text-muted-foreground text-sm">{`%{mm} = Month`}</p>
+                <p className="text-muted-foreground text-sm">{`%{dd} = Day`}</p>
+                <p className="text-muted-foreground text-sm">{`%{hh} = Hour`}</p>
+                <p className="text-muted-foreground text-sm">{`%{ss} = Second`}</p>
+              </VStack>
+            </VStack>
+          </DrawerBody>
+          <DrawerFooter>
+            <HStack>
+              <Submit isDisabled={isDisabled}>
+                <Trans>Save</Trans>
+              </Submit>
+              <Button size="md" variant="solid" onClick={onClose}>
+                <Trans>Cancel</Trans>
+              </Button>
+            </HStack>
+          </DrawerFooter>
+        </ValidatedForm>
+      </DrawerContent>
+    </Drawer>
+  );
+};
+
+export default SequenceForm;

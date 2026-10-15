@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle
+} from "@carbon/react";
+import { datetime, redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import { Trans } from "@lingui/react/macro";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import { NewRecordPage } from "~/components/NewRecordPage";
+import { MemoForm, memoValidator, upsertMemo } from "~/modules/invoicing";
+import { getCompany, getNextSequence } from "~/modules/settings";
+import { getCompanyTimeZone } from "~/modules/shared/timezone.server";
+import { setCustomFields } from "~/utils/form";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+// One create route, two presentations. ?party (from the originating list)
+// picks the type; Supplier Credit is a supplier Debit, Credit Memo a customer
+// Credit. The breadcrumb links back to the matching list.
+export const handle: Handle = {
+  breadcrumb: (_params: unknown, data: unknown) => {
+    const isVendor =
+      (data as { type?: string } | undefined)?.type === "supplierCredit";
+    return [
+      isVendor
+        ? { breadcrumb: msg`Supplier Credits`, to: path.to.supplierCredits }
+        : { breadcrumb: msg`Credit Memos`, to: path.to.creditMemos }
+    ];
+  },
+  module: "invoicing"
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    create: "invoicing"
+  });
+
+  const company = await getCompany(client, companyId);
+  const currencyCode = company.data?.baseCurrencyCode ?? "";
+
+  const party = new URL(request.url).searchParams.get("party");
+  const type = party === "supplier" ? "supplierCredit" : "creditMemo";
+
+  return {
+    type,
+    initialValues: {
+      memoId: "",
+      // Direction follows the type and is submitted hidden by the form.
+      direction:
+        type === "supplierCredit" ? ("Debit" as const) : ("Credit" as const),
+      customerId: "",
+      supplierId: "",
+      memoDate: datetime
+        .today(await getCompanyTimeZone(client, companyId))
+        .toString(),
+      currencyCode,
+      exchangeRate: 1,
+      amount: 0,
+      reference: "",
+      notes: ""
+    }
+  };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    create: "invoicing"
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(memoValidator).validate(formData);
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  let memoId = validation.data.memoId;
+  if (!memoId) {
+    const next = await getNextSequence(
+      client,
+      validation.data.direction === "Credit" ? "creditMemo" : "debitMemo",
+      companyId
+    );
+    if (next.error || !next.data) {
+      throw redirect(
+        path.to.invoicing,
+        await flash(request, error(next.error, "Failed to allocate memo id"))
+      );
+    }
+    memoId = next.data;
+  }
+
+  // The form posts a hidden `id` as "" which validates to null. The create
+  // branch must omit it so the table's xid() default generates the id.
+  const { id: _omitId, ...memoData } = validation.data;
+
+  const insert = await upsertMemo(client, {
+    ...memoData,
+    memoId,
+    companyId,
+    createdBy: userId,
+    customFields: setCustomFields(formData)
+  });
+  if (insert.error || !insert.data) {
+    throw redirect(
+      path.to.invoicing,
+      await flash(request, error(insert.error, "Failed to create memo"))
+    );
+  }
+
+  throw redirect(
+    path.to.memo(insert.data.id),
+    await flash(request, success("Memo created"))
+  );
+}
+
+export default function NewMemoRoute() {
+  const { initialValues, type } = useLoaderData<typeof loader>();
+  const isVendor = type === "supplierCredit";
+  return (
+    <NewRecordPage>
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            {isVendor ? (
+              <Trans>New Supplier Credit</Trans>
+            ) : (
+              <Trans>New Credit Memo</Trans>
+            )}
+          </CardTitle>
+          <CardDescription>
+            {isVendor ? (
+              <Trans>
+                Record a credit from a supplier — it reduces what you owe them.
+                Applications to specific invoices are added after it is created.
+              </Trans>
+            ) : (
+              <Trans>
+                Record a credit memo for a customer — it reduces what they owe.
+                Applications to specific invoices are added after it is created.
+              </Trans>
+            )}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="@container">
+          <MemoForm
+            initialValues={initialValues}
+            type={isVendor ? "supplierCredit" : "creditMemo"}
+          />
+        </CardContent>
+      </Card>
+    </NewRecordPage>
+  );
+}

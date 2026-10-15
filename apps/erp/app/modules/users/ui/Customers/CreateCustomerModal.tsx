@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useControlField, useField, ValidatedForm } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import {
+  Combobox,
+  FormControl,
+  FormErrorMessage,
+  FormLabel,
+  HStack,
+  Input,
+  LabelWithHelp,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  ModalOverlay,
+  ModalTitle,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useFetcher, useNavigate } from "react-router";
+import { Customer, Submit } from "~/components/Form";
+import { useUrlParams } from "~/hooks";
+import type {
+  CustomerContact as CustomerContactType,
+  getCustomerContacts
+} from "~/modules/sales";
+import { createCustomerAccountValidator } from "~/modules/users";
+import type { Result } from "~/types";
+import { path } from "~/utils/path";
+
+const CreateCustomerModal = () => {
+  const { t } = useLingui();
+  const navigate = useNavigate();
+  const [params] = useUrlParams();
+
+  const formFetcher = useFetcher<Result>();
+  const [customer, setCustomer] = useState<string | undefined>(
+    (params.get("customer") as string) ?? undefined
+  );
+  const [contact, setContact] = useState<CustomerContactType["contact"] | null>(
+    null
+  );
+
+  return (
+    <Modal
+      open
+      onOpenChange={(open) => {
+        if (!open) navigate(path.to.customerAccounts);
+      }}
+    >
+      <ModalOverlay />
+      <ModalContent>
+        <ValidatedForm
+          method="post"
+          action={`${path.to.newCustomerAccount}${
+            params.get("customer") ? `?customer=${params.get("customer")}` : ""
+          }`}
+          validator={createCustomerAccountValidator}
+          defaultValues={{
+            id: params.get("id") ?? "",
+            customer: params.get("customer") ?? ""
+          }}
+          fetcher={formFetcher}
+          className="flex flex-col h-full"
+        >
+          <ModalHeader>
+            <ModalTitle>
+              <Trans>Create an account</Trans>
+            </ModalTitle>
+          </ModalHeader>
+
+          <ModalBody>
+            <VStack spacing={4}>
+              <Customer
+                name="customer"
+                label={t`Customer`}
+                termId="create-customer-account-customer"
+                onChange={(newValue) =>
+                  setCustomer(newValue?.value as string | undefined)
+                }
+              />
+              <CustomerContact
+                name="id"
+                customer={customer}
+                onChange={(contact) => setContact(contact?.contact ?? null)}
+              />
+              {contact && (
+                <>
+                  <FormControl>
+                    <FormLabel>
+                      <Trans>Email</Trans>
+                    </FormLabel>
+                    <Input isReadOnly value={contact?.email ?? ""} />
+                  </FormControl>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full">
+                    <FormControl>
+                      <FormLabel>
+                        <Trans>First Name</Trans>
+                      </FormLabel>
+                      <Input isReadOnly value={contact?.firstName ?? ""} />
+                    </FormControl>
+                    <FormControl>
+                      <FormLabel>
+                        <Trans>Last Name</Trans>
+                      </FormLabel>
+                      <Input isReadOnly value={contact?.lastName ?? ""} />
+                    </FormControl>
+                  </div>
+                </>
+              )}
+            </VStack>
+          </ModalBody>
+          <ModalFooter>
+            <HStack>
+              <Submit isLoading={formFetcher.state !== "idle"}>
+                <Trans>Create User</Trans>
+              </Submit>
+            </HStack>
+          </ModalFooter>
+        </ValidatedForm>
+      </ModalContent>
+    </Modal>
+  );
+};
+
+const CustomerContact = ({
+  name,
+  customer,
+  onChange
+}: {
+  name: string;
+  customer?: string;
+  onChange?: (
+    newValue: {
+      id: string;
+      contact: CustomerContactType["contact"];
+    } | null
+  ) => void;
+}) => {
+  const initialLoad = useRef(true);
+  const {
+    error,
+    defaultValue,
+    isOptional: isCustomerContactOptional
+  } = useField(name);
+  const [value, setValue] = useControlField<string | null>(name);
+
+  const customerContactFetcher = useLoaderQuery<
+    Awaited<ReturnType<typeof getCustomerContacts>>
+  >(customer ? path.to.api.customerContacts(customer) : null);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  useEffect(() => {
+    if (initialLoad.current) {
+      initialLoad.current = false;
+    } else {
+      setValue(null);
+      if (onChange) {
+        onChange(null);
+      }
+    }
+  }, [customer]);
+
+  const options = useMemo(
+    () =>
+      customerContactFetcher.data?.data
+        ? customerContactFetcher.data?.data.map((c) => ({
+            value: c.id,
+            label: `${c.contact?.firstName} ${c.contact?.lastName}`
+          }))
+        : [],
+    [customerContactFetcher.data]
+  );
+
+  const handleChange = (newValue: string) => {
+    setValue(newValue ?? "");
+    if (onChange && typeof onChange === "function") {
+      if (!newValue) onChange(null);
+      const contact = customerContactFetcher.data?.data?.find(
+        (c) => c.id === newValue
+      );
+
+      // @ts-expect-error TS2322 - TODO: fix type
+      onChange({ id: newValue, contact: contact?.contact ?? null });
+    }
+  };
+
+  // so that we can call onChange on load
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  useEffect(() => {
+    if (value && value === defaultValue) {
+      handleChange(value);
+    }
+  }, [value, customerContactFetcher.data?.data]);
+
+  return (
+    <FormControl isInvalid={!!error}>
+      <FormLabel htmlFor={name} isOptional={isCustomerContactOptional}>
+        <LabelWithHelp termId="create-customer-account-contact">
+          <Trans>Customer Contact</Trans>
+        </LabelWithHelp>
+      </FormLabel>
+      <input type="hidden" name={name} id={name} value={value ?? ""} />
+      <Combobox
+        id={name}
+        value={value ?? undefined}
+        options={options}
+        onChange={handleChange}
+        className="w-full"
+      />
+      {error && <FormErrorMessage>{error}</FormErrorMessage>}
+    </FormControl>
+  );
+};
+
+export default CreateCustomerModal;

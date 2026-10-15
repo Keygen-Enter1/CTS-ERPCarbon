@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { TermId } from "@carbon/content/glossary";
+import { ValidatedForm } from "@carbon/form";
+import {
+  Button,
+  Heading,
+  HStack,
+  LabelWithHelp,
+  useCloseRoute
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useMemo } from "react";
+import type { z } from "zod";
+import { Select, Submit } from "~/components/Form";
+import { usePermissions } from "~/hooks";
+import { months } from "~/modules/shared";
+import { path } from "~/utils/path";
+import { fiscalYearSettingsValidator } from "../../accounting.models";
+
+type FiscalYearSettingsField = {
+  name: string;
+  label: string;
+  description: string;
+  termId: TermId;
+  locked: boolean;
+};
+
+type FiscalYearSettingsFormProps = {
+  initialValues: z.infer<typeof fiscalYearSettingsValidator>;
+  fiscalStartLocked?: boolean;
+};
+
+const FiscalYearSettingsForm = ({
+  initialValues,
+  fiscalStartLocked = false
+}: FiscalYearSettingsFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const closeRoute = useCloseRoute();
+  const onClose = () => closeRoute();
+
+  const isDisabled =
+    !permissions.can("update", "accounting") || !permissions.is("employee");
+
+  const fields: FiscalYearSettingsField[] = useMemo(
+    () => [
+      {
+        name: "startMonth",
+        label: t`Start of Fiscal Year`,
+        description: t`This is the month your fiscal year starts.`,
+        termId: "fiscal-year-start",
+        locked: fiscalStartLocked
+      },
+      {
+        name: "taxStartMonth",
+        label: t`Start of Tax Year`,
+        description: t`This is the month your tax year starts.`,
+        termId: "fiscal-year-tax-start",
+        locked: false
+      }
+    ],
+    [t, fiscalStartLocked]
+  );
+
+  return (
+    <ValidatedForm
+      method="post"
+      action={path.to.fiscalYears}
+      defaultValues={initialValues}
+      validator={fiscalYearSettingsValidator}
+      className="w-full"
+    >
+      <div className="rounded-lg border border-border bg-card">
+        <div className="flex items-center justify-between border-b border-border p-6 max-md:flex-col max-md:items-start max-md:gap-3 max-md:p-4">
+          <div>
+            <Heading as="h1" size="h3">
+              <Trans>Fiscal Year Settings</Trans>
+            </Heading>
+            <p className="text-sm text-muted-foreground">
+              <Trans>
+                Configure the start months for your fiscal and tax years
+              </Trans>
+            </p>
+          </div>
+          <HStack>
+            <Submit isDisabled={isDisabled}>
+              <Trans>Save</Trans>
+            </Submit>
+            <Button size="md" variant="solid" onClick={onClose}>
+              <Trans>Cancel</Trans>
+            </Button>
+          </HStack>
+        </div>
+        <div className="flex flex-col gap-3 p-6 max-md:gap-5 max-md:p-4">
+          {fields.map((field) => (
+            <div
+              key={field.name}
+              className="group rounded-lg border border-border p-4 transition-colors hover:border-muted-foreground/30 max-md:border-0 max-md:p-0"
+            >
+              <div className="flex items-start justify-between gap-4 max-md:flex-col max-md:items-stretch max-md:gap-2">
+                <div className="flex-1 min-w-0">
+                  <h3 className="text-sm font-medium text-foreground mb-1">
+                    <LabelWithHelp variant="inline" termId={field.termId}>
+                      {field.label}
+                    </LabelWithHelp>
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    {field.description}
+                  </p>
+                  {field.locked && (
+                    <p className="text-xs text-muted-foreground mt-1.5">
+                      <Trans>
+                        Fixed once accounting periods have been posted to or
+                        closed. Delete all open periods to change it.
+                      </Trans>
+                    </p>
+                  )}
+                </div>
+                <div className="flex-shrink-0 w-64 max-md:w-full">
+                  <Select
+                    name={field.name}
+                    options={months.map((month) => ({
+                      label: month,
+                      value: month
+                    }))}
+                    size="sm"
+                    isReadOnly={field.locked}
+                  />
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </ValidatedForm>
+  );
+};
+
+export default FiscalYearSettingsForm;

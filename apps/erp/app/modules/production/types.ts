@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+import type {
+  getActiveProductionEvents,
+  getAssemblyComponentMappings,
+  getAssemblyInstruction,
+  getAssemblyInstructionStepMaterials,
+  getAssemblyInstructionStepSlides,
+  getAssemblyInstructionSteps,
+  getAssemblyInstructionStepTools,
+  getAssemblyInstructions,
+  getAssemblyInstructionVersions,
+  getAssemblyUnits,
+  getFailureMode,
+  getFailureModes,
+  getJob,
+  getJobMakeMethodById,
+  getJobMaterialsWithQuantityOnHand,
+  getJobMethodTree,
+  getJobOperationBatchEvents,
+  getJobOperationBatches,
+  getJobOperationBatchWithMembers,
+  getJobOperations,
+  getJobPurchaseOrderLines,
+  getMaintenanceDispatch,
+  getMaintenanceDispatchComments,
+  getMaintenanceDispatchEvents,
+  getMaintenanceDispatches,
+  getMaintenanceDispatchItems,
+  getMaintenanceDispatchWorkCenters,
+  getMaintenanceSchedule,
+  getMaintenanceScheduleItems,
+  getMaintenanceSchedules,
+  getPlanningActions,
+  getProcedure,
+  getProcedureParameters,
+  getProcedureSteps,
+  getProcedures,
+  getProductionEvents,
+  getProductionPlanning,
+  getProductionProjections,
+  getProductionQuantities,
+  getScrapReasons,
+  JobOperationBatchListMember
+} from "./production.service";
+
+export type ActiveProductionEvent = NonNullable<
+  Awaited<ReturnType<typeof getActiveProductionEvents>>["data"]
+>[number];
+
+export type DemandProjection = NonNullable<
+  Awaited<ReturnType<typeof getProductionProjections>>["data"]
+>[number];
+
+export type FailureMode = NonNullable<
+  Awaited<ReturnType<typeof getFailureModes>>["data"]
+>[number];
+
+export type FailureModeDetail = NonNullable<
+  Awaited<ReturnType<typeof getFailureMode>>["data"]
+>;
+
+export type MaintenanceDispatch = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceDispatches>>["data"]
+>[number];
+
+export type MaintenanceDispatchDetail = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceDispatch>>["data"]
+>;
+
+export type MaintenanceDispatchComment = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceDispatchComments>>["data"]
+>[number];
+
+export type MaintenanceDispatchEvent = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceDispatchEvents>>["data"]
+>[number];
+
+export type MaintenanceDispatchItem = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceDispatchItems>>["data"]
+>[number];
+
+export type MaintenanceDispatchWorkCenter = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceDispatchWorkCenters>>["data"]
+>[number];
+
+export type MaintenanceSchedule = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceSchedules>>["data"]
+>[number];
+
+export type MaintenanceScheduleDetail = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceSchedule>>["data"]
+>;
+
+export type MaintenanceScheduleItem = NonNullable<
+  Awaited<ReturnType<typeof getMaintenanceScheduleItems>>["data"]
+>[number];
+
+export type Job = NonNullable<Awaited<ReturnType<typeof getJob>>["data"]>;
+
+export type JobMakeMethod = NonNullable<
+  Awaited<ReturnType<typeof getJobMakeMethodById>>["data"]
+>;
+
+export type JobMaterial = NonNullable<
+  Awaited<ReturnType<typeof getJobMaterialsWithQuantityOnHand>>["data"]
+>[number] & { hasExpiredBatch?: boolean };
+
+export type JobMethod = NonNullable<
+  Awaited<ReturnType<typeof getJobMethodTree>>["data"]
+>[number]["data"];
+
+export type JobOperation = NonNullable<
+  Awaited<ReturnType<typeof getJobOperations>>["data"]
+>[number];
+
+export type JobPurchaseOrderLine = NonNullable<
+  Awaited<ReturnType<typeof getJobPurchaseOrderLines>>["data"]
+>[number];
+
+export type JobMaterialPurchaseOrderLine = {
+  itemId: string | null;
+  purchaseQuantity: number | null;
+  quantityReceived: number | null;
+  status: Database["public"]["Enums"]["purchaseOrderStatus"] | null;
+};
+
+// An active job that produces a (manufactured) material item — the supply-side
+// counterpart to JobMaterialPurchaseOrderLine.
+export type JobMaterialSupplyJobLine = {
+  itemId: string | null;
+  status: Database["public"]["Enums"]["jobStatus"] | null;
+};
+
+export type PurchaseOrderStatus =
+  Database["public"]["Enums"]["purchaseOrderStatus"];
+
+export type JobStatus = Database["public"]["Enums"]["jobStatus"];
+
+export type ItemOrderStatus = {
+  needsOrder: boolean;
+  needsJob: boolean;
+  shortfall: number;
+  substituteItemId: string | null;
+  status: PurchaseOrderStatus | null;
+  supplyJobStatus: JobStatus | null;
+  coveredByOnHand: boolean;
+  isIssued: boolean;
+  ordered: number;
+  received: number;
+};
+
+export type JobOrderStatusCategory =
+  | "issued"
+  | "needsOrder"
+  | "needsJob"
+  | "planned"
+  | "plannedJob"
+  | "awaitingApproval"
+  | "onOrder"
+  | "received"
+  | "inStock";
+
+export type ItemShortfall = {
+  shortfall: number;
+  coveredByOnHand: boolean;
+  substituteItemId?: string | null;
+};
+
+export type ProductionEvent = NonNullable<
+  Awaited<ReturnType<typeof getProductionEvents>>["data"]
+>[number];
+
+export type ProductionQuantity = NonNullable<
+  Awaited<ReturnType<typeof getProductionQuantities>>["data"]
+>[number];
+
+export type Procedures = NonNullable<
+  Awaited<ReturnType<typeof getProcedures>>["data"]
+>[number];
+
+export type ProcedureStep = NonNullable<
+  Awaited<ReturnType<typeof getProcedureSteps>>["data"]
+>[number];
+
+export type ProcedureParameter = NonNullable<
+  Awaited<ReturnType<typeof getProcedureParameters>>["data"]
+>[number];
+
+export type Procedure = NonNullable<
+  Awaited<ReturnType<typeof getProcedure>>["data"]
+>;
+
+/**
+ * The columns the planning grid RPCs add to the base planning row. Generated
+ * function return types mark every column non-null; these are not — an item
+ * with no group, no planning horizon, no negative week or nothing to order
+ * comes back NULL.
+ */
+export type PlanningGridColumns = {
+  itemPostingGroupId: string | null;
+  /** The item's saved planning horizon in days (item, else company default);
+   *  null when there is none — a saved 0 means "no fence" and reads as null. */
+  planningHorizonDays: number | null;
+  /** Today + the saved horizon; null when the item has no fence. */
+  timeFenceDate: string | null;
+  /** Start of the first week whose projected on-hand is below zero. */
+  firstNegativeDate: string | null;
+  /** Earliest order-by date among the item's open new-supply actions. */
+  latestOrderDate: string | null;
+  /** The quantity of the item's open new-supply actions (Order / Make) inside
+   *  its fence — what the Order / Make button offers, and the default sort.
+   *  The base RPC's `quantityToOrder` is a second sizing that misses what MRP
+   *  did after sizing. */
+  orderQuantity: number;
+};
+
+export type ProductionPlanningItem = Omit<
+  NonNullable<
+    Awaited<ReturnType<typeof getProductionPlanning>>["data"]
+  >[number],
+  keyof PlanningGridColumns
+> &
+  PlanningGridColumns;
+
+export type PlanningAction = NonNullable<
+  Awaited<ReturnType<typeof getPlanningActions>>["data"]
+>[number];
+
+export type ScrapReason = NonNullable<
+  Awaited<ReturnType<typeof getScrapReasons>>["data"]
+>[number];
+
+export type JobOperationBatch = NonNullable<
+  Awaited<ReturnType<typeof getJobOperationBatches>>["data"]
+>[number] & {
+  // Merged into the row by the batches loader (getJobOperationBatchMemberStats).
+  memberCount?: number;
+  totalQuantity?: number;
+  // Header work center, falling back to the members' shared one.
+  workCenterName?: string | null;
+  // Member rows for the expandable sub-list (getJobOperationBatchMembers).
+  members?: JobOperationBatchListMember[];
+};
+
+export type JobOperationBatchDetail = NonNullable<
+  Awaited<ReturnType<typeof getJobOperationBatchWithMembers>>["data"]
+>;
+
+export type JobOperationBatchEvent = NonNullable<
+  Awaited<ReturnType<typeof getJobOperationBatchEvents>>["data"]
+>[number];
+
+// Material properties of one BOM line, as returned by get_batchable_operations.
+export type BatchMaterial = {
+  itemReadableId: string | null;
+  description: string | null;
+  quantity: number | null;
+  formId: string | null;
+  formName: string | null;
+  substanceId: string | null;
+  substanceName: string | null;
+  gradeId: string | null;
+  gradeName: string | null;
+  dimensionId: string | null;
+  dimensionName: string | null;
+  finishId: string | null;
+  finishName: string | null;
+};
+
+// A candidate operation for the batch builder. The base shape is the
+// get_batchable_operations RPC row; the batchable-operations API route enriches
+// each with the op's setupTime/setupUnit/dueDate (for the setup-saving and
+// due-spread chips), which the RPC does not return.
+export type BatchCandidate = {
+  id: string;
+  jobId: string;
+  jobReadableId: string | null;
+  jobDueDate: string | null;
+  jobStatus: string | null;
+  itemId: string | null;
+  itemReadableId: string | null;
+  itemDescription: string | null;
+  // The produced item's lot tracking and the job's live WIP entity, whose
+  // readableId is the lot number (pre-fills the builder's Output card).
+  requiresBatchTracking: boolean | null;
+  trackedEntityId: string | null;
+  lotNumber: string | null;
+  description: string | null;
+  operationQuantity: number | null;
+  status: string | null;
+  workCenterId: string | null;
+  jobOperationBatchId: string | null;
+  batchReadableId: string | null;
+  batchStatus: "Active" | "Completing" | "Completed" | null;
+  batchWorkCenterId: string | null;
+  materials: BatchMaterial[];
+  // Enriched by the API route (absent on the raw RPC row).
+  setupTime: number | null;
+  setupUnit: string | null;
+  laborTime: number | null;
+  laborUnit: string | null;
+  machineTime: number | null;
+  machineUnit: string | null;
+  dueDate: string | null;
+  thumbnailPath: string | null;
+};
+
+// --- Assembly Instructions ---------------------------------------------
+
+export type AssemblyInstruction = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyInstruction>>["data"]
+>;
+
+export type AssemblyInstructionListItem = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyInstructions>>["data"]
+>[number];
+
+export type AssemblyInstructionVersion = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyInstructionVersions>>["data"]
+>[number];
+
+export type AssemblyInstructionStepRow = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyInstructionSteps>>["data"]
+>[number];
+
+export type AssemblyStepMaterial = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyInstructionStepMaterials>>["data"]
+>[number];
+
+export type AssemblyStepSlide = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyInstructionStepSlides>>["data"]
+>[number];
+
+export type AssemblyStepTool = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyInstructionStepTools>>["data"]
+>[number];
+
+export type AssemblyUnit = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyUnits>>["data"]
+>[number];
+
+export type AssemblyComponentMapping = NonNullable<
+  Awaited<ReturnType<typeof getAssemblyComponentMappings>>["data"]
+>[number];

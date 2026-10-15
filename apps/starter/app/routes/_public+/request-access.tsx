@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { getAppUrl } from "@carbon/auth";
+import { Button } from "@carbon/react";
+import { SUPPORT_EMAIL } from "@carbon/utils";
+import type { MetaFunction } from "react-router";
+
+export const meta: MetaFunction = () => {
+  return [
+    {
+      title: "Carbon Developers | Request Access"
+    }
+  ];
+};
+
+export default function RequestAccessRoute() {
+  return (
+    <>
+      <div className="flex flex-col items-center justify-center">
+        <img
+          src="/carbon-mark-light.svg"
+          alt="Carbon Logo"
+          className="w-24 mb-3"
+        />
+        <img
+          src="/carbon-mark-dark.svg"
+          alt="Carbon Logo"
+          className="w-24 mb-3 hidden dark:block"
+        />
+
+        <h3 className="font-mono font-bold leading-loose uppercase text-xl">
+          Developers
+        </h3>
+      </div>
+      <div className="rounded-lg bg-card flex flex-col gap-4 border border-border shadow-lg p-8 w-[380px]">
+        <p>
+          Request access to the developer portal by emailing {SUPPORT_EMAIL}
+        </p>
+        <Button size="lg" asChild>
+          <a href={getAppUrl()}>Return to App</a>
+        </Button>
+      </div>
+    </>
+  );
+}

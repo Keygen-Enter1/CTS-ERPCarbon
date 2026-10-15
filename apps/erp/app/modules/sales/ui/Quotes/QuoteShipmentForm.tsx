@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ValidatedForm } from "@carbon/form";
+import {
+  Card,
+  CardContent,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  useViewport
+} from "@carbon/react";
+import { INPUT_FORMAT } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { forwardRef, useImperativeHandle, useRef, useState } from "react";
+import { useFetcher, useParams } from "react-router";
+import type { z } from "zod";
+import {
+  DatePicker,
+  Hidden,
+  Input,
+  Location,
+  Number,
+  Select,
+  ShippingMethod,
+  Submit
+} from "~/components/Form";
+import {
+  useCurrencyDecimals,
+  usePermissions,
+  useRouteData,
+  useUser
+} from "~/hooks";
+import { incoterms } from "~/modules/shared";
+import { path } from "~/utils/path";
+import { isQuoteLocked, quoteShipmentValidator } from "../../sales.models";
+import type { Quotation } from "../../types";
+
+type QuoteShipmentFormProps = {
+  initialValues: z.infer<typeof quoteShipmentValidator>;
+  defaultCollapsed?: boolean;
+};
+
+export type QuoteShipmentFormRef = {
+  focusShippingCost: () => void;
+};
+
+const QuoteShipmentForm = forwardRef<
+  QuoteShipmentFormRef,
+  QuoteShipmentFormProps
+>(({ initialValues, defaultCollapsed = false }, ref) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const fetcher = useFetcher<{}>();
+  const [isCollapsed, setIsCollapsed] = useState(defaultCollapsed);
+  const [incoterm, setIncoterm] = useState<string | undefined>(
+    initialValues.incoterm || undefined
+  );
+
+  const shippingCostRef = useRef<HTMLInputElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    focusShippingCost: () => {
+      setIsCollapsed(false);
+      setTimeout(() => {
+        cardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+        shippingCostRef.current?.focus();
+      }, 100);
+    }
+  }));
+
+  const isCustomer = permissions.is("customer");
+
+  const { quoteId } = useParams();
+  if (!quoteId) throw new Error("quoteId not found");
+  const routeData = useRouteData<{
+    quote: Quotation;
+  }>(path.to.quote(quoteId));
+
+  const isLocked = isQuoteLocked(routeData?.quote?.status);
+  const isEditable = !isLocked;
+  const { isPhone } = useViewport();
+  const quoteStatus = routeData?.quote?.status ?? "";
+
+  const { company } = useUser();
+  const currencyDecimals = useCurrencyDecimals(company?.baseCurrencyCode);
+
+  return (
+    <Card
+      ref={cardRef}
+      isCollapsible
+      defaultCollapsed={defaultCollapsed}
+      isCollapsed={isCollapsed}
+      onCollapsedChange={setIsCollapsed}
+    >
+      <ValidatedForm
+        action={path.to.quoteShipment(initialValues.id)}
+        method="post"
+        validator={quoteShipmentValidator}
+        defaultValues={initialValues}
+        fetcher={fetcher}
+        isDisabled={isLocked}
+      >
+        <CardHeader>
+          <CardTitle>
+            <Trans>Shipping</Trans>
+          </CardTitle>
+          {isPhone && isLocked ? (
+            <p className="text-sm text-muted-foreground">
+              <Trans>
+                Locked while the quote is {quoteStatus}. Reopen it to edit.
+              </Trans>
+            </p>
+          ) : null}
+        </CardHeader>
+        <CardContent>
+          <Hidden name="id" />
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-x-8 gap-y-4 w-full">
+            <Number
+              name="shippingCost"
+              label={t`Shipping Cost`}
+              formatOptions={INPUT_FORMAT.money(
+                company?.baseCurrencyCode,
+                currencyDecimals
+              )}
+              minValue={0}
+              ref={shippingCostRef}
+            />
+            <Location
+              name="locationId"
+              label={t`Shipment Location`}
+              isReadOnly={isCustomer}
+              isClearable
+              termId="quote-shipment-from-location"
+            />
+            <ShippingMethod
+              name="shippingMethodId"
+              label={t`Shipping Method`}
+            />
+            <Select
+              name="incoterm"
+              label={t`Incoterm`}
+              termId="customer-incoterm"
+              isClearable
+              options={incoterms.map((i) => ({ value: i, label: i }))}
+              onChange={(v) => setIncoterm(v?.value as string)}
+            />
+            {incoterm && (
+              <Input name="incotermLocation" label={t`Incoterm Location`} />
+            )}
+
+            <DatePicker
+              name="receiptRequestedDate"
+              label={t`Requested Date`}
+              termId="quote-shipment-receipt-requested-date"
+            />
+          </div>
+        </CardContent>
+        <CardFooter>
+          <Submit
+            isDisabled={!permissions.can("update", "sales") || !isEditable}
+          >
+            <Trans>Save</Trans>
+          </Submit>
+        </CardFooter>
+      </ValidatedForm>
+    </Card>
+  );
+});
+
+QuoteShipmentForm.displayName = "QuoteShipmentForm";
+
+export default QuoteShipmentForm;

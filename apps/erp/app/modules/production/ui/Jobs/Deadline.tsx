@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { BsExclamationSquareFill } from "react-icons/bs";
+import { HighPriorityIcon } from "~/assets/icons/HighPriorityIcon";
+import { LowPriorityIcon } from "~/assets/icons/LowPriorityIcon";
+import { MediumPriorityIcon } from "~/assets/icons/MediumPriorityIcon";
+import type { deadlineTypes } from "../../production.models";
+
+export function getDeadlineIcon(deadlineType: (typeof deadlineTypes)[number]) {
+  switch (deadlineType) {
+    case "ASAP":
+      return <BsExclamationSquareFill className="text-red-500" />;
+    case "Hard Deadline":
+      return <HighPriorityIcon />;
+    case "Soft Deadline":
+      return <MediumPriorityIcon />;
+    case "No Deadline":
+      return <LowPriorityIcon />;
+  }
+}

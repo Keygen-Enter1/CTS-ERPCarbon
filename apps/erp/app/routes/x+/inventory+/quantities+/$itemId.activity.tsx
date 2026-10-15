@@ -1,0 +1,324 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error, notFound, useCarbon } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { Button, Heading } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { Trans } from "@lingui/react/macro";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { LuChevronUp } from "react-icons/lu";
+import type { LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import InfiniteScroll from "~/components/InfiniteScroll";
+import type {
+  BalanceAnchor,
+  CollapsedItemLedger,
+  ItemLedger
+} from "~/modules/inventory";
+import {
+  collapseTransferPairs,
+  getItemLedgerActivity,
+  getItemLedgerBalance,
+  InventoryActivity,
+  withRunningBalance
+} from "~/modules/inventory";
+import { getItem } from "~/modules/items";
+import { getLocationsList } from "~/modules/resources";
+import { getUserDefaults } from "~/modules/users/users.server";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId, userId } = await requirePermissions(request, {
+    view: "inventory"
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw notFound("itemId not found");
+
+  const url = new URL(request.url);
+  const searchParams = new URLSearchParams(url.search);
+  let locationId = searchParams.get("location");
+  const highlightId = searchParams.get("highlight");
+
+  if (!locationId) {
+    const userDefaults = await getUserDefaults(client, userId, companyId);
+    if (userDefaults.error) {
+      throw redirect(
+        path.to.inventory,
+        await flash(
+          request,
+          error(userDefaults.error, "Failed to load default location")
+        )
+      );
+    }
+
+    locationId = userDefaults.data?.locationId ?? null;
+  }
+
+  if (!locationId) {
+    const locations = await getLocationsList(client, companyId);
+    if (locations.error || !locations.data?.length) {
+      throw redirect(
+        path.to.inventory,
+        await flash(
+          request,
+          error(locations.error, "Failed to load any locations")
+        )
+      );
+    }
+    locationId = locations.data?.[0].id as string;
+  }
+
+  // When arriving via a `highlight` param, anchor the first page directly on
+  // that entry (load it + older below) so it's on screen no matter how old it
+  // is — instead of paging from newest until we reach it.
+  let anchorEntryNumber: number | null = null;
+  if (highlightId) {
+    const anchor = await client
+      .from("itemLedger")
+      .select("entryNumber")
+      .eq("id", highlightId)
+      .eq("companyId", companyId)
+      .maybeSingle();
+    anchorEntryNumber = anchor.data?.entryNumber ?? null;
+  }
+
+  // The activity page and the "is there anything newer than the anchor?"
+  // existence check both depend only on `anchorEntryNumber`, not on each other —
+  // run them in parallel to save a roundtrip on highlight navigations. So does
+  // the on-hand balance when the page is anchored, since the anchor entry is
+  // then the page's newest row.
+  const [itemLedgerRecords, newer, item, anchoredBalance] = await Promise.all([
+    getItemLedgerActivity(client, {
+      itemId,
+      companyId,
+      locationId,
+      entryNumber: anchorEntryNumber ?? undefined,
+      direction: "older",
+      inclusive: anchorEntryNumber !== null
+    }),
+    anchorEntryNumber !== null
+      ? client
+          .from("itemLedger")
+          .select("id")
+          .eq("itemId", itemId)
+          .eq("companyId", companyId)
+          .eq("locationId", locationId)
+          .gt("entryNumber", anchorEntryNumber)
+          .limit(1)
+      : Promise.resolve({ data: [] as { id: string }[] }),
+    getItem(client, itemId),
+    anchorEntryNumber !== null
+      ? getItemLedgerBalance(client, {
+          itemId,
+          companyId,
+          locationId,
+          entryNumber: anchorEntryNumber
+        })
+      : null
+  ]);
+  if (itemLedgerRecords.error) {
+    throw redirect(
+      path.to.inventory,
+      await flash(
+        request,
+        error(itemLedgerRecords.error, "Failed to load item inventory activity")
+      )
+    );
+  }
+
+  // Only offer "Load newer" when entries actually exist above the anchor.
+  const hasNewer = (newer.data?.length ?? 0) > 0;
+
+  // One balance prices the whole feed: the on-hand right after the newest row
+  // loaded. The client walks every page out from it. Unanchored, the newest
+  // row is only known now — measuring "on hand now" in parallel instead would
+  // misprice the feed whenever an entry landed between the two queries.
+  const newestEntryNumber = itemLedgerRecords.data[0]?.entryNumber;
+  const balance =
+    newestEntryNumber === undefined
+      ? null
+      : (anchoredBalance ??
+        (await getItemLedgerBalance(client, {
+          itemId,
+          companyId,
+          locationId,
+          entryNumber: newestEntryNumber
+        })));
+  // A failed balance read costs only the before → after column, not the feed.
+  const balanceAnchor: BalanceAnchor | null =
+    newestEntryNumber !== undefined && balance && !balance.error
+      ? { entryNumber: newestEntryNumber, balanceAfter: Number(balance.data) }
+      : null;
+
+  return {
+    initialItemLedgers: itemLedgerRecords.data,
+    itemId,
+    companyId,
+    locationId,
+    highlightId,
+    hasOlder: itemLedgerRecords.hasMore,
+    hasNewer,
+    balanceAnchor,
+    itemTrackingType: item.data?.itemTrackingType ?? null
+  };
+}
+
+// The feed keeps the pages it has loaded in state, seeded from the loader. A
+// reload for another location or highlight is a new feed: without the key it
+// kept showing the first one, with the new one's paging cursors. An entry
+// posted while the feed is open is deliberately not a new feed: remounting
+// would drop the older pages already loaded and the scroll position.
+export default function ItemInventoryActivityRoute() {
+  const { itemId, locationId, highlightId } = useLoaderData<typeof loader>();
+  return (
+    <ItemInventoryActivity key={`${itemId}:${locationId}:${highlightId}`} />
+  );
+}
+
+function ItemInventoryActivity() {
+  const {
+    initialItemLedgers,
+    itemId,
+    companyId,
+    locationId,
+    highlightId,
+    hasOlder: initialHasOlder,
+    hasNewer: initialHasNewer,
+    balanceAnchor: initialBalanceAnchor,
+    itemTrackingType
+  } = useLoaderData<typeof loader>();
+
+  const { carbon } = useCarbon();
+
+  const [itemLedgers, setItemLedgers] =
+    useState<ItemLedger[]>(initialItemLedgers);
+  // Held alongside the rows it was measured against, so the two never drift.
+  const [balanceAnchor] = useState(initialBalanceAnchor);
+  // Price every row from the one anchored balance BEFORE collapsing: a stock
+  // transfer writes an outbound and an inbound ledger row, and collapsing each
+  // pair (so one move reads as one entry) must not lose either half's quantity.
+  const activityItems = useMemo(
+    () => collapseTransferPairs(withRunningBalance(itemLedgers, balanceAnchor)),
+    [itemLedgers, balanceAnchor]
+  );
+  // InfiniteScroll only forwards { item, highlightId } — close over the item's
+  // tracking type so rows label their tracked entity from the item, not a
+  // quantity heuristic.
+  const ActivityItem = useMemo(
+    () =>
+      function ActivityItem({
+        item,
+        highlightId: rowHighlightId
+      }: {
+        item: CollapsedItemLedger;
+        highlightId?: string;
+      }) {
+        return (
+          <InventoryActivity
+            item={item}
+            highlightId={rowHighlightId}
+            itemTrackingType={itemTrackingType}
+          />
+        );
+      },
+    [itemTrackingType]
+  );
+  const [hasOlder, setHasOlder] = useState(initialHasOlder);
+  const [hasNewer, setHasNewer] = useState(initialHasNewer);
+  const [isLoadingNewer, setIsLoadingNewer] = useState(false);
+
+  // Mirror the values the paging callbacks read into refs so the callbacks stay
+  // referentially stable across appends — otherwise InfiniteScroll's
+  // IntersectionObserver effect re-subscribes on every loaded page.
+  const oldestEntryNumber = useRef<number | null>(
+    initialItemLedgers[initialItemLedgers.length - 1]?.entryNumber ?? null
+  );
+  const newestEntryNumber = useRef<number | null>(
+    initialItemLedgers[0]?.entryNumber ?? null
+  );
+  const loadingOlder = useRef(false);
+  const loadingNewer = useRef(false);
+  const hasOlderRef = useRef(initialHasOlder);
+  const hasNewerRef = useRef(initialHasNewer);
+
+  const loadOlder = useCallback(async () => {
+    const cursor = oldestEntryNumber.current;
+    if (loadingOlder.current || !hasOlderRef.current || cursor === null) return;
+    loadingOlder.current = true;
+
+    const result = await getItemLedgerActivity(carbon!, {
+      itemId,
+      companyId,
+      locationId,
+      entryNumber: cursor,
+      direction: "older"
+    });
+
+    if (result.data.length > 0) {
+      oldestEntryNumber.current =
+        result.data[result.data.length - 1].entryNumber;
+      setItemLedgers((prev) => [...prev, ...result.data]);
+    }
+    hasOlderRef.current = result.hasMore;
+    setHasOlder(result.hasMore);
+    loadingOlder.current = false;
+  }, [carbon, itemId, companyId, locationId]);
+
+  const loadNewer = useCallback(async () => {
+    const cursor = newestEntryNumber.current;
+    if (loadingNewer.current || !hasNewerRef.current || cursor === null) return;
+    loadingNewer.current = true;
+    setIsLoadingNewer(true);
+
+    const result = await getItemLedgerActivity(carbon!, {
+      itemId,
+      companyId,
+      locationId,
+      entryNumber: cursor,
+      direction: "newer"
+    });
+
+    if (result.data.length > 0) {
+      newestEntryNumber.current = result.data[0].entryNumber;
+      setItemLedgers((prev) => [...result.data, ...prev]);
+    }
+    hasNewerRef.current = result.hasMore;
+    setHasNewer(result.hasMore);
+    loadingNewer.current = false;
+    setIsLoadingNewer(false);
+  }, [carbon, itemId, companyId, locationId]);
+
+  return (
+    <div className="w-full space-y-4 pt-6 px-4 max-md:p-0">
+      <Heading size="h2" className="mb-4">
+        <Trans>Activity</Trans>
+      </Heading>
+
+      {hasNewer && (
+        <div className="flex justify-center">
+          <Button
+            variant="secondary"
+            leftIcon={<LuChevronUp />}
+            isLoading={isLoadingNewer}
+            isDisabled={isLoadingNewer}
+            onClick={loadNewer}
+          >
+            <Trans>Load newer</Trans>
+          </Button>
+        </div>
+      )}
+
+      <InfiniteScroll
+        component={ActivityItem}
+        items={activityItems}
+        loadMore={loadOlder}
+        hasMore={hasOlder}
+        highlightId={highlightId ?? undefined}
+      />
+    </div>
+  );
+}

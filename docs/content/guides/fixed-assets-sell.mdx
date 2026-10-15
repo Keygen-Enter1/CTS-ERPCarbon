@@ -1,0 +1,41 @@
+---
+title: Sell or dispose
+description: "Two ways an asset leaves the books: sold to a buyer, or scrapped."
+label: "(IV)"
+index: 3
+flow: manufacturing-accounting
+flowName: Manufacturing accounting
+flowIndex: 3
+---
+
+An **"Active"** or **"Fully Depreciated"** asset leaves the books through either a sale or a **<Term id="disposal">disposal</Term>**. A sale enters the sales workflow; a disposal writes off the asset directly.
+
+Both paths use the asset's **<Term>net book value</Term>**: acquisition cost minus accumulated <Term id="depreciation">depreciation</Term>.
+
+<Figure illustration="asset-exit" caption="Two ways an asset leaves the books: sold through a sales order at net book value, or disposed as a write-off." />
+
+## Sell it
+
+The **Sell** action creates a draft **<Term>sales order</Term>** with one **"Fixed Asset"** line. The line references the asset and uses its **net book value** as the price. The order then follows the standard shipment, invoice, and collection workflow.
+
+<Callout tone="blue" badge="SEEDS A SALES ORDER" title="Selling an asset hands it to quote-to-cash at book value.">
+The Sell action uses the standard sales-order workflow at net book value. The fixed-asset line retains the link to the asset being sold.
+</Callout>
+
+<Screenshot src="/screens/fa-sell.png" label="Sell fixed asset" caption="The Sell action drafts a sales order for the asset at its net book value." ratio="wide" />
+
+## Dispose it
+
+Use **Dispose** to retire an asset without a sale. Carbon clears accumulated depreciation, removes the full acquisition cost from the asset account, records the remaining **net book value** as a loss, and moves the asset to **"Disposed"**.
+
+<Callout tone="amber" badge="DISPOSAL IS A WRITE-OFF" title="Disposing scraps the asset and books its remaining value as a loss.">
+The disposal entry debits accumulated depreciation, debits the write-off account for the remaining book value, and credits the asset account for its acquisition cost. This path records no proceeds.
+</Callout>
+
+<Callout tone="green" badge="SELL vs DISPOSE" title="They're separate exits, not two names for one thing.">
+Selling creates a sales order and defers accounting to the invoice. Disposing posts the write-off immediately and marks the asset **"Disposed"**. Use a sale when proceeds are expected and a disposal when retiring the asset without proceeds.
+</Callout>
+
+<Divider />
+
+The fixed-asset lifecycle consists of registration or purchase receipt, periodic depreciation, and either sale through quote-to-cash or disposal through a write-off.

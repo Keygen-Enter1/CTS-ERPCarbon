@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Button,
+  Card,
+  CardAction,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  HStack,
+  Table,
+  Tbody,
+  Td,
+  Tfoot,
+  Th,
+  Thead,
+  Tr,
+  useDisclosure
+} from "@carbon/react";
+import { Trans } from "@lingui/react/macro";
+import { LuCirclePlus } from "react-icons/lu";
+import { useFetcher, useParams } from "react-router";
+import { DateTime, Empty, Hyperlink } from "~/components";
+import { usePermissions } from "~/hooks";
+import { ShipmentStatus } from "~/modules/inventory/ui/Shipments";
+import { path } from "~/utils/path";
+import type {
+  Opportunity,
+  SalesOrder,
+  SalesOrderLine,
+  SalesOrderLineShipment
+} from "../../types";
+
+type SalesOrderLineShipmentsProps = {
+  salesOrder: SalesOrder;
+  line: SalesOrderLine;
+  opportunity: Opportunity;
+  shipments: SalesOrderLineShipment[];
+};
+
+export function SalesOrderLineShipments({
+  line,
+  shipments
+}: SalesOrderLineShipmentsProps) {
+  const permissions = usePermissions();
+  const { orderId, lineId } = useParams();
+  if (!orderId) throw new Error("orderId not found");
+  if (!lineId) throw new Error("lineId not found");
+
+  const newJobDisclosure = useDisclosure();
+  const hasShipments = shipments.length > 0;
+
+  const totalShipmentQuantity = shipments.reduce(
+    (sum, shipment) => sum + (shipment.shippedQuantity ?? 0),
+    0
+  );
+
+  const fetcher = useFetcher<{ success: boolean }>();
+
+  return (
+    <>
+      <Card>
+        <HStack className="w-full justify-between">
+          <CardHeader>
+            <CardTitle>
+              <Trans>Shipments</Trans>
+            </CardTitle>
+          </CardHeader>
+          <CardAction>
+            {permissions.can("create", "inventory") && hasShipments && (
+              <fetcher.Form
+                method="post"
+                action={path.to.newSalesOrderLineShipment(orderId, lineId)}
+              >
+                <Button
+                  type="submit"
+                  leftIcon={<LuCirclePlus />}
+                  onClick={newJobDisclosure.onOpen}
+                  isLoading={fetcher.state !== "idle"}
+                  isDisabled={fetcher.state !== "idle"}
+                >
+                  New Shipment
+                </Button>
+              </fetcher.Form>
+            )}
+          </CardAction>
+        </HStack>
+
+        <CardContent>
+          {shipments.length > 0 ? (
+            <Table>
+              <Thead>
+                <Tr>
+                  <Th>
+                    <Trans>Shipment</Trans>
+                  </Th>
+                  <Th>
+                    <Trans>Date</Trans>
+                  </Th>
+                  <Th className="text-right">Quantity</Th>
+                </Tr>
+              </Thead>
+              <Tbody>
+                {Object.entries(
+                  shipments.reduce(
+                    (acc, shipment) => {
+                      const key = shipment.shipment.id!;
+                      if (!acc[key]) {
+                        acc[key] = [];
+                      }
+                      acc[key].push(shipment);
+                      return acc;
+                    },
+                    {} as Record<string, typeof shipments>
+                  )
+                ).map(([shipmentId, groupedShipments]) => (
+                  <Tr key={shipmentId}>
+                    <Td>
+                      <HStack>
+                        <Hyperlink to={path.to.shipment(shipmentId)}>
+                          {groupedShipments[0].shipment.shipmentId}
+                        </Hyperlink>
+                        <ShipmentStatus
+                          status={groupedShipments[0].shipment.status}
+                          invoiced={groupedShipments[0].shipment.invoiced}
+                        />
+                      </HStack>
+                    </Td>
+                    <Td>
+                      <DateTime
+                        value={groupedShipments[0].shipment.createdAt}
+                        variant="date"
+                      />
+                    </Td>
+                    <Td className="text-right">
+                      {groupedShipments.reduce(
+                        (sum, shipment) =>
+                          sum + (shipment.shippedQuantity ?? 0),
+                        0
+                      )}
+                    </Td>
+                  </Tr>
+                ))}
+              </Tbody>
+              <Tfoot className="border-t border-border">
+                <Tr>
+                  <Td />
+                  <Td />
+                  <Td className="text-right">{totalShipmentQuantity}</Td>
+                </Tr>
+              </Tfoot>
+            </Table>
+          ) : (
+            <Empty className="pb-12">
+              {permissions.can("create", "inventory") && (
+                <fetcher.Form
+                  method="post"
+                  action={path.to.newSalesOrderLineShipment(orderId, lineId)}
+                >
+                  <Button
+                    type="submit"
+                    leftIcon={<LuCirclePlus />}
+                    onClick={newJobDisclosure.onOpen}
+                    isLoading={fetcher.state !== "idle"}
+                    isDisabled={fetcher.state !== "idle"}
+                  >
+                    New Shipment
+                  </Button>
+                </fetcher.Form>
+              )}
+            </Empty>
+          )}
+        </CardContent>
+      </Card>
+    </>
+  );
+}

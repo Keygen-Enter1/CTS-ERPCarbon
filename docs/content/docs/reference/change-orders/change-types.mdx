@@ -1,0 +1,101 @@
+---
+title: Change types
+description: Version, Revision, Replacement Part, and New Part — the per-affected-item choice that decides what you can edit and what release creates.
+---
+
+Each affected item has a change type, defaulting to **Version**. The type determines which draft fields are editable and what release creates. The four types differ by whether they have a predecessor and whether the result keeps the same part number.
+
+## The four types
+
+| Change type | You edit | Release creates | Auto-supersession |
+| --- | --- | --- | --- |
+| Version | BoM and BoP on the **same item** | A new **method version**; the prior Active version is archived | None |
+| Revision | Attributes, documents, BoM and BoP | A new **item revision** (same Part ID, next revision) | Old revision → new revision |
+| Replacement Part | Attributes, documents, BoM and BoP | A **new part number** derived from the affected part | Affected part → new part |
+| New Part | Attributes, documents, BoM and BoP | A **net-new part** minted under the change notice | None — it has no predecessor |
+
+<Callout type="info" title="A Version bumps the method; the two replacement types mint a new item; New Part is net-new.">
+A **Version** creates a method version on the same item and does not supersede anything. A **Revision** or **Replacement Part** creates a new item derived from the affected part and writes a <Term>supersession</Term> from old to new. A **New Part** has no predecessor and therefore creates no supersession. See [Supersession & cutover](/docs/reference/change-orders/supersession).
+</Callout>
+
+## When to use which
+
+- **Version** — use for manufacturing-method changes that do not require a new item revision or stock phase-over.
+- **Revision** — the part is formally revising (new drawing revision, new dimension) and you want old and new
+  to coexist while stock phases over. This is the everyday engineering-change case. You can name the revision
+  (for example `A`) when you add the item, or leave it blank to take the next revision automatically.
+- **Replacement Part** — use for a one-to-one replacement with a new part number derived from the old part.
+- **New Part** — you're introducing a genuinely new part under change control, with no old part behind it.
+  Nothing is superseded. This is also how a consolidation is modeled: when several components collapse into
+  one, the consolidated "1" is added as a **New Part** and the old lines are dropped from the parent
+  assembly's draft BoM.
+
+<Callout type="note" title="A New Part's change type is fixed.">
+Because a New Part is net-new by construction, you can't switch it to another change type after you add it,
+and it shows no cutover card. The other three types can be switched, but switching discards the draft and mints
+a fresh one, so any edits are reset.
+</Callout>
+
+## What each type gates
+
+Change type also controls the editable surface on the affected item:
+
+- **Version** exposes the **Bill of Material** and **Bill of Process** editors on the draft method.
+- **Revision**, **Replacement Part**, and **New Part** add **Part Properties** (attributes) and documents on
+  top of BoM and BoP, because each is producing a genuinely new item, not just a new recipe.
+
+<Callout type="warning" title="Change notices operate on Parts only.">
+The **Add Affected Item** picker accepts **Parts only** — the existing-item selector is filtered to Parts, and
+the New Part mini-form always mints a Part. There's no Tool path in the change-notice UI.
+</Callout>
+
+<Callout type="warning" title="A purchased item can't take a Version.">
+A purchased (**Buy**) item has no bill of materials or process, so a **Version** is meaningless for it. The
+picker hides **Version** for Buy items and restricts a Version's item selector to **Make** parts; adding a Buy
+item defaults its change type to **Revision** instead.
+</Callout>
+
+## Add a net-new part
+
+Choosing **New Part** in the change-type selector swaps the affected-item modal to a short mint-a-part form:
+
+<FieldTable>
+  <Field name="Part Number" required>The new part's readable id. Type <code>...</code> to pull the next id in the Part sequence.</Field>
+  <Field name="Name" required>What the part is.</Field>
+  <Field name="Replenishment System" required>Buy, Make, or Buy and Make. Defaults to **Make**.</Field>
+  <Field name="Tracking Type" required>Inventory, Non-Inventory, Serial, or Batch. Defaults to **Inventory**.</Field>
+</FieldTable>
+
+Submitting creates an inactive Part and adds it as a **New Part** affected item. The part remains hidden until release.
+
+## Supplier parts on a purchased line
+
+A **Revision**, **Replacement Part**, or **New Part** whose draft item is purchased (**Buy** or **Buy and
+Make**) gets a **Supplier Parts** grid on its line, right alongside the properties editor. You use it to set up
+how the new part or revision is bought: **Supplier**, **Supplier ID** (the supplier's own part number), **Unit
+Price**, **Unit of Measure**, **Minimum Order Quantity**, and **Conversion Factor**. Add, edit, and delete rows
+here the same way you would on a live part.
+
+A **Revision** draft starts with the source revision's supplier parts and their price breaks, along with its
+batch size, scrap percent, lead time, reordering policy, preferred supplier, and item group. It releases ready
+to plan and buy, so edit the grid only where the new revision differs. The change notice's
+[changes](/docs/reference/change-orders/lifecycle#review-the-changes-then-release) list only the suppliers you
+added, changed, or removed.
+
+<Callout type="warning" title="Set suppliers up on a Replacement Part or New Part before you release.">
+These two drafts start with **no** supplier parts. A Replacement Part does not inherit the source item's
+suppliers, and a New Part has no source to inherit from. If a purchased one releases with an empty grid, the
+new part is stocked but has no way to buy it, so a purchase order can't reference it. Fill the grid on the line
+first. The suppliers you add show up in the change notice's changes as additions.
+</Callout>
+
+## Related
+
+<Cards>
+  <Card title="Lifecycle & release" href="/docs/reference/change-orders/lifecycle">
+    What release does with each change type.
+  </Card>
+  <Card title="Methods & sourcing" href="/docs/reference/methods">
+    Method versions and the Draft/Active/Archived states a change notice drives.
+  </Card>
+</Cards>

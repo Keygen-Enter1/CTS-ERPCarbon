@@ -1,0 +1,883 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  assertIsPost,
+  CarbonEdition,
+  CONTROLLED_ENVIRONMENT,
+  carbonClient,
+  error,
+  getRedirectTo,
+  isAuthProviderEnabled,
+  magicLinkValidator,
+  RATE_LIMIT
+} from "@carbon/auth";
+import {
+  botProtection,
+  getMagicLinkErrorMessage,
+  logAuthEvent,
+  sendMagicLink,
+  signInWithBypassEmail,
+  verifyAuthSession,
+  verifyBotProtection
+} from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import {
+  isPlatformSignupDisabled,
+  isSelfSignupBlockedForEmail,
+  PLATFORM_SIGNUP_DISABLED_MESSAGE,
+  SELF_SIGNUP_BLOCKED_MESSAGE
+} from "@carbon/auth/self-signup.server";
+import {
+  clearAuthCookies,
+  flash,
+  getAuthSession,
+  setAuthSession
+} from "@carbon/auth/session.server";
+import { getUserByEmail } from "@carbon/auth/users.server";
+import { sendVerificationCode } from "@carbon/auth/verification.server";
+import { isSsoEnabled, isSsoRequiredForEmail } from "@carbon/ee/sso.server";
+import { Hidden, Input, Submit, ValidatedForm, validator } from "@carbon/form";
+import { AccountLockout, Ratelimit, redis } from "@carbon/kv";
+import { getLogger } from "@carbon/logger";
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Button,
+  Heading,
+  ItarLoginDisclaimer,
+  Separator,
+  toast,
+  useBotProtection,
+  useMount,
+  VStack
+} from "@carbon/react";
+import { Edition, getClientIp, redirect } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import {
+  browserSupportsWebAuthn,
+  startAuthentication
+} from "@simplewebauthn/browser";
+import { useEffect, useRef, useState } from "react";
+import { LuCircleAlert, LuFingerprint } from "react-icons/lu";
+import type {
+  ActionFunctionArgs,
+  LoaderFunctionArgs,
+  MetaFunction
+} from "react-router";
+import { data, useFetcher, useLoaderData, useSearchParams } from "react-router";
+import type { Result } from "~/types";
+import { path } from "~/utils/path";
+
+export const meta: MetaFunction = () => {
+  return [{ title: "Carbon | Login" }];
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const authSession = await getAuthSession(request);
+  const hasOutlookAuth = isAuthProviderEnabled("azure");
+  const hasGoogleAuth = isAuthProviderEnabled("google");
+  const hasPasskeyAuth = isAuthProviderEnabled("passkey");
+  const hasSsoAuth = isSsoEnabled();
+
+  if (authSession) {
+    if (await verifyAuthSession(authSession)) {
+      throw redirect(getRedirectTo(request));
+    }
+    const cookieHeaders = await clearAuthCookies(request);
+    return data(
+      {
+        hasOutlookAuth,
+        hasGoogleAuth,
+        hasPasskeyAuth,
+        hasSsoAuth,
+        botProtection
+      },
+      { headers: cookieHeaders }
+    );
+  }
+
+  return {
+    hasOutlookAuth,
+    hasGoogleAuth,
+    hasPasskeyAuth,
+    hasSsoAuth,
+    botProtection
+  };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const ip = getClientIp(request) ?? "127.0.0.1";
+  const ratelimit = new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(RATE_LIMIT, "1 h"),
+    analytics: true
+  });
+  const { success } = await ratelimit.limit(ip);
+
+  if (!success) {
+    logAuthEvent("login_rate_limited", { ip });
+    return data(
+      error(null, "Rate limit exceeded"),
+      await flash(request, error(null, "Rate limit exceeded"))
+    );
+  }
+
+  const validation = await validator(magicLinkValidator).validate(
+    await request.formData()
+  );
+
+  if (validation.error) {
+    return error(validation.error, "Invalid email address");
+  }
+
+  const { email, botToken, redirectTo } = validation.data;
+
+  // Per-account lockout (NIST 800-171 3.1.8) — layered ON TOP of the IP limit
+  // above. Keyed by the normalized email so an attacker rotating IPs, or
+  // hammering one account to spam magic links / probe existence, is bounded per
+  // account. The reply is deliberately GENERIC (never reveals whether the
+  // account exists) to avoid user enumeration.
+  const lockout = new AccountLockout({ redis });
+  const LOCKED_MESSAGE =
+    "For your security, sign-in for this account is temporarily paused. Please try again later.";
+
+  const lockStatus = await lockout.status(email);
+  if (lockStatus.locked) {
+    logAuthEvent("login_locked", {
+      actor: email,
+      ip,
+      reason: "account temporarily locked",
+      retryAfterSeconds: lockStatus.retryAfterSeconds
+    });
+    return data(
+      { success: false, message: LOCKED_MESSAGE },
+      await flash(request, error(null, LOCKED_MESSAGE))
+    );
+  }
+
+  const botError = await verifyBotProtection({
+    token: botToken,
+    ip,
+    actor: email
+  });
+  if (botError) {
+    return data(
+      error(null, botError),
+      await flash(request, error(null, botError))
+    );
+  }
+
+  // Count this attempt against the account. If it tips the account past the
+  // window's allowance, an exponential-backoff lock engages now and we reject
+  // this request with the same generic message.
+  const attempt = await lockout.recordFailure(email);
+  if (attempt.locked) {
+    logAuthEvent("login_locked", {
+      actor: email,
+      ip,
+      reason: "account temporarily locked",
+      retryAfterSeconds: attempt.retryAfterSeconds
+    });
+    return data(
+      { success: false, message: LOCKED_MESSAGE },
+      await flash(request, error(null, LOCKED_MESSAGE))
+    );
+  }
+
+  const user = await getUserByEmail(email);
+
+  const devBypassEmail = process.env.DEV_BYPASS_EMAIL;
+  if (
+    devBypassEmail &&
+    email.toLowerCase() === devBypassEmail.toLowerCase() &&
+    user.data?.active
+  ) {
+    const authSession = await signInWithBypassEmail(email);
+    if (authSession) {
+      // Genuine completed login — clear any accumulated lockout state.
+      await lockout.reset(email);
+      logAuthEvent("login_success", { actor: email, ip, method: "bypass" });
+      const sessionCookie = await setAuthSession(request, { authSession });
+      return redirect(redirectTo || path.to.authenticatedRoot, {
+        headers: [["Set-Cookie", sessionCookie]]
+      });
+    }
+  }
+
+  // Require-SSO gate: a covered + enforced domain may only authenticate via
+  // SSO — refuse the magic link (and the signup verification-code path) here,
+  // server-side. Deliberately AFTER the dev-bypass branch above so local dev
+  // keeps working.
+  if (await isSsoRequiredForEmail(getCarbonServiceRole(), email)) {
+    const SSO_REQUIRED_MESSAGE =
+      "Your organization requires single sign-on. Sign in with your work email to continue.";
+    logAuthEvent("login_failed", {
+      actor: email,
+      ip,
+      reason: "sso required for domain"
+    });
+    return data(
+      { success: false, message: SSO_REQUIRED_MESSAGE },
+      await flash(request, error(null, SSO_REQUIRED_MESSAGE))
+    );
+  }
+
+  if (user.data && user.data.active) {
+    const magicLink = await sendMagicLink(email, undefined, redirectTo);
+
+    if (magicLink.error) {
+      logAuthEvent("login_failed", {
+        actor: email,
+        ip,
+        reason: "magic link send failed"
+      });
+      const message = getMagicLinkErrorMessage(magicLink.error);
+      return data(
+        error(magicLink, message),
+        await flash(request, error(magicLink, message))
+      );
+    }
+    logAuthEvent("magic_link_sent", { actor: email, ip });
+    return { success: true, mode: "login" };
+  } else if (CarbonEdition === Edition.Enterprise) {
+    logAuthEvent("login_failed", {
+      actor: email,
+      ip,
+      reason: "user record not found"
+    });
+    return data(
+      { success: false, message: "User record not found" },
+      await flash(request, error(null, "Failed to sign in"))
+    );
+  } else if (await isPlatformSignupDisabled()) {
+    // Self-hosted with sign-ups switched off: same refusal as Enterprise,
+    // but named — the person can act on "ask for an invitation".
+    logAuthEvent("login_failed", {
+      actor: email,
+      ip,
+      reason: "sign-ups disabled on this instance"
+    });
+    return data(
+      { success: false, message: PLATFORM_SIGNUP_DISABLED_MESSAGE },
+      await flash(request, error(null, PLATFORM_SIGNUP_DISABLED_MESSAGE))
+    );
+  } else if (isSelfSignupBlockedForEmail(email)) {
+    // Cloud self-signup rejects consumer email domains (self-signup-blocked-domains.txt).
+    logAuthEvent("login_failed", {
+      actor: email,
+      ip,
+      reason: "self-signup domain blocked"
+    });
+    return data(
+      { success: false, message: SELF_SIGNUP_BLOCKED_MESSAGE },
+      await flash(request, error(null, SELF_SIGNUP_BLOCKED_MESSAGE))
+    );
+  } else {
+    // User doesn't exist, send verification code for signup
+    const verificationSent = await sendVerificationCode(email);
+
+    if (!verificationSent) {
+      return data(
+        error(null, "Failed to send verification code"),
+        await flash(request, error(null, "Failed to send verification code"))
+      );
+    }
+
+    return { success: true, mode: "signup", email };
+  }
+}
+
+export default function LoginRoute() {
+  // A signed-out user lands here however the session ended (sign out, expiry,
+  // a revoked account), so this is where the lists kept on the device go.
+  useEffect(() => {
+    import("localforage")
+      .then((storage) => storage.default.clear())
+      .catch((error) =>
+        getLogger("erp", "login").warn("stored lists not cleared", { error })
+      );
+  }, []);
+
+  const { t } = useLingui();
+  const {
+    hasOutlookAuth,
+    hasGoogleAuth,
+    hasPasskeyAuth,
+    hasSsoAuth,
+    botProtection
+  } = useLoaderData<typeof loader>();
+
+  const [searchParams] = useSearchParams();
+  const redirectTo = searchParams.get("redirectTo") ?? undefined;
+  const emailParam = searchParams.get("email") ?? undefined;
+  const [mode, setMode] = useState<"login" | "signup" | "verify">("login");
+  const [signupEmail, setSignupEmail] = useState<string>("");
+  const [passkeySupported, setPasskeySupported] = useState(false);
+  const [passkeyLoading, setPasskeyLoading] = useState(false);
+  const [ssoLoading, setSsoLoading] = useState(false);
+  const [ssoError, setSsoError] = useState<string | null>(null);
+  const conditionalAbortRef = useRef<AbortController | null>(null);
+
+  // A forced logout (see destroyAuthSession) arrives as a bare 302, leaving the
+  // browser no trace of what went wrong. "no-claims" is almost always a user
+  // with no company membership.
+  const logoutReason = searchParams.get("reason");
+  useEffect(() => {
+    if (logoutReason) {
+      // biome-ignore lint/suspicious/noConsole: surfacing the silent logout is the point
+      console.warn(
+        `[carbon:auth] Session was destroyed server-side (reason: ${logoutReason}). See server logs for the full record.`
+      );
+    }
+  }, [logoutReason]);
+
+  const fetcher = useFetcher<Result & { mode?: string; email?: string }>();
+  const bot = useBotProtection("/login", botProtection, fetcher.data);
+
+  useEffect(() => {
+    if (fetcher.data?.success && fetcher.data.mode) {
+      if (fetcher.data.mode === "signup" && mode !== "verify") {
+        setMode("verify");
+        if (fetcher.data.email) {
+          setSignupEmail(fetcher.data.email);
+          // Redirect to verify route with email parameter
+          const verifyUrl = `/verify?email=${encodeURIComponent(
+            fetcher.data.email
+          )}${
+            redirectTo ? `&redirectTo=${encodeURIComponent(redirectTo)}` : ""
+          }`;
+          window.location.href = verifyUrl;
+        }
+      }
+    }
+  }, [fetcher.data, mode, redirectTo]);
+
+  // Detect passkey support and start conditional UI (autofill) on mount
+  useMount(() => {
+    if (!hasPasskeyAuth) return;
+    if (!browserSupportsWebAuthn()) return;
+
+    const checkAndStart = async () => {
+      const conditionalSupported =
+        typeof PublicKeyCredential !== "undefined" &&
+        typeof (PublicKeyCredential as any).isConditionalMediationAvailable ===
+          "function" &&
+        (await (PublicKeyCredential as any).isConditionalMediationAvailable());
+
+      setPasskeySupported(true);
+
+      if (!conditionalSupported) return;
+
+      try {
+        const optRes = await fetch("/api/passkey/authenticate/options", {
+          method: "POST"
+        });
+        if (!optRes.ok) return;
+        const { challengeId, ...options } = await optRes.json();
+
+        const abortCtrl = new AbortController();
+        conditionalAbortRef.current = abortCtrl;
+
+        const credential = await startAuthentication({
+          optionsJSON: options,
+          useBrowserAutofill: true,
+          signal: abortCtrl.signal
+        } as any);
+
+        await completePasskeyAuth(credential, challengeId);
+      } catch {
+        // User dismissed or no passkeys — silently ignore
+      }
+    };
+
+    checkAndStart();
+
+    return () => {
+      conditionalAbortRef.current?.abort();
+    };
+  });
+
+  const completePasskeyAuth = async (credential: any, challengeId: string) => {
+    const verifyRes = await fetch("/api/passkey/authenticate/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ credential, challengeId, redirectTo })
+    });
+
+    if (verifyRes.redirected) {
+      window.location.href = verifyRes.url;
+      return;
+    }
+
+    if (!verifyRes.ok) {
+      const body = await verifyRes.json().catch(() => ({}));
+      if (verifyRes.status === 404 && body.unknownCredential) {
+        if (
+          typeof (PublicKeyCredential as any).signalUnknownCredential ===
+          "function"
+        ) {
+          await (PublicKeyCredential as any).signalUnknownCredential({
+            rpId: window.location.hostname,
+            credentialId: body.credentialId
+          });
+        }
+      }
+      toast.error(body.message ?? "Passkey sign-in failed");
+    }
+  };
+
+  const onSignInWithPasskey = async () => {
+    if (!passkeySupported) return;
+    setPasskeyLoading(true);
+    conditionalAbortRef.current?.abort();
+
+    try {
+      const optRes = await fetch("/api/passkey/authenticate/options", {
+        method: "POST"
+      });
+      if (!optRes.ok) throw new Error("Failed to get options");
+      const { challengeId, ...options } = await optRes.json();
+
+      const credential = await startAuthentication({
+        optionsJSON: options
+      } as any);
+      await completePasskeyAuth(credential, challengeId);
+    } catch (e: any) {
+      if (e?.name !== "NotAllowedError" && e?.name !== "AbortError") {
+        toast.error("Passkey sign-in failed");
+      }
+    } finally {
+      setPasskeyLoading(false);
+    }
+  };
+
+  const onSignInWithGoogle = async () => {
+    const { error } = await carbonClient.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: `${window.location.origin}/callback${
+          redirectTo ? `?redirectTo=${encodeURIComponent(redirectTo)}` : ""
+        }`
+      }
+    });
+
+    if (error) {
+      toast.error(error.message);
+    }
+  };
+
+  const onSignInWithAzure = async () => {
+    const { error } = await carbonClient.auth.signInWithOAuth({
+      provider: "azure",
+      options: {
+        scopes: "email",
+        redirectTo: `${window.location.origin}/callback${
+          redirectTo ? `?redirectTo=${encodeURIComponent(redirectTo)}` : ""
+        }`
+      }
+    });
+
+    if (error) {
+      toast.error(error.message);
+    }
+  };
+
+  // Invisible SSO fork: runs as the email form's onSubmit (after validation).
+  // If the entered email's domain is an SSO-registered domain, suppress the
+  // magic-link POST and route the browser to the identity provider instead.
+  // Otherwise it returns and the form submits normally (magic link / signup).
+  const onSubmitEmail = async (
+    formData: { email?: string },
+    event: React.FormEvent<HTMLFormElement>
+  ) => {
+    // No SSO configured for this deployment — never pay a round-trip.
+    if (!hasSsoAuth) return;
+
+    setSsoError(null);
+    const email = String(formData.email ?? "")
+      .trim()
+      .toLowerCase();
+    const domain = email.split("@")[1];
+    if (!domain) return; // let the server validator handle a bad address
+
+    let enabled = false;
+    try {
+      const body = new FormData();
+      body.append("email", email);
+      const response = await fetch(path.to.api.ssoCheck, {
+        method: "POST",
+        body
+      });
+      enabled = response.ok ? Boolean((await response.json()).enabled) : false;
+    } catch {
+      // Fall through to the magic-link path; the server-side require-SSO gate
+      // is the defense-in-depth that still refuses an SSO-required domain.
+      enabled = false;
+    }
+
+    if (!enabled) return; // ordinary domain — magic-link submit proceeds
+
+    // SSO domain — stop the magic-link POST and hand off to the IdP.
+    event.preventDefault();
+    setSsoLoading(true);
+    const { data, error } = await carbonClient.auth.signInWithSSO({
+      domain,
+      options: {
+        redirectTo: `${window.location.origin}/callback${
+          redirectTo ? `?redirectTo=${encodeURIComponent(redirectTo)}` : ""
+        }`
+      }
+    });
+
+    if (error) {
+      setSsoError(error.message);
+      setSsoLoading(false);
+      return;
+    }
+
+    if (data?.url) {
+      // Prefill the user's email at the IdP so they don't retype it. The
+      // returned url is the IdP's SAML redirect-binding endpoint; login_hint is
+      // an extra query param (URL-encoded by URLSearchParams) that Okta/Entra
+      // honor and other IdPs safely ignore — it is not covered by the SAML
+      // request signature, so appending it never invalidates the request.
+      let target = data.url;
+      try {
+        const url = new URL(data.url);
+        url.searchParams.set("login_hint", email);
+        target = url.toString();
+      } catch {
+        // Non-absolute url — navigate to it unchanged.
+      }
+      window.location.href = target; // navigate away; keep the loading state
+    }
+  };
+
+  return (
+    <>
+      <div className="flex justify-center mb-8">
+        <img
+          src={CONTROLLED_ENVIRONMENT ? "/flag.png" : "/carbon-mark-light.svg"}
+          alt="Carbon Logo"
+          className="w-24 dark:hidden"
+        />
+        <img
+          src={CONTROLLED_ENVIRONMENT ? "/flag.png" : "/carbon-mark-dark.svg"}
+          alt="Carbon Logo"
+          className="w-24 hidden dark:block"
+        />
+      </div>
+      <div className="rounded-lg p-8 w-[380px]">
+        {fetcher.data?.success === true && fetcher.data?.mode === "login" ? (
+          <>
+            <VStack spacing={4} className="items-center justify-center">
+              <Heading size="h3">
+                <Trans>Check your email</Trans>
+              </Heading>
+              <p className="text-muted-foreground tracking-tight text-sm">
+                <Trans>
+                  We've sent you a magic link to sign in to your account.
+                </Trans>
+              </p>
+            </VStack>
+          </>
+        ) : mode === "verify" ? (
+          <VStack spacing={4} className="items-center">
+            <Heading size="h3">
+              <Trans>Verify your email</Trans>
+            </Heading>
+            <p className="text-muted-foreground tracking-tight text-sm text-center">
+              <Trans>We've sent a verification code to {signupEmail}</Trans>
+            </p>
+            <p className="text-muted-foreground tracking-tight text-xs text-center">
+              <Trans>Redirecting to verification page...</Trans>
+            </p>
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              onClick={() => {
+                setMode("login");
+                setSignupEmail("");
+                // Reset fetcher data
+                window.location.reload();
+              }}
+            >
+              <Trans>Use a different email</Trans>
+            </Button>
+          </VStack>
+        ) : (
+          <ValidatedForm
+            fetcher={fetcher}
+            validator={magicLinkValidator}
+            defaultValues={{ redirectTo, email: emailParam }}
+            method="post"
+            action="/login"
+            onSubmit={onSubmitEmail}
+          >
+            <Hidden name="redirectTo" value={redirectTo} type="hidden" />
+            <Hidden name="botToken" value={bot.token} />
+            <VStack spacing={2}>
+              {((fetcher.data?.success === false && fetcher.data?.message) ||
+                ssoError) && (
+                <Alert variant="destructive">
+                  <LuCircleAlert className="w-4 h-4" />
+                  <AlertTitle>
+                    <Trans>Authentication Error</Trans>
+                  </AlertTitle>
+                  <AlertDescription>
+                    {ssoError ?? fetcher.data?.message}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {hasGoogleAuth && (
+                <Button
+                  type="button"
+                  size="lg"
+                  className="w-full"
+                  onClick={onSignInWithGoogle}
+                  isDisabled={fetcher.state !== "idle"}
+                  variant="secondary"
+                  leftIcon={<GoogleIcon />}
+                >
+                  <Trans>Sign in with Google</Trans>
+                </Button>
+              )}
+              {hasOutlookAuth && (
+                <Button
+                  type="button"
+                  size="lg"
+                  className="w-full"
+                  onClick={onSignInWithAzure}
+                  isDisabled={fetcher.state !== "idle"}
+                  variant="secondary"
+                  leftIcon={<OutlookIcon className="size-6" />}
+                >
+                  <Trans>Sign in with Outlook</Trans>
+                </Button>
+              )}
+
+              {hasPasskeyAuth && passkeySupported && (
+                <Button
+                  type="button"
+                  size="lg"
+                  className="w-full"
+                  onClick={onSignInWithPasskey}
+                  isDisabled={passkeyLoading || fetcher.state !== "idle"}
+                  isLoading={passkeyLoading}
+                  variant="secondary"
+                  leftIcon={<LuFingerprint className="size-4" />}
+                >
+                  <Trans>Sign in with Passkey</Trans>
+                </Button>
+              )}
+
+              {(hasGoogleAuth || hasOutlookAuth || hasPasskeyAuth) && (
+                <div className="py-3 w-full">
+                  <Separator />
+                </div>
+              )}
+
+              <Input
+                name="email"
+                label=""
+                autoFocus
+                placeholder={t`Email Address`}
+                autoComplete={hasPasskeyAuth ? "email webauthn" : "email"}
+              />
+
+              <Submit
+                isDisabled={
+                  fetcher.state !== "idle" || ssoLoading || !bot.ready
+                }
+                isLoading={fetcher.state === "submitting" || ssoLoading}
+                hideShortcutKey
+                size="lg"
+                className="w-full"
+                withBlocker={false}
+                variant="secondary"
+              >
+                <Trans>Continue</Trans>
+              </Submit>
+              {bot.challenge}
+            </VStack>
+          </ValidatedForm>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-4 text-sm text-center text-balance text-muted-foreground w-[380px]">
+        {mode !== "verify" &&
+          fetcher.data?.success !== true &&
+          CarbonEdition !== Edition.Enterprise && (
+            <p>
+              <Trans>Login or create a new account</Trans>
+            </p>
+          )}
+        {CONTROLLED_ENVIRONMENT && <ItarLoginDisclaimer />}
+        {CarbonEdition !== Edition.Community && (
+          <p>
+            <Trans>
+              By signing in, you agree to the{" "}
+              <a
+                href="https://carbon.ms/terms"
+                target="_blank"
+                rel="noreferrer"
+                className="underline"
+              >
+                Terms of Service
+              </a>{" "}
+              and{" "}
+              <a
+                href="https://carbon.ms/privacy"
+                target="_blank"
+                rel="noreferrer"
+                className="underline"
+              >
+                Privacy Policy.
+              </a>
+            </Trans>
+          </p>
+        )}
+      </div>
+    </>
+  );
+}
+
+function GoogleIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      height="16"
+      strokeLinejoin="round"
+      viewBox="0 0 16 16"
+      width="16"
+      {...props}
+    >
+      <path
+        d="M8.15991 6.54543V9.64362H12.4654C12.2763 10.64 11.709 11.4837 10.8581 12.0509L13.4544 14.0655C14.9671 12.6692 15.8399 10.6182 15.8399 8.18188C15.8399 7.61461 15.789 7.06911 15.6944 6.54552L8.15991 6.54543Z"
+        fill="#4285F4"
+      ></path>
+      <path
+        d="M3.6764 9.52268L3.09083 9.97093L1.01807 11.5855C2.33443 14.1963 5.03241 16 8.15966 16C10.3196 16 12.1305 15.2873 13.4542 14.0655L10.8578 12.0509C10.1451 12.5309 9.23598 12.8219 8.15966 12.8219C6.07967 12.8219 4.31245 11.4182 3.67967 9.5273L3.6764 9.52268Z"
+        fill="#34A853"
+      ></path>
+      <path
+        d="M1.01803 4.41455C0.472607 5.49087 0.159912 6.70543 0.159912 7.99995C0.159912 9.29447 0.472607 10.509 1.01803 11.5854C1.01803 11.5926 3.6799 9.51991 3.6799 9.51991C3.5199 9.03991 3.42532 8.53085 3.42532 7.99987C3.42532 7.46889 3.5199 6.95983 3.6799 6.47983L1.01803 4.41455Z"
+        fill="#FBBC05"
+      ></path>
+      <path
+        d="M8.15982 3.18545C9.33802 3.18545 10.3853 3.59271 11.2216 4.37818L13.5125 2.0873C12.1234 0.792777 10.3199 0 8.15982 0C5.03257 0 2.33443 1.79636 1.01807 4.41455L3.67985 6.48001C4.31254 4.58908 6.07983 3.18545 8.15982 3.18545Z"
+        fill="#EA4335"
+      ></path>
+    </svg>
+  );
+}
+
+function OutlookIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      height="24"
+      width="24"
+      viewBox="-274.66275 -425.834 2380.4105 2555.004"
+      {...props}
+    >
+      <path
+        d="M1831.083 894.25a40.879 40.879 0 00-19.503-35.131h-.213l-.767-.426-634.492-375.585a86.175 86.175 0 00-8.517-5.067 85.17 85.17 0 00-78.098 0 86.37 86.37 0 00-8.517 5.067l-634.49 375.585-.766.426c-19.392 12.059-25.337 37.556-13.278 56.948a41.346 41.346 0 0014.257 13.868l634.492 375.585a95.617 95.617 0 008.517 5.068 85.17 85.17 0 0078.098 0 95.52 95.52 0 008.517-5.068l634.492-375.585a40.84 40.84 0 0020.268-35.685z"
+        fill="#0A2767"
+      />
+      <path
+        d="M520.453 643.477h416.38v381.674h-416.38zM1745.917 255.5V80.908c1-43.652-33.552-79.862-77.203-80.908H588.204C544.552 1.046 510 37.256 511 80.908V255.5l638.75 170.333z"
+        fill="#0364B8"
+      />
+      <path d="M511 255.5h425.833v383.25H511z" fill="#0078D4" />
+      <path
+        d="M1362.667 255.5H936.833v383.25L1362.667 1022h383.25V638.75z"
+        fill="#28A8EA"
+      />
+      <path d="M936.833 638.75h425.833V1022H936.833z" fill="#0078D4" />
+      <path d="M936.833 1022h425.833v383.25H936.833z" fill="#0364B8" />
+      <path d="M520.453 1025.151h416.38v346.969h-416.38z" fill="#14447D" />
+      <path d="M1362.667 1022h383.25v383.25h-383.25z" fill="#0078D4" />
+      <linearGradient
+        gradientTransform="matrix(1 0 0 -1 0 1705.333)"
+        y2="1.998"
+        x2="1128.458"
+        y1="811.083"
+        x1="1128.458"
+        gradientUnits="userSpaceOnUse"
+        id="a"
+      >
+        <stop offset="0" stopColor="#35b8f1" />
+        <stop offset="1" stopColor="#28a8ea" />
+      </linearGradient>
+      <path
+        d="M1811.58 927.593l-.809.426-634.492 356.848c-2.768 1.703-5.578 3.321-8.517 4.769a88.437 88.437 0 01-34.407 8.517l-34.663-20.27a86.706 86.706 0 01-8.517-4.897L447.167 906.003h-.298l-21.036-11.753v722.384c.328 48.196 39.653 87.006 87.849 86.7h1230.914c.724 0 1.363-.341 2.129-.341a107.79 107.79 0 0029.808-6.217 86.066 86.066 0 0011.966-6.217c2.853-1.618 7.75-5.152 7.75-5.152a85.974 85.974 0 0034.833-68.772V894.25a38.323 38.323 0 01-19.502 33.343z"
+        fill="url(#a)"
+      />
+      <path
+        d="M1797.017 891.397v44.287l-663.448 456.791-686.87-486.174a.426.426 0 00-.426-.426l-63.023-37.899v-31.938l25.976-.426 54.932 31.512 1.277.426 4.684 2.981s645.563 368.346 647.267 369.197l24.698 14.478c2.129-.852 4.258-1.703 6.813-2.555 1.278-.852 640.879-360.681 640.879-360.681z"
+        fill="#0A2767"
+        opacity=".5"
+      />
+      <path
+        d="M1811.58 927.593l-.809.468-634.492 356.848c-2.768 1.703-5.578 3.321-8.517 4.769a88.96 88.96 0 01-78.098 0 96.578 96.578 0 01-8.517-4.769l-634.49-356.848-.766-.468a38.326 38.326 0 01-20.057-33.343v722.384c.305 48.188 39.616 87.004 87.803 86.7h1229.64c48.188.307 87.5-38.509 87.807-86.696 0-.001 0 0 0 0V894.25a38.33 38.33 0 01-19.504 33.343z"
+        fill="#1490DF"
+      />
+      <path
+        d="M1185.52 1279.629l-9.496 5.323a92.806 92.806 0 01-8.517 4.812 88.173 88.173 0 01-33.47 8.857l241.405 285.479 421.107 101.476a86.785 86.785 0 0026.7-33.343z"
+        opacity=".1"
+      />
+      <path
+        d="M1228.529 1255.442l-52.505 29.51a92.806 92.806 0 01-8.517 4.812 88.173 88.173 0 01-33.47 8.857l113.101 311.838 549.538 74.989a86.104 86.104 0 0034.407-68.815v-9.326z"
+        opacity=".05"
+      />
+      <path
+        d="M514.833 1703.333h1228.316a88.316 88.316 0 0052.59-17.033l-697.089-408.331a86.706 86.706 0 01-8.517-4.897L447.125 906.088h-.298l-20.993-11.838v719.914c-.048 49.2 39.798 89.122 88.999 89.169-.001 0-.001 0 0 0z"
+        fill="#28A8EA"
+      />
+      <path
+        d="M1022 418.722v908.303c-.076 31.846-19.44 60.471-48.971 72.392a73.382 73.382 0 01-28.957 5.962H425.833V383.25H511v-42.583h433.073c43.019.163 77.834 35.035 77.927 78.055z"
+        opacity=".1"
+      />
+      <path
+        d="M979.417 461.305v908.302a69.36 69.36 0 01-6.388 29.808c-11.826 29.149-40.083 48.273-71.54 48.417H425.833V383.25h475.656a71.493 71.493 0 0135.344 8.943c26.104 13.151 42.574 39.883 42.584 69.112z"
+        opacity=".2"
+      />
+      <path
+        d="M979.417 461.305v823.136c-.208 43-34.928 77.853-77.927 78.225H425.833V383.25h475.656a71.493 71.493 0 0135.344 8.943c26.104 13.151 42.574 39.883 42.584 69.112z"
+        opacity=".2"
+      />
+      <path
+        d="M936.833 461.305v823.136c-.046 43.067-34.861 78.015-77.927 78.225H425.833V383.25h433.072c43.062.023 77.951 34.951 77.927 78.013a.589.589 0 01.001.042z"
+        opacity=".2"
+      />
+      <linearGradient
+        gradientTransform="matrix(1 0 0 -1 0 1705.333)"
+        y2="324.259"
+        x2="774.086"
+        y1="1383.074"
+        x1="162.747"
+        gradientUnits="userSpaceOnUse"
+        id="b"
+      >
+        <stop offset="0" stopColor="#1784d9" />
+        <stop offset=".5" stopColor="#107ad5" />
+        <stop offset="1" stopColor="#0a63c9" />
+      </linearGradient>
+      <path
+        d="M78.055 383.25h780.723c43.109 0 78.055 34.947 78.055 78.055v780.723c0 43.109-34.946 78.055-78.055 78.055H78.055c-43.109 0-78.055-34.947-78.055-78.055V461.305c0-43.108 34.947-78.055 78.055-78.055z"
+        fill="url(#b)"
+      />
+      <path
+        d="M243.96 710.631a227.05 227.05 0 0189.17-98.495 269.56 269.56 0 01141.675-35.515 250.91 250.91 0 01131.114 33.683 225.014 225.014 0 0186.742 94.109 303.751 303.751 0 0130.405 138.396 320.567 320.567 0 01-31.299 144.783 230.37 230.37 0 01-89.425 97.388 260.864 260.864 0 01-136.011 34.578 256.355 256.355 0 01-134.01-34.067 228.497 228.497 0 01-87.892-94.28 296.507 296.507 0 01-30.745-136.735 329.29 329.29 0 0130.276-143.845zm95.046 231.227a147.386 147.386 0 0050.163 64.812 131.028 131.028 0 0078.353 23.591 137.244 137.244 0 0083.634-24.358 141.156 141.156 0 0048.715-64.812 251.594 251.594 0 0015.543-90.404 275.198 275.198 0 00-14.649-91.554 144.775 144.775 0 00-47.182-67.537 129.58 129.58 0 00-82.91-25.55 135.202 135.202 0 00-80.184 23.804 148.626 148.626 0 00-51.1 65.365 259.759 259.759 0 00-.341 186.728z"
+        fill="#FFF"
+      />
+      <path d="M1362.667 255.5h383.25v383.25h-383.25z" fill="#50D9FF" />
+    </svg>
+  );
+}

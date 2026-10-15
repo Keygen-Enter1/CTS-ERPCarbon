@@ -1,0 +1,417 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+"use client";
+
+import type { DialogProps } from "@radix-ui/react-dialog";
+import type { VariantProps } from "class-variance-authority";
+import { cva } from "class-variance-authority";
+import { Command as CommandPrimitive } from "cmdk";
+import type {
+  ComponentPropsWithoutRef,
+  ElementRef,
+  HTMLAttributes
+} from "react";
+import { forwardRef } from "react";
+import { LuChevronDown } from "react-icons/lu";
+import { RxMagnifyingGlass } from "react-icons/rx";
+import { Modal, ModalContent, ModalTitle } from "./Modal";
+import { cn } from "./utils/cn";
+import { HitArea, useViewport } from "./Viewport";
+
+const Command = forwardRef<
+  ElementRef<typeof CommandPrimitive>,
+  ComponentPropsWithoutRef<typeof CommandPrimitive>
+>(({ className, ...props }, ref) => (
+  <CommandPrimitive
+    ref={ref}
+    className={cn(
+      "flex h-full w-full flex-col overflow-hidden rounded-md bg-popover text-popover-foreground",
+      className
+    )}
+    {...props}
+  />
+));
+Command.displayName = CommandPrimitive.displayName;
+
+interface CommandDialogProps extends DialogProps {
+  /** Announced by screen readers; the palette shows no visible heading. */
+  title?: string;
+}
+
+const CommandDialog = ({
+  children,
+  title = "Search",
+  ...props
+}: CommandDialogProps) => {
+  return (
+    <Modal {...props}>
+      <ModalContent
+        aria-describedby={undefined}
+        className="overflow-hidden p-0 [&>button[type=button]]:top-1 [&>button[type=button]]:right-2 [&>button[type=button]]:p-3"
+      >
+        <ModalTitle className="sr-only">{title}</ModalTitle>
+        <Command className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground [&_[cmdk-group]:not([hidden])_~[cmdk-group]]:pt-0 [&_[cmdk-group]]:px-2 [&_[cmdk-input-wrapper]_svg]:h-5 [&_[cmdk-input-wrapper]_svg]:w-5 [&_[cmdk-input]]:h-12 [&_[cmdk-item]]:px-2 [&_[cmdk-item]]:py-3 [&_[cmdk-item]_svg]:h-5 [&_[cmdk-item]_svg]:w-5">
+          {children}
+        </Command>
+      </ModalContent>
+    </Modal>
+  );
+};
+
+const commandInputVariants = cva(
+  "flex h-10 w-full rounded-md bg-transparent py-3 text-sm outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50",
+  {
+    variants: {
+      size: {
+        lg: "h-12 px-4 py-3 rounded-lg text-base",
+        md: "h-10 px-3 py-2 rounded-md text-base",
+        sm: "h-8  px-3 py-2 rounded text-sm"
+      }
+    }
+  }
+);
+
+interface CommandInputProps
+  extends Omit<ComponentPropsWithoutRef<typeof CommandPrimitive.Input>, "size">,
+    VariantProps<typeof commandInputVariants> {}
+
+const CommandInput = forwardRef<
+  ElementRef<typeof CommandPrimitive.Input>,
+  CommandInputProps
+>(({ className, size, ...props }, ref) => (
+  <div
+    className="flex items-center border-b border-border px-3"
+    cmdk-input-wrapper=""
+  >
+    <RxMagnifyingGlass className="mr-2 h-4 w-4 shrink-0 opacity-50" />
+    <CommandPrimitive.Input
+      ref={ref}
+      className={cn(
+        commandInputVariants({
+          size
+        }),
+        className
+      )}
+      {...props}
+    />
+  </div>
+));
+
+CommandInput.displayName = CommandPrimitive.Input.displayName;
+
+const commandInputTextFieldVariants = cva(
+  "flex w-full px-3 py-1 bg-transparent text-foreground transition-[color,box-shadow] placeholder:text-muted-foreground disabled:opacity-50 rounded-md border border-input shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed",
+  {
+    variants: {
+      size: {
+        lg: "h-12 rounded-lg px-4 text-base",
+        md: "h-10 rounded-md px-4 text-sm max-md:h-11 max-md:text-base",
+        sm: "h-8 rounded-md px-3 text-sm max-md:h-11 max-md:text-base",
+        xs: "h-6 rounded px-2 text-sm max-md:h-11 max-md:text-base"
+      },
+      isInvalid: {
+        true: "border-destructive ring-destructive focus-visible:ring-destructive",
+        false: ""
+      },
+      isReadOnly: {
+        true: "bg-muted text-muted-foreground",
+        false: ""
+      },
+      isDisabled: {
+        true: "bg-muted text-muted-foreground",
+        false: ""
+      },
+      borderless: {
+        true: "border-none px-0 outline-none ring-transparent focus:ring-transparent focus:ring-offset-0 focus-visible:ring-transparent focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 shadow-none",
+        false: ""
+      }
+    },
+    defaultVariants: {
+      size: "md",
+      isInvalid: false,
+      borderless: false
+    }
+  }
+);
+
+interface CommandInputTextFieldProps
+  extends Omit<ComponentPropsWithoutRef<typeof CommandPrimitive.Input>, "size">,
+    VariantProps<typeof commandInputTextFieldVariants> {
+  isInvalid?: boolean;
+  isDisabled?: boolean;
+  isReadOnly?: boolean;
+  borderless?: boolean;
+}
+
+const CommandInputTextField = forwardRef<
+  ElementRef<typeof CommandPrimitive.Input>,
+  CommandInputTextFieldProps
+>(
+  (
+    {
+      className,
+      size,
+      isInvalid = false,
+      isDisabled = false,
+      isReadOnly = false,
+      borderless = false,
+      ...props
+    },
+    ref
+  ) => (
+    <CommandPrimitive.Input
+      ref={ref}
+      className={cn(
+        commandInputTextFieldVariants({
+          size,
+          isInvalid,
+          isDisabled,
+          isReadOnly,
+          borderless
+        }),
+        className
+      )}
+      disabled={isDisabled}
+      readOnly={isReadOnly}
+      {...props}
+    />
+  )
+);
+
+CommandInputTextField.displayName = "CommandInputTextField";
+
+const CommandList = forwardRef<
+  ElementRef<typeof CommandPrimitive.List>,
+  ComponentPropsWithoutRef<typeof CommandPrimitive.List>
+>(({ className, ...props }, ref) => (
+  <CommandPrimitive.List
+    ref={ref}
+    className={cn(
+      "max-h-[300px] overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent overflow-x-hidden",
+      className
+    )}
+    {...props}
+  />
+));
+
+CommandList.displayName = CommandPrimitive.List.displayName;
+
+const CommandLoading = forwardRef<
+  ElementRef<typeof CommandPrimitive.Loading>,
+  ComponentPropsWithoutRef<typeof CommandPrimitive.Loading>
+>((props, ref) => <CommandPrimitive.Loading ref={ref} {...props} />);
+
+CommandLoading.displayName = CommandPrimitive.Loading.displayName;
+
+const CommandEmpty = forwardRef<
+  ElementRef<typeof CommandPrimitive.Empty>,
+  ComponentPropsWithoutRef<typeof CommandPrimitive.Empty>
+>((props, ref) => (
+  <CommandPrimitive.Empty
+    ref={ref}
+    className="py-6 text-center text-sm"
+    {...props}
+  />
+));
+
+CommandEmpty.displayName = CommandPrimitive.Empty.displayName;
+
+const CommandGroup = forwardRef<
+  ElementRef<typeof CommandPrimitive.Group>,
+  ComponentPropsWithoutRef<typeof CommandPrimitive.Group>
+>(({ className, ...props }, ref) => (
+  <CommandPrimitive.Group
+    ref={ref}
+    className={cn(
+      "overflow-hidden p-1 text-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground",
+      className
+    )}
+    {...props}
+  />
+));
+
+CommandGroup.displayName = CommandPrimitive.Group.displayName;
+
+const CommandSeparator = forwardRef<
+  ElementRef<typeof CommandPrimitive.Separator>,
+  ComponentPropsWithoutRef<typeof CommandPrimitive.Separator>
+>(({ className, ...props }, ref) => (
+  <CommandPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 h-px bg-border", className)}
+    {...props}
+  />
+));
+CommandSeparator.displayName = CommandPrimitive.Separator.displayName;
+
+const CommandItem = forwardRef<
+  ElementRef<typeof CommandPrimitive.Item>,
+  ComponentPropsWithoutRef<typeof CommandPrimitive.Item>
+>(({ className, ...props }, ref) => (
+  <CommandPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none aria-selected:bg-accent aria-selected:text-accent-foreground data-[disabled='true']:pointer-events-none data-[disabled='true']:opacity-50",
+      className
+    )}
+    {...props}
+  />
+));
+
+CommandItem.displayName = CommandPrimitive.Item.displayName;
+
+const CommandShortcut = ({
+  className,
+  ...props
+}: HTMLAttributes<HTMLSpanElement>) => {
+  return (
+    <span
+      className={cn(
+        "ml-auto text-xs tracking-widest text-muted-foreground",
+        className
+      )}
+      {...props}
+    />
+  );
+};
+CommandShortcut.displayName = "CommandShortcut";
+
+const commandTriggerVariants = cva(
+  "items-center justify-between [&>span]:line-clamp-1 overflow-hidden hover:scale-100 focus-visible:scale-100 transition-[background-color,color,transform] duration-150 ease-in-out",
+  {
+    variants: {
+      size: {
+        lg: "h-12 px-4 py-3 rounded-lg text-base space-x-4",
+        md: "h-10 px-3 py-2 rounded-md text-sm space-x-3 max-md:h-11 max-md:text-base",
+        sm: "h-8 px-3 py-2 rounded-md text-sm space-x-2 max-md:h-11 max-md:text-base"
+      },
+      asButton: {
+        false:
+          "text-foreground flex w-full whitespace-nowrap rounded-md border border-input shadow-xs data-[placeholder]:text-muted-foreground outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 [&>span]:line-clamp-1 overflow-hidden",
+        true: "text-foreground relative font-medium shrink-0 group inline-flex select-none transform-gpu initial:border-none disabled:opacity-50 focus:!outline-none focus:!ring-0 active:!outline-none active:!ring-0 after:pointer-events-none after:absolute after:-inset-[3px] after:rounded-lg after:border after:border-blue-500 after:opacity-0 after:ring-2 after:ring-blue-500/20 after:transition-opacity focus-visible:after:opacity-100 active:after:opacity-0 before:pointer-events-none before:bg-gradient-to-b before:transition-opacity before:from-white/[0.12] before:absolute before:inset-0 before:z-[1] before:rounded before:opacity-0 bg-background hover:bg-accent hover:text-accent-foreground dark:bg-input/30 dark:border-input dark:hover:bg-input/50 shadow-button-base hover:scale-100 focus-visible:scale-100 transition-[background-color,color,transform,box-shadow] duration-150 ease-in-out max-md:rounded-full max-md:overflow-visible"
+      }
+    },
+    compoundVariants: [
+      { size: "lg", asButton: true, class: "max-md:h-8 max-md:text-sm" },
+      { size: "md", asButton: true, class: "max-md:h-8 max-md:text-sm" },
+      { size: "sm", asButton: true, class: "max-md:h-8 max-md:text-sm" }
+    ],
+    defaultVariants: {
+      size: "md",
+      asButton: false
+    }
+  }
+);
+
+export const multiSelectTriggerVariants = cva(
+  "w-full justify-between font-normal hover:scale-100 focus-visible:scale-100",
+  {
+    variants: {
+      size: {
+        lg: "text-base",
+        md: "text-sm max-md:text-base",
+        sm: "text-xs max-md:text-base"
+      },
+      hasSelections: {
+        true: "h-full",
+        false: ""
+      }
+    },
+    compoundVariants: [
+      {
+        size: "lg",
+        hasSelections: true,
+        class: "py-3 px-4"
+      },
+      {
+        size: "lg",
+        hasSelections: false,
+        class: "h-12"
+      },
+      {
+        size: "md",
+        hasSelections: true,
+        class: "py-2 px-3"
+      },
+      {
+        size: "md",
+        hasSelections: false,
+        class: "h-10 max-md:h-11"
+      },
+      {
+        size: "sm",
+        hasSelections: true,
+        class: "py-1 px-2"
+      },
+      {
+        size: "sm",
+        hasSelections: false,
+        class: "h-8 max-md:h-11"
+      }
+    ],
+    defaultVariants: {
+      size: "md",
+      hasSelections: false
+    }
+  }
+);
+
+interface CommandTriggerProps
+  extends ComponentPropsWithoutRef<"button">,
+    VariantProps<typeof commandTriggerVariants> {
+  icon?: React.ReactNode;
+  asButton?: boolean;
+}
+
+const CommandTrigger = forwardRef<ElementRef<"button">, CommandTriggerProps>(
+  ({ asButton = false, size, className, children, icon, ...props }, ref) => {
+    // Only mounted on phones: the trigger's `[&>span]:line-clamp-1` would
+    // otherwise un-hide the hit-area span on desktop.
+    const { isPhone } = useViewport();
+    return (
+      <button
+        ref={ref}
+        type="button"
+        className={cn(
+          commandTriggerVariants({
+            size,
+            asButton
+          }),
+          className
+        )}
+        {...props}
+      >
+        {asButton && isPhone && <HitArea />}
+        {children}
+        {icon ? (
+          icon
+        ) : (
+          <>
+            {/* Phones: a picker's trailing indicator is ⌄. It comes first so
+              the desktop magnifier stays the last child (space-x). */}
+            <LuChevronDown className="hidden size-4 flex-shrink-0 opacity-50 max-md:block" />
+            <RxMagnifyingGlass className="size-4 flex-shrink-0 opacity-50 max-md:hidden" />
+          </>
+        )}
+      </button>
+    );
+  }
+);
+CommandTrigger.displayName = "CommandTrigger";
+
+export {
+  Command,
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandInputTextField,
+  CommandItem,
+  CommandList,
+  CommandLoading,
+  CommandSeparator,
+  CommandShortcut,
+  CommandTrigger
+};

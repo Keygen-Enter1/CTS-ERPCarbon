@@ -1,0 +1,86 @@
+name: Deploy Apps
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/erp/**"
+      - "apps/mes/**"
+      - "packages/**"
+      - "docs/content/**"
+  workflow_dispatch:
+jobs:
+  # The images come from build-images.yml, which runs on the same push. This
+  # waits for that run rather than building them a second time. It watches the
+  # run, not the registry: polling public.ecr.aws anonymously from a shared
+  # runner IP can be refused for the life of the runner, which looked exactly
+  # like an image that never arrived, and a build that failed or was cancelled
+  # left this waiting out its whole timeout.
+  images:
+    name: Wait for images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for carbon/erp and carbon/mes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REGISTRY: ${{ vars.IMAGE_REGISTRY }}
+          SHA: ${{ github.sha }}
+        run: |
+          [ -n "$REGISTRY" ] || { echo "vars.IMAGE_REGISTRY is not set" >&2; exit 1; }
+          until run=$(gh run list --workflow build-images.yml --commit "$SHA" --limit 1 \
+              --json databaseId --jq '.[0].databaseId // empty') && [ -n "$run" ]; do
+            echo "waiting for Build images to start on $SHA"
+            sleep 15
+          done
+          echo "Build images run: $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$run"
+          gh run watch "$run" --interval 15 > /dev/null
+          for app in erp mes; do
+            conclusion=$(gh run view "$run" --json jobs \
+              --jq ".jobs[] | select(.name == \"carbon/$app\") | .conclusion")
+            echo "carbon/$app: ${conclusion:-missing}"
+            [ "$conclusion" = success ] || exit 1
+          done
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: images
+
+    env:
+      IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY }}
+      IMAGE_TAG: ${{ github.sha }}
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install compatible Pulumi version
+        run: |
+          curl -fsSL https://get.pulumi.com | sh -s -- --version 3.212.0
+          echo "$HOME/.pulumi/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run deployment
+        run: pnpm --filter ci ci:deploy

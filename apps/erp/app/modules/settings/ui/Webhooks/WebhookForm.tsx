@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { Boolean, Input, Select, ValidatedForm } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import {
+  Badge,
+  Button,
+  Drawer,
+  DrawerBody,
+  DrawerContent,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+  FormControl,
+  FormLabel,
+  HStack,
+  Separator,
+  toast,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { useEffect } from "react";
+import { useFetcher } from "react-router";
+import type { z } from "zod";
+import { Hidden, Submit } from "~/components/Form";
+import { usePermissions } from "~/hooks";
+import { path } from "~/utils/path";
+import { webhookValidator } from "../../settings.models";
+import type { getWebhookTables } from "../../settings.service";
+
+type WebhookFormProps = {
+  initialValues: z.infer<typeof webhookValidator>;
+  type?: "modal" | "drawer";
+  open?: boolean;
+  onClose: (data?: { id: string; name: string }) => void;
+};
+
+const WebhookForm = ({
+  initialValues,
+  open = true,
+  onClose
+}: WebhookFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const fetcher = useFetcher<PostgrestResponse<{ id: string }>>();
+
+  const tables = useWebhookTables();
+
+  useEffect(() => {
+    if (fetcher.state === "loading" && fetcher.data?.data) {
+      onClose?.();
+      toast.success(t`Created webhook`);
+    } else if (fetcher.state === "idle" && fetcher.data?.error) {
+      toast.error(t`Failed to create webhook: ${fetcher.data.error.message}`);
+    }
+  }, [fetcher.data, fetcher.state, onClose, t]);
+
+  const isEditing = initialValues.id !== undefined;
+  const isDisabled = isEditing
+    ? !permissions.can("update", "parts")
+    : !permissions.can("create", "parts");
+
+  return (
+    <Drawer
+      open={open}
+      onOpenChange={(open) => {
+        if (!open) onClose?.();
+      }}
+    >
+      <DrawerContent size="sm">
+        <ValidatedForm
+          validator={webhookValidator}
+          method="post"
+          action={
+            isEditing ? path.to.webhook(initialValues.id!) : path.to.newWebhook
+          }
+          defaultValues={initialValues}
+          fetcher={fetcher}
+          className="flex flex-col h-full"
+        >
+          <DrawerHeader>
+            <DrawerTitle>
+              {isEditing ? (
+                <Trans>Edit Webhook</Trans>
+              ) : (
+                <Trans>New Webhook</Trans>
+              )}
+            </DrawerTitle>
+          </DrawerHeader>
+          <DrawerBody>
+            <Hidden name="id" />
+
+            <VStack spacing={4}>
+              <Select name="table" label={t`Table`} options={tables} />
+              <FormControl>
+                <FormLabel>
+                  <Trans>Notifications</Trans>
+                </FormLabel>
+                <VStack>
+                  <Boolean
+                    name="onInsert"
+                    description={<Badge variant="green">Insert</Badge>}
+                  />
+                  <Boolean
+                    name="onUpdate"
+                    description={<Badge variant="blue">Update</Badge>}
+                  />
+                  <Boolean
+                    name="onDelete"
+                    description={<Badge variant="red">Delete</Badge>}
+                  />
+                </VStack>
+              </FormControl>
+
+              <Separator />
+
+              <Input
+                name="name"
+                label={t`Name`}
+                helperText={t`This is a unique identifier for the webhook`}
+              />
+
+              <Input
+                name="url"
+                label={t`Webhook URL`}
+                helperText={t`The endpoint that receives a POST request with the updated data when the table is updated`}
+              />
+
+              <Separator />
+
+              <Boolean name="active" label={t`Active`} bordered />
+            </VStack>
+          </DrawerBody>
+          <DrawerFooter>
+            <HStack>
+              <Submit isDisabled={isDisabled}>
+                <Trans>Save</Trans>
+              </Submit>
+              <Button size="md" variant="solid" onClick={() => onClose()}>
+                <Trans>Cancel</Trans>
+              </Button>
+            </HStack>
+          </DrawerFooter>
+        </ValidatedForm>
+      </DrawerContent>
+    </Drawer>
+  );
+};
+
+export default WebhookForm;
+
+export const useWebhookTables = () => {
+  const tablesFetcher = useLoaderQuery<
+    Awaited<ReturnType<typeof getWebhookTables>>
+  >(path.to.api.webhookTables);
+
+  const tables = tablesFetcher.data?.data ?? [];
+
+  const options = tables.map((t) => ({
+    value: t.table,
+    label: t.name
+  }));
+
+  return options;
+};

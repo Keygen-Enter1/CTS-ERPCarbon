@@ -1,0 +1,666 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { existsSync } from "node:fs";
+import { log } from "@clack/prompts";
+import { execa } from "execa";
+import { join } from "pathe";
+import { COMPOSE_DEV_FILE, COMPOSE_DEV_FILE_LEGACY } from "../constants.js";
+import { readLines } from "../helpers.js";
+import { projectName, SHARED_REDIS_PORT } from "../worktree.js";
+
+// Resolve the dev compose file for a given worktree root. Prefers the current
+// location, falls back to the pre-move root path so older checkouts still work.
+// Returns an absolute path (so `-f` is independent of cwd); the project dir is
+// pinned separately via `--project-directory .`.
+function composeFile(root: string): string {
+  const current = join(root, COMPOSE_DEV_FILE);
+  if (existsSync(current)) return current;
+  const legacy = join(root, COMPOSE_DEV_FILE_LEGACY);
+  if (existsSync(legacy)) return legacy;
+  return current; // neither present — surface the current-path error
+}
+
+// Shared redis runs as a single plain container (not a compose stack) — one per
+// host, reused across worktrees via per-worktree logical DB indexes.
+export const REDIS_CONTAINER = "carbon-redis";
+const REDIS_VOLUME = "carbon-redis-data";
+
+// Fail fast with an actionable message when the Docker daemon is unreachable,
+// instead of a cryptic `Cannot connect to the Docker daemon` deep in the boot.
+export async function ensureDockerRunning() {
+  const r = await execa("docker", ["info"], { reject: false, stdio: "ignore" });
+  if (r.exitCode !== 0) {
+    throw new Error(
+      "Docker isn't running. Start Docker Desktop (or your docker daemon) and re-run `crbn up`."
+    );
+  }
+}
+
+type Publisher = { PublishedPort: number; TargetPort: number };
+
+// Normalized shape. `parseContainer` ensures Health is always string|null and
+// Publishers is always an array — downstream code (ui.ts) doesn't have to
+// re-check for null/undefined, and the V8 hidden class stays stable across
+// every parsed entry.
+export type Container = {
+  Service: string;
+  Name: string;
+  State: string;
+  Status: string;
+  Health: string | null;
+  Publishers: Publisher[];
+};
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+// Every profile `bootStack` can enable. Compose treats profile-gated services
+// as "not enabled" rather than orphans, so a `down` missing one silently
+// leaves those containers running. `stopStack`'s sweep backstops drift here.
+const COMPOSE_PROFILES = ["full", "studio", "mail"] as const;
+
+// Which services a boot starts. Default: the stack the apps need plus Inbucket
+// (login emails). `full` adds Studio, Postgres-Meta, the edge runtime and
+// imgproxy — nothing in the apps calls the first three (~40% of a stack's
+// memory) and imgproxy only converts HEIC. `studio` adds just Studio and the
+// Postgres-Meta it reads through (picked as an app in `crbn up`). `minimal`
+// drops Inbucket too (headless runs sign in by bypass).
+export type StackSize = { minimal?: boolean; full?: boolean; studio?: boolean };
+
+function profileArgs(opts?: StackSize): string[] {
+  const profiles: string[] = [];
+  if (opts?.full) profiles.push("full");
+  else if (opts?.studio) profiles.push("studio");
+  if (!opts?.minimal) profiles.push("mail");
+  return profiles.flatMap((profile) => ["--profile", profile]);
+}
+
+// Exported for tests: the `docker compose … up -d` argv.
+export function buildUpArgs(
+  root: string,
+  slug: string,
+  opts?: StackSize & { services?: string[] }
+): string[] {
+  const args = devArgs(root, slug, "--env-file", ".env.local");
+  // When specific services are requested, don't activate profiles — compose
+  // starts only the named services (+ dependencies) regardless of profiles.
+  if (!opts?.services) args.push(...profileArgs(opts));
+  args.push("up", "-d");
+  if (opts?.services) args.push(...opts.services);
+  return args;
+}
+
+// Exported for tests. Enables every profile unconditionally — one that was
+// never booted matches nothing, while a missing one leaks containers.
+export function buildDownArgs(
+  root: string,
+  slug: string,
+  withVolumes: boolean
+): string[] {
+  const args = devArgs(root, slug, "--env-file", ".env.local");
+  for (const profile of COMPOSE_PROFILES) args.push("--profile", profile);
+  args.push("down", "--remove-orphans");
+  if (withVolumes) args.push("-v");
+  return args;
+}
+
+export async function bootStack(
+  root: string,
+  slug: string,
+  opts?: StackSize & { services?: string[] }
+) {
+  await execStrict("docker", buildUpArgs(root, slug, opts), root);
+}
+
+// Stop every container of the stack but keep them (and their volumes): the
+// memory is freed and `bootStack` brings them back. All profiles, so a service
+// started later with `crbn reload` is stopped too. 30s for Postgres to shut
+// down cleanly before Docker kills it.
+export async function sleepStack(root: string, slug: string) {
+  const args = devArgs(root, slug, ...envFileArgs(root));
+  for (const profile of COMPOSE_PROFILES) args.push("--profile", profile);
+  args.push("stop", "--timeout", "30");
+  await execStrict("docker", args, root);
+}
+
+// `docker compose restart` a subset of services. Used by the storage-stuck
+// heal path: after re-applying init.sql we restart storage/gotrue/postgrest so
+// they reconnect with the freshly-rotated supabase role passwords.
+export async function restartServices(
+  root: string,
+  slug: string,
+  services: string[]
+) {
+  if (services.length === 0) return;
+  await execa("docker", devArgs(root, slug, "restart", ...services), {
+    cwd: root,
+    reject: false,
+    stdio: "ignore"
+  });
+}
+
+// `docker compose up -d --force-recreate` a subset of services — reapplies
+// compose/.env.local changes (image, env, memory, ports) to just those
+// containers, leaving the rest of the stack (and the app dev servers) running.
+// Unlike `restart`, this picks up edits to the compose file.
+export async function recreateServices(
+  root: string,
+  slug: string,
+  services: string[]
+) {
+  if (services.length === 0) return;
+  await execStrict(
+    "docker",
+    devArgs(
+      root,
+      slug,
+      "--env-file",
+      ".env.local",
+      "up",
+      "-d",
+      "--force-recreate",
+      ...services
+    ),
+    root
+  );
+}
+
+// Pull all images before `up -d` so `bootStack` doesn't block silently behind
+// a multi-GB download. `--progress=plain` emits parseable per-line status to
+// stderr (`<service> Pulling`, `<service> Pulled`); we stream the latest line
+// via `onLine` so the caller can feed it into a spinner subtitle.
+export async function pullStack(
+  root: string,
+  slug: string,
+  onLine: (line: string) => void,
+  opts?: StackSize
+) {
+  const args = devArgs(root, slug, "--env-file", ".env.local");
+  args.push(...profileArgs(opts));
+  args.push("--progress", "plain", "pull");
+  const proc = execa("docker", args, { cwd: root, reject: false, all: true });
+
+  if (proc.all) {
+    readLines(proc.all, (line) => {
+      const trimmed = line.trim();
+      if (trimmed) onLine(trimmed);
+    });
+  }
+
+  const r = await proc;
+  if (r.exitCode !== 0) {
+    process.stderr.write(r.all?.toString() ?? "");
+    throw new Error(`docker compose pull failed (exit ${r.exitCode})`);
+  }
+}
+
+/** Resolved image refs for the dev compose file (tags as pinned in compose). */
+export async function devComposeImageRefs(
+  root: string,
+  slug: string,
+  opts?: StackSize
+): Promise<string[] | null> {
+  const args = devArgs(root, slug, "--env-file", ".env.local");
+  args.push(...profileArgs(opts));
+  args.push("config", "--images");
+  const r = await execa("docker", args, { cwd: root, reject: false });
+  if (r.exitCode !== 0) return null;
+  const refs = (r.stdout ?? "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return refs.length > 0 ? refs : null;
+}
+
+/** True when `docker image inspect` succeeds for every ref (parallel). */
+export async function allImagesPresentLocally(
+  refs: string[]
+): Promise<boolean> {
+  const results = await Promise.all(
+    refs.map((ref) =>
+      execa("docker", ["image", "inspect", ref], {
+        stdio: "ignore",
+        reject: false
+      }).then((x) => x.exitCode === 0)
+    )
+  );
+  return results.every(Boolean);
+}
+
+// Returns the compose `down` exit code (0 = success). On compose-parse
+// failures (missing .env.local, profile issues, renamed compose file), falls
+// back to raw `docker rm -f` via destroyProject so the stack is always torn
+// down even when compose can't parse the project to find its containers.
+// Keyed on containers actually remaining, not the exit code alone: compose
+// exits 0 after skipping services it had no profile for.
+export async function stopStack(
+  root: string,
+  slug: string,
+  withVolumes: boolean
+): Promise<number> {
+  const r = await execa("docker", buildDownArgs(root, slug, withVolumes), {
+    cwd: root,
+    reject: false
+  });
+  const project = projectName(slug);
+  let remaining = await projectContainerIds(project);
+  if (r.exitCode !== 0 || remaining.length > 0) {
+    await destroyProject(project, withVolumes);
+    // destroyProject swallows docker errors — re-read rather than assume.
+    remaining = await projectContainerIds(project);
+  }
+  return teardownExitCode(r.exitCode, remaining.length);
+}
+
+// Describes the end state, not the compose invocation: `down` uses this only
+// to warn that containers may still be running.
+export function teardownExitCode(
+  composeExit: number | undefined,
+  remaining: number
+): number {
+  return remaining > 0 ? composeExit || 1 : 0;
+}
+
+// Container ids for a compose project, by label — works with no compose file.
+async function projectContainerIds(project: string): Promise<string[]> {
+  const r = await execa(
+    "docker",
+    [
+      "ps",
+      "-a",
+      "-q",
+      "--filter",
+      `label=com.docker.compose.project=${project}`
+    ],
+    { reject: false }
+  );
+  return (r.stdout ?? "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// One redis per host, run directly via `docker run` (no compose file).
+// Idempotent: reuse a running container, start a stopped one, otherwise create.
+export async function bootSharedRedis() {
+  const state = await execa(
+    "docker",
+    ["container", "inspect", "-f", "{{.State.Running}}", REDIS_CONTAINER],
+    { reject: false }
+  );
+  if (state.exitCode === 0) {
+    if (state.stdout.trim() === "true") return;
+    // Exists but stopped — try to start it; if that fails, recreate below.
+    const started = await execa("docker", ["start", REDIS_CONTAINER], {
+      reject: false,
+      stdio: "ignore"
+    });
+    if (started.exitCode === 0) return;
+    await execa("docker", ["rm", "-f", REDIS_CONTAINER], {
+      reject: false,
+      stdio: "ignore"
+    });
+  }
+
+  const args = [
+    "run",
+    "-d",
+    "--name",
+    REDIS_CONTAINER,
+    "--restart",
+    "unless-stopped",
+    "-p",
+    `${SHARED_REDIS_PORT}:6379`,
+    "-v",
+    `${REDIS_VOLUME}:/data`,
+    "--health-cmd",
+    "redis-cli ping",
+    "--health-interval",
+    "5s",
+    "--health-timeout",
+    "3s",
+    "--health-retries",
+    "5",
+    "redis:7-alpine",
+    "redis-server",
+    "--appendonly",
+    "yes"
+  ];
+  // Recover from a stale container holding the name.
+  let r = await execa("docker", args, { reject: false });
+  if (r.exitCode !== 0 && /already in use/i.test(r.stderr ?? "")) {
+    await execa("docker", ["rm", "-f", REDIS_CONTAINER], {
+      reject: false,
+      stdio: "ignore"
+    });
+    r = await execa("docker", args, { reject: false });
+  }
+  if (r.exitCode !== 0) {
+    process.stderr.write(r.stderr ?? "");
+    throw new Error(`shared redis up failed (exit ${r.exitCode})`);
+  }
+}
+
+export async function destroyProjectVolumes(cwd: string, project: string) {
+  await execa(
+    "docker",
+    [
+      "compose",
+      "-f",
+      composeFile(cwd),
+      "--project-directory",
+      ".",
+      "--env-file",
+      ".env.local",
+      "-p",
+      project,
+      "down",
+      "-v",
+      "--remove-orphans"
+    ],
+    { cwd, stdio: "ignore", reject: false }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Inspection
+// ---------------------------------------------------------------------------
+
+export async function listContainers(
+  root: string,
+  slug: string
+): Promise<Container[]> {
+  const stdout = await composeRead(
+    root,
+    devArgs(root, slug, ...envFileArgs(root), "ps", "-a", "--format", "json")
+  );
+  if (!stdout.trim()) return [];
+  const out: Container[] = [];
+  for (const line of stdout.split("\n")) {
+    if (!line) continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const c = parseContainer(raw);
+    if (c) out.push(c);
+  }
+  return out;
+}
+
+function parseContainer(raw: unknown): Container | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (
+    typeof r.Service !== "string" ||
+    typeof r.Name !== "string" ||
+    typeof r.State !== "string" ||
+    typeof r.Status !== "string"
+  ) {
+    return null;
+  }
+  return {
+    Service: r.Service,
+    Name: r.Name,
+    State: r.State,
+    Status: r.Status,
+    Health: typeof r.Health === "string" ? r.Health : null,
+    Publishers: parsePublishers(r.Publishers)
+  };
+}
+
+function parsePublishers(raw: unknown): Publisher[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Publisher[] = [];
+  for (const p of raw) {
+    if (!p || typeof p !== "object") continue;
+    const pp = (p as Record<string, unknown>).PublishedPort;
+    const tp = (p as Record<string, unknown>).TargetPort;
+    if (typeof pp !== "number" || typeof tp !== "number") continue;
+    out.push({ PublishedPort: pp, TargetPort: tp });
+  }
+  return out;
+}
+
+// Names of services declared in the dev compose file, resolved via
+// `docker compose config --services` so we don't drift if services are added.
+export async function listComposeServices(
+  root: string,
+  slug: string,
+  opts?: StackSize
+): Promise<string[]> {
+  const args = devArgs(root, slug, "--env-file", ".env.local");
+  args.push(...profileArgs(opts));
+  args.push("config", "--services");
+  return (await composeRead(root, args))
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// Tail logs for a single compose service. Returns merged stdout/stderr —
+// docker compose writes log content to stderr on some versions. Empty string
+// if the call fails; callers use this for best-effort diagnostics.
+export async function tailServiceLogs(
+  root: string,
+  slug: string,
+  service: string,
+  lines: number
+): Promise<string> {
+  const r = await execa(
+    "docker",
+    devArgs(
+      root,
+      slug,
+      ...envFileArgs(root),
+      "logs",
+      "--tail",
+      String(lines),
+      "--no-color",
+      service
+    ),
+    { cwd: root, reject: false }
+  );
+  return ((r.stdout ?? "") + (r.stderr ?? "")).trim();
+}
+
+export async function dockerProjectStates(): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const r = await execa(
+    "docker",
+    [
+      "ps",
+      "-a",
+      "--format",
+      '{{.Label "com.docker.compose.project"}}\t{{.State}}'
+    ],
+    { reject: false }
+  );
+  for (const line of (r.stdout ?? "").split("\n")) {
+    const [project, state] = line.split("\t");
+    if (!project || !state) continue;
+    if (state === "running") out.set(project, "running");
+    else if (!out.has(project)) out.set(project, state);
+  }
+  return out;
+}
+
+// Destroy a compose project by force-removing its containers, volumes, and
+// networks using raw docker commands. Works even when the compose file or
+// worktree directory no longer exists (orphaned projects). When withVolumes is
+// false (plain `crbn down`), preserves the project's data volumes.
+export async function destroyProject(project: string, withVolumes = true) {
+  // Find containers belonging to the project.
+  const ids = await projectContainerIds(project);
+  if (ids.length > 0) {
+    await execa("docker", ["rm", "-f", ...ids], {
+      reject: false,
+      stdio: "ignore"
+    });
+  }
+
+  // Remove networks prefixed with the project name (always — cheap, and stale
+  // networks block the next `up` from reusing the project name cleanly).
+  const net = await execa(
+    "docker",
+    ["network", "ls", "-q", "--filter", `name=${project}_`],
+    {
+      reject: false
+    }
+  );
+  const nets = (net.stdout ?? "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (nets.length > 0) {
+    await execa("docker", ["network", "rm", ...nets], {
+      reject: false,
+      stdio: "ignore"
+    });
+  }
+
+  if (!withVolumes) return;
+
+  // Remove volumes prefixed with the project name.
+  const vol = await execa(
+    "docker",
+    ["volume", "ls", "-q", "--filter", `name=${project}_`],
+    {
+      reject: false
+    }
+  );
+  const vols = (vol.stdout ?? "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (vols.length > 0) {
+    await execa("docker", ["volume", "rm", "-f", ...vols], {
+      reject: false,
+      stdio: "ignore"
+    });
+  }
+}
+
+// List all docker compose project names that start with "carbon-".
+export async function listCarbonProjects(): Promise<string[]> {
+  const r = await execa(
+    "docker",
+    [
+      "ps",
+      "-a",
+      "--format",
+      '{{.Label "com.docker.compose.project"}}',
+      "--filter",
+      "label=com.docker.compose.project"
+    ],
+    { reject: false }
+  );
+  const all = new Set<string>();
+  for (const line of (r.stdout ?? "").split("\n")) {
+    const name = line.trim();
+    if (name && name.startsWith("carbon-")) all.add(name);
+  }
+  return [...all];
+}
+
+// Every crbn stack on the machine, including ones whose containers are gone:
+// `down` keeps volumes, so a deleted worktree's data outlives its containers.
+// Matching on the `pgdata` volume keeps other "carbon-" compose projects out.
+export async function listCarbonStacks(): Promise<string[]> {
+  const r = await execa(
+    "docker",
+    [
+      "volume",
+      "ls",
+      "--filter",
+      "label=com.docker.compose.volume=pgdata",
+      "--format",
+      '{{.Label "com.docker.compose.project"}}'
+    ],
+    { reject: false }
+  );
+  const fromVolumes = (r.stdout ?? "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((name) => name.startsWith("carbon-"));
+  return [...new Set([...fromVolumes, ...(await listCarbonProjects())])];
+}
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+
+// Wipe one logical DB on shared redis via the container's bundled redis-cli —
+// avoids requiring a host `redis-cli` install.
+export async function flushDb(db: number) {
+  const r = await execa(
+    "docker",
+    ["exec", REDIS_CONTAINER, "redis-cli", "-n", String(db), "FLUSHDB"],
+    { reject: false, stdio: "ignore" }
+  );
+  if (r.exitCode !== 0) {
+    log.warn(`redis flush of db ${db} failed (skipped)`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+// A compose command whose answer the caller reports as fact. A failure here is
+// thrown with compose's own words: returning "nothing" instead made `crbn
+// status` show an empty stack while eight containers ran, hiding the config
+// error that caused it.
+async function composeRead(root: string, args: string[]): Promise<string> {
+  const r = await execa("docker", args, { cwd: root, reject: false });
+  if (r.exitCode === 0) return r.stdout ?? "";
+  const detail = (r.stderr ?? "")
+    .split("\n")
+    .filter((line) => line.trim() && !line.includes("level=warning"))
+    .slice(-5)
+    .join("\n");
+  throw new Error(
+    `docker ${args.slice(-3).join(" ")} failed (exit ${r.exitCode})\n${detail}`
+  );
+}
+
+// Compose must interpolate the whole file before it will even list containers,
+// and the file has values with no default (extra_hosts names). Read-only
+// commands that run outside `crbn up` — where nothing has loaded .env.local
+// into the process — need it passed explicitly, or they fail and report an
+// empty stack.
+function envFileArgs(root: string): string[] {
+  return existsSync(join(root, ".env.local"))
+    ? ["--env-file", ".env.local"]
+    : [];
+}
+
+function devArgs(root: string, slug: string, ...rest: string[]): string[] {
+  // --project-directory . pins the project dir to the cwd (repo root) so the
+  // compose file's ./packages/... mounts resolve from root even though the file
+  // now lives under packages/dev/docker/.
+  return [
+    "compose",
+    "-f",
+    composeFile(root),
+    "--project-directory",
+    ".",
+    "-p",
+    projectName(slug),
+    ...rest
+  ];
+}
+
+async function execStrict(cmd: string, args: string[], cwd: string) {
+  const r = await execa(cmd, args, { cwd, reject: false, preferLocal: true });
+  if (r.exitCode !== 0) {
+    process.stderr.write(r.stderr?.toString() ?? "");
+    process.stdout.write(r.stdout?.toString() ?? "");
+    throw new Error(`${cmd} ${args.join(" ")} failed (exit ${r.exitCode})`);
+  }
+}

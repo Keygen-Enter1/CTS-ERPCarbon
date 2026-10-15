@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { trigger } from "@carbon/jobs";
+import { useCloseRoute } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { data, useLoaderData } from "react-router";
+import {
+  getMaintenanceSchedule,
+  maintenanceScheduleValidator,
+  upsertMaintenanceSchedule
+} from "~/modules/resources";
+import MaintenanceScheduleForm from "~/modules/resources/ui/MaintenanceSchedule/MaintenanceScheduleForm";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    view: "resources",
+    role: "employee"
+  });
+
+  const { scheduleId } = params;
+  if (!scheduleId) throw notFound("scheduleId not found");
+
+  const schedule = await getMaintenanceSchedule(client, scheduleId);
+
+  if (schedule.error) {
+    throw redirect(
+      path.to.maintenanceSchedules,
+      await flash(
+        request,
+        error(schedule.error, "Failed to get maintenance schedule")
+      )
+    );
+  }
+
+  return {
+    schedule: schedule.data
+  };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    update: "resources"
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(maintenanceScheduleValidator).validate(
+    formData
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const { id, ...d } = validation.data;
+  if (!id) throw new Error("id not found");
+
+  const updateSchedule = await upsertMaintenanceSchedule(client, {
+    id,
+    ...d,
+    updatedBy: userId
+  });
+
+  if (updateSchedule.error) {
+    return data(
+      {},
+      await flash(
+        request,
+        error(updateSchedule.error, "Failed to update maintenance schedule")
+      )
+    );
+  }
+
+  // Re-run generation so any change (frequency, active, day-of-week) is
+  // reflected on the maintenance displays without waiting for the nightly run.
+  await trigger("generate-maintenance", { companyId, scheduleId: id });
+
+  throw redirect(
+    path.to.maintenanceSchedules,
+    await flash(request, success("Updated maintenance schedule"))
+  );
+}
+
+export default function EditMaintenanceScheduleRoute() {
+  const { schedule } = useLoaderData<typeof loader>();
+  const closeRoute = useCloseRoute();
+
+  const initialValues = {
+    id: schedule.id ?? undefined,
+    name: schedule.name ?? "",
+    workCenterId: schedule.workCenterId ?? "",
+    locationId: (schedule as any).locationId ?? "",
+    frequency: schedule.frequency ?? ("Weekly" as const),
+    priority: schedule.priority ?? ("Medium" as const),
+    estimatedDuration: schedule.estimatedDuration ?? undefined,
+    takesWorkCenterOffline: (schedule as any).takesWorkCenterOffline ?? false,
+    nextDueAt: schedule.nextDueAt ? schedule.nextDueAt.slice(0, 10) : undefined,
+    active: schedule.active ?? true,
+    // Day-of-week settings
+    monday: schedule.monday ?? true,
+    tuesday: schedule.tuesday ?? true,
+    wednesday: schedule.wednesday ?? true,
+    thursday: schedule.thursday ?? true,
+    friday: schedule.friday ?? true,
+    saturday: schedule.saturday ?? true,
+    sunday: schedule.sunday ?? true,
+    skipHolidays: schedule.skipHolidays ?? true,
+    procedureId: (schedule as any).procedureId ?? undefined
+  };
+
+  return (
+    <MaintenanceScheduleForm
+      key={initialValues.id}
+      initialValues={initialValues}
+      onClose={() => closeRoute()}
+    />
+  );
+}

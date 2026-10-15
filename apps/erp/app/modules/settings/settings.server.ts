@@ -1,0 +1,869 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { bustApiKeyCache } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import type { Database, Json } from "@carbon/database";
+import {
+  getIntegrationConfigById,
+  getIntegrationIdsByRole,
+  type IntegrationHealthcheckResult,
+  type IntegrationID,
+  resolveIntegrationSecrets,
+  splitSecrets
+} from "@carbon/ee";
+import { isAccountingSyncEnabled } from "@carbon/ee/accounting";
+import { getIntegrationServerHooks } from "@carbon/ee/hooks.server";
+import { patchRampSettings } from "@carbon/ee/ramp.server";
+import { redis } from "@carbon/kv";
+import { getLogger } from "@carbon/logger";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { z } from "zod";
+import type { Integration } from "~/modules/settings/types";
+import { sanitize } from "~/utils/supabase";
+import { oeeDevicesCacheKey } from "./oee-devices-cache";
+import type { customFieldValidator } from "./settings.models";
+
+const INTEGRATION_CACHE_TTL = 3600;
+const logger = getLogger("erp", "settings");
+
+/**
+ * Drop the cached auth record for an API key so a scope change or revocation
+ * takes effect immediately in the common case. An in-flight auth read can still
+ * re-prime the cache with the pre-write row, so the hard bound is the 30s TTL —
+ * callers that delete the row should bust AGAIN after the delete commits, using
+ * the returned keyHash (unreadable from the DB once the row is gone).
+ *
+ * Service-role on purpose: apiKey's RLS SELECT requires `settings_view`, but the
+ * routes that revoke or rescope a key gate on `users_update`, so the caller's own
+ * client cannot see the row and the bust would silently do nothing.
+ */
+export async function invalidateApiKeyCache(
+  id: string,
+  companyId: string
+): Promise<string | null> {
+  const { data, error } = await getCarbonServiceRole()
+    .from("apiKey")
+    .select("keyHash")
+    .eq("id", id)
+    .eq("companyId", companyId)
+    .maybeSingle();
+  // A failed lookup is indistinguishable from a missing row at the return type,
+  // and neither may block the revoke — log it so a stale scope surviving its TTL
+  // is diagnosable rather than silent.
+  if (error) {
+    logger.error("Failed to read api key for cache bust", {
+      error,
+      id,
+      companyId
+    });
+  }
+  if (!data?.keyHash) return null;
+  await bustApiKeyCache(data.keyHash);
+  return data.keyHash;
+}
+
+export async function clearCustomFieldsCache(companyId?: string) {
+  const keys = companyId ? `customFields:${companyId}:*` : "customFields:*";
+  redis.keys(keys).then(function (keys) {
+    const pipeline = redis.pipeline();
+    keys.forEach(function (key) {
+      pipeline.del(key);
+    });
+    return pipeline.exec();
+  });
+}
+
+export async function clearCompanyIntegrationCache(
+  companyId: string
+): Promise<void> {
+  const cacheKey = `integrations:${companyId}`;
+
+  try {
+    // Clear both old and new key formats, and the OEE device lists: a new API
+    // key or environment can name different stations.
+    await redis.del(
+      cacheKey,
+      `json:${cacheKey}`,
+      ...getIntegrationIdsByRole("oee").map((integrationId) =>
+        oeeDevicesCacheKey(companyId, integrationId)
+      )
+    );
+  } catch (error) {
+    logger.error("Redis cache invalidation error", { error });
+  }
+}
+
+export async function clearAllIntegrationCaches(): Promise<void> {
+  try {
+    // Clear both old and new key patterns
+    const oldPattern = "integrations:*";
+    const newPattern = "json:integrations:*";
+
+    const [oldKeys, newKeys] = await Promise.all([
+      redis.keys(oldPattern),
+      redis.keys(newPattern)
+    ]);
+
+    const allKeys = [...oldKeys, ...newKeys];
+    if (allKeys.length > 0) {
+      logger.info("Clearing integration cache entries", {
+        count: allKeys.length
+      });
+      await redis.del(...allKeys);
+    }
+  } catch (error) {
+    logger.error("Error clearing all integration caches", { error });
+  }
+}
+
+export async function deactivateIntegration(
+  client: SupabaseClient<Database>,
+  args: {
+    id: string;
+    companyId: string;
+    updatedBy: string;
+  }
+) {
+  const { id, companyId, updatedBy } = args;
+
+  const result = await client
+    .from("companyIntegration")
+    .update({
+      active: false,
+      updatedBy,
+      updatedAt: new Date().toISOString()
+    })
+    .eq("id", id)
+    .eq("companyId", companyId);
+
+  if (result.error) {
+    return result;
+  }
+
+  await clearCompanyIntegrationCache(companyId);
+
+  return result;
+}
+
+export async function deleteCustomField(
+  client: SupabaseClient<Database>,
+  id: string,
+  companyId: string
+) {
+  try {
+    clearCustomFieldsCache(companyId);
+  } finally {
+    return client.from("customField").delete().eq("id", id);
+  }
+}
+
+interface CompanyIntegration {
+  id: string;
+  companyId: string;
+  metadata: Record<string, any>;
+  active: boolean;
+}
+
+export async function getCompanyIntegrations(
+  client: SupabaseClient<Database>,
+  companyId: string
+): Promise<CompanyIntegration[]> {
+  const cacheKey = `integrations:${companyId}`;
+
+  try {
+    // Try the new prefixed key first
+    let cached = await redis.get(`json:${cacheKey}`);
+    if (cached && typeof cached === "string") {
+      try {
+        return JSON.parse(cached);
+      } catch (parseError) {
+        logger.error("JSON parse error for prefixed cache key", {
+          cacheKey: `json:${cacheKey}`,
+          error: parseError
+        });
+        await redis.del(`json:${cacheKey}`);
+      }
+    }
+
+    // Fallback to old key format for backwards compatibility
+    cached = await redis.get(cacheKey);
+    if (cached !== null && cached !== undefined) {
+      // Log the type and content for debugging
+      logger.info("Cache hit", {
+        cacheKey,
+        type: typeof cached,
+        isArray: Array.isArray(cached),
+        value: cached,
+        constructor: cached?.constructor?.name
+      });
+
+      // Handle different response types from Upstash
+      if (Array.isArray(cached)) {
+        // Direct array return from Upstash
+        return cached as CompanyIntegration[];
+      } else if (typeof cached === "object" && cached !== null) {
+        // Object return from Upstash - could be a parsed JSON already
+        return cached as CompanyIntegration[];
+      } else if (typeof cached === "string") {
+        // String return - needs JSON parsing
+        try {
+          return JSON.parse(cached);
+        } catch (parseError) {
+          logger.error("JSON parse error for cache key", {
+            cacheKey,
+            error: parseError,
+            cached
+          });
+          await redis.del(cacheKey);
+        }
+      } else {
+        logger.warning("Unexpected cache format for key", {
+          cacheKey,
+          type: typeof cached,
+          cached
+        });
+        await redis.del(cacheKey);
+      }
+    }
+  } catch (error) {
+    logger.error("Redis cache read error", { error });
+    // Clear the corrupted cache entry
+    try {
+      await redis.del(cacheKey);
+    } catch (deleteError) {
+      logger.error("Failed to delete corrupted cache entry", {
+        error: deleteError
+      });
+    }
+  }
+
+  const { data, error } = await client
+    .from("companyIntegration")
+    .select("*")
+    .eq("companyId", companyId);
+
+  if (error) {
+    throw error;
+  }
+
+  // Secret material must never reach Redis. Strip each integration's secret keys
+  // into the vault-backed shape (config only) before caching AND returning, so no
+  // consumer of this function depends on a plaintext secret in `metadata` (secret
+  // reads go through resolveIntegrationSecrets against the row, not this cache).
+  const integrations = (data || []).map((integration) => ({
+    ...integration,
+    metadata: splitSecrets(integration.id, integration.metadata).config
+  }));
+
+  try {
+    // Force string storage to avoid Upstash automatic deserialization issues
+    const serializedData = JSON.stringify(integrations);
+    if (typeof serializedData === "string" && serializedData.length > 0) {
+      // Use a prefixed key to ensure we know this is a JSON string
+      await redis.setex(
+        `json:${cacheKey}`,
+        INTEGRATION_CACHE_TTL,
+        serializedData
+      );
+    } else {
+      logger.error("Failed to serialize integrations data for cache");
+    }
+  } catch (error) {
+    logger.error("Redis cache write error", { error });
+  }
+
+  return integrations as CompanyIntegration[];
+}
+
+export async function hasIntegration(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  integrationId: string
+): Promise<boolean> {
+  const integrations = await getCompanyIntegrations(client, companyId);
+  return integrations.some((i) => i.id === integrationId && i.active === true);
+}
+
+export async function getCompanyIntegration(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  integrationId: string
+): Promise<CompanyIntegration | null> {
+  const integrations = await getCompanyIntegrations(client, companyId);
+  return (
+    integrations.find((i) => i.id === integrationId && i.active === true) ||
+    null
+  );
+}
+
+export async function getSlackIntegration(
+  client: SupabaseClient<Database>,
+  companyId: string
+): Promise<{ token: string; channelId?: string } | null> {
+  // The Redis cache (getCompanyIntegration) no longer holds secret material, so
+  // read the row directly with a service-role client — required both to resolve
+  // the vaulted access_token and, in the transitional window, to see the plaintext
+  // still in the column.
+  const serviceRole = getCarbonServiceRole();
+  const { data: integration } = await serviceRole
+    .from("companyIntegration")
+    .select("metadata, secretRef, active")
+    .eq("companyId", companyId)
+    .eq("id", "slack")
+    .maybeSingle();
+
+  if (!integration?.active || !integration.metadata) {
+    return null;
+  }
+
+  const metadata = (await resolveIntegrationSecrets(
+    serviceRole,
+    companyId,
+    "slack",
+    integration.metadata,
+    integration.secretRef
+  )) as any;
+
+  if (!metadata.access_token) {
+    return null;
+  }
+
+  return {
+    token: metadata.access_token,
+    channelId: metadata.channel_id || metadata.default_channel_id
+  };
+}
+
+export async function hasSlackIntegration(
+  client: SupabaseClient<Database>,
+  companyId: string
+): Promise<boolean> {
+  return hasIntegration(client, companyId, "slack");
+}
+
+export async function upsertCompanyIntegration(
+  client: SupabaseClient<Database>,
+  update: {
+    id: string;
+    active: boolean;
+    metadata: Json;
+    companyId: string;
+    updatedBy: string;
+  }
+) {
+  if (update.id === "ramp") {
+    try {
+      const data = await patchRampSettings(
+        getCarbonServiceRole(),
+        update.companyId,
+        {
+          metadata: update.metadata as Record<string, unknown>,
+          active: update.active,
+          updatedBy: update.updatedBy
+        }
+      );
+      await clearCompanyIntegrationCache(update.companyId);
+      return { data, error: null };
+    } catch (error) {
+      logger.error("Failed to atomically patch Ramp settings", {
+        error,
+        companyId: update.companyId
+      });
+      return { data: null, error };
+    }
+  }
+
+  // Split secret material out of the metadata: only the non-secret config is
+  // written to the column; the secrets go to Supabase Vault. The row is upserted
+  // FIRST (so it exists), then the vault RPC stamps `secretRef` onto it.
+  // `secrets` is a PARTIAL bag — splitSecrets omits untouched masked fields — so
+  // `upsert_integration_secret` MERGES it into the stored bag (an omitted secret
+  // keeps its value). A full replace here silently wiped a multi-secret
+  // integration's other credential on a partial save.
+  const { config, secrets } = splitSecrets(update.id, update.metadata);
+
+  const result = await client
+    .from("companyIntegration")
+    .upsert([{ ...update, metadata: config as Json }], {
+      onConflict: "id,companyId"
+    })
+    .select()
+    .single();
+
+  if (result.error) {
+    return result;
+  }
+
+  if (Object.keys(secrets).length > 0) {
+    const serviceRole = getCarbonServiceRole();
+    const { error: vaultError } = await serviceRole.rpc(
+      "upsert_integration_secret",
+      {
+        p_company_id: update.companyId,
+        p_integration_id: update.id,
+        p_secret: secrets as never
+      }
+    );
+    if (vaultError) {
+      logger.error("Failed to persist integration secret to vault", {
+        error: vaultError,
+        id: update.id
+      });
+      return { ...result, data: null, error: vaultError };
+    }
+  }
+
+  await clearCompanyIntegrationCache(update.companyId);
+
+  return result;
+}
+
+export async function upsertCustomField(
+  client: SupabaseClient<Database>,
+  customField:
+    | (Omit<z.infer<typeof customFieldValidator>, "id"> & {
+        companyId: string;
+        createdBy: string;
+      })
+    | (Omit<z.infer<typeof customFieldValidator>, "id"> & {
+        id: string;
+        updatedBy: string;
+      })
+) {
+  try {
+    clearCustomFieldsCache();
+  } finally {
+    if ("createdBy" in customField) {
+      const sortOrders = await client
+        .from("customField")
+        .select("sortOrder")
+        .eq("table", customField.table);
+
+      if (sortOrders.error) return sortOrders;
+      const maxSortOrder = sortOrders.data.reduce((max, item) => {
+        return Math.max(max, item.sortOrder);
+      }, 0);
+
+      return client
+        .from("customField")
+        .insert([{ ...customField, sortOrder: maxSortOrder + 1 }]);
+    }
+    return client
+      .from("customField")
+      .update(
+        sanitize({
+          ...customField,
+          updatedBy: customField.updatedBy
+        })
+      )
+      .eq("id", customField.id);
+  }
+}
+
+export async function updateCustomFieldsSortOrder(
+  client: SupabaseClient<Database>,
+  updates: {
+    id: string;
+    sortOrder: number;
+    updatedBy: string;
+  }[]
+) {
+  try {
+    clearCustomFieldsCache();
+  } finally {
+    const updatePromises = updates.map(({ id, sortOrder, updatedBy }) =>
+      client.from("customField").update({ sortOrder, updatedBy }).eq("id", id)
+    );
+    return Promise.all(updatePromises);
+  }
+}
+
+export type IntegrationHealthStatus =
+  | "healthy"
+  | "unhealthy"
+  | "inactive"
+  | "sync-off";
+
+type IntegrationHealthFields = {
+  health: IntegrationHealthStatus;
+  /** Why an unhealthy check failed, when the integration says. */
+  healthReason: string | null;
+};
+
+/**
+ * Connection health, plus `sync-off` for an accounting integration whose
+ * connection works but whose sync switch is off (a new connection still being
+ * set up, or one switched off since). A broken connection still reads
+ * `unhealthy` — that is the more urgent thing to show.
+ */
+export async function getIntegrationHealth(
+  companyId: string,
+  integration: Integration
+): Promise<Integration & IntegrationHealthFields> {
+  const result = await getConnectionHealth(companyId, integration);
+  if (
+    result.health === "healthy" &&
+    (getIntegrationIdsByRole("accounting") as string[]).includes(
+      integration.id ?? ""
+    ) &&
+    !isAccountingSyncEnabled(integration.metadata)
+  ) {
+    return { ...result, health: "sync-off" };
+  }
+  return result;
+}
+
+async function getConnectionHealth(
+  companyId: string,
+  integration: Integration
+): Promise<
+  Integration &
+    IntegrationHealthFields & { health: "healthy" | "unhealthy" | "inactive" }
+> {
+  if (!integration.active) {
+    return {
+      ...integration,
+      health: "inactive",
+      healthReason: null
+    };
+  }
+
+  const serverHooks = getIntegrationServerHooks(integration.id!);
+  const config = getIntegrationConfigById(integration.id as IntegrationID);
+  const healthcheck = serverHooks?.onHealthcheck ?? config?.onHealthcheck;
+
+  if (!healthcheck) {
+    return {
+      ...integration,
+      health: "healthy",
+      healthReason: null
+    };
+  }
+
+  const key = `integrations:${companyId}:${integration.id}:health`;
+
+  const cached = await redis.get(key);
+
+  // Only cache healthy status
+  if (cached === "1") {
+    return {
+      ...integration,
+      health: "healthy",
+      healthReason: null
+    };
+  }
+
+  // Resolve vaulted secrets back into the metadata before the healthcheck
+  // builds its provider/client. Since the secret-vault refactor, credentials no
+  // longer live in the plaintext `metadata` column, so an unresolved metadata
+  // authenticates with nothing and every secret-bearing healthcheck (Rillet,
+  // Xero, Email) would read "unhealthy". `resolveIntegrationSecrets` looks up
+  // the row's `secretRef` itself (the `integrations` view doesn't expose it) and
+  // throws when the secret can't be read — treat that as unhealthy rather than
+  // crashing the whole settings page.
+  let resolvedMetadata: Record<string, any>;
+  try {
+    resolvedMetadata = (await resolveIntegrationSecrets(
+      getCarbonServiceRole(),
+      companyId,
+      integration.id!,
+      (integration.metadata as Record<string, any>) ?? {}
+    )) as Record<string, any>;
+  } catch {
+    return {
+      ...integration,
+      health: "unhealthy",
+      healthReason: null
+    };
+  }
+
+  const result = await (
+    healthcheck as (
+      companyId: string,
+      metadata: Record<string, any>
+    ) => Promise<boolean | IntegrationHealthcheckResult>
+  )(companyId, resolvedMetadata);
+  const healthy = typeof result === "boolean" ? result : result.healthy;
+  const reason = typeof result === "boolean" ? null : (result.reason ?? null);
+
+  await redis.set(key, healthy ? "1" : "0", "EX", INTEGRATION_CACHE_TTL * 5); // Cache for 5 hours
+
+  return {
+    ...integration,
+    health: healthy ? "healthy" : "unhealthy",
+    healthReason: healthy ? null : reason
+  };
+}
+
+export async function getIntegrationsWithHealth(
+  client: SupabaseClient<Database>,
+  companyId: string
+) {
+  const results = await client
+    .from("integrations")
+    .select("*")
+    .eq("companyId", companyId);
+
+  if (results.error) return results;
+
+  const integrations = results.data;
+
+  const withHealth = await Promise.all(
+    integrations.map((i) => getIntegrationHealth(companyId, i))
+  );
+
+  return {
+    data: withHealth,
+    error: null
+  };
+}
+
+export async function invalidateIntegrationHealthCache(
+  integrationId: string,
+  companyId: string
+) {
+  const key = `integrations:${companyId}:${integrationId}:health`;
+
+  return await redis.del(key);
+}
+
+// Server-only (needs the service-role client for the Vault RPC). Lives here rather
+// than in settings.service.ts because that file is re-exported by the client barrel;
+// a client.server import there would leak the service-role client into the browser
+// bundle. Reached by the Carbon API registry (api+/v1+/lib/registry.server.ts),
+// which imports this module server-side.
+export async function updateIntegrationMetadata(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  integrationId: string,
+  metadata: any,
+  updatedBy?: string
+) {
+  if (integrationId === "ramp") {
+    try {
+      const data = await patchRampSettings(getCarbonServiceRole(), companyId, {
+        metadata: metadata as Record<string, unknown>,
+        updatedBy
+      });
+      await clearCompanyIntegrationCache(companyId);
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error };
+    }
+  }
+
+  // Split secret material out to Supabase Vault; only the non-secret config is
+  // written to the column. The row already exists (this is an update), so vault
+  // FIRST (fail-closed: if the vault write fails, the plaintext is left intact
+  // rather than stripped-and-lost), then write the stripped config.
+  const { config, secrets } = splitSecrets(integrationId, metadata);
+
+  if (Object.keys(secrets).length > 0) {
+    const serviceRole = getCarbonServiceRole();
+    const { error } = await serviceRole.rpc("upsert_integration_secret", {
+      p_company_id: companyId,
+      p_integration_id: integrationId,
+      p_secret: secrets as never
+    });
+    if (error) {
+      return { data: null, error };
+    }
+  }
+
+  return client
+    .from("companyIntegration")
+    .update(
+      sanitize({
+        metadata: config as Json,
+        updatedAt: new Date().toISOString(),
+        updatedBy
+      })
+    )
+    .eq("companyId", companyId)
+    .eq("id", integrationId);
+}
+
+/**
+ * Where a sync operation's `entityId` resolves to a human-readable document
+ * number, per `entityType` (the keys of the accounting sync engine's
+ * `ENTITY_DEFINITIONS`). `employee` and `inventoryAdjustment` are absent on
+ * purpose: the first is a `user` id with no readable column of its own, the
+ * second an `itemLedger` row with no document number at all.
+ */
+const SYNC_ENTITY_READABLE_ID_SOURCES: Record<
+  string,
+  { table: string; column: string }
+> = {
+  customer: { table: "customer", column: "name" },
+  vendor: { table: "supplier", column: "name" },
+  item: { table: "item", column: "readableId" },
+  purchaseOrder: { table: "purchaseOrder", column: "purchaseOrderId" },
+  bill: { table: "purchaseInvoice", column: "invoiceId" },
+  salesOrder: { table: "salesOrder", column: "salesOrderId" },
+  invoice: { table: "salesInvoice", column: "invoiceId" },
+  payment: { table: "payment", column: "paymentId" },
+  charge: { table: "charge", column: "chargeId" },
+  reimbursement: { table: "reimbursement", column: "reimbursementId" },
+  journalEntry: { table: "journal", column: "journalEntryId" },
+  // One table, two entity types — the sweep splits `memo` by party.
+  creditMemo: { table: "memo", column: "memoId" },
+  supplierCredit: { table: "memo", column: "memoId" }
+};
+
+const JOURNAL_REVERSAL_SUFFIX = ":reversal";
+const DAILY_CONSOLIDATION_PREFIX = "daily:";
+
+/** The fields of a sync operation this resolver reads. */
+type SyncOperationReference = {
+  integration: string;
+  entityType: string;
+  entityId: string;
+  direction: string;
+};
+
+/**
+ * The lookup key, built identically here and in `SyncActivity`'s
+ * `getEntityReference`.
+ */
+function syncOperationReadableIdKey(operation: {
+  entityType: string;
+  entityId: string;
+}) {
+  return `${operation.entityType}:${operation.entityId}`;
+}
+
+/**
+ * A pulled operation is keyed by the PROVIDER's remote id, so it only
+ * reaches a Carbon row through `externalIntegrationMapping`. One query for
+ * the whole page, keyed back by `entityType:externalId`.
+ */
+async function getPulledEntityIds(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  operations: SyncOperationReference[]
+): Promise<Map<string, string>> {
+  const pulled = operations.filter(
+    (operation) =>
+      operation.direction === "pull-from-accounting" &&
+      operation.entityType in SYNC_ENTITY_READABLE_ID_SOURCES
+  );
+  if (pulled.length === 0) return new Map();
+
+  const { data, error } = await client
+    .from("externalIntegrationMapping")
+    .select("entityType, entityId, externalId")
+    .eq("companyId", companyId)
+    .in("integration", [
+      ...new Set(pulled.map((operation) => operation.integration))
+    ])
+    .in("entityType", [
+      ...new Set(pulled.map((operation) => operation.entityType))
+    ])
+    .in("externalId", [
+      ...new Set(pulled.map((operation) => operation.entityId))
+    ]);
+
+  if (error || !data) return new Map();
+
+  return new Map(
+    data.map((row) => [`${row.entityType}:${row.externalId}`, row.entityId])
+  );
+}
+
+/**
+ * Resolve one page of sync operations to the document numbers a human reads
+ * — `PO000001` rather than `po_6UyRfXggN6YrmCSauBaVf1`. One query per entity
+ * type on the page (plus one for pulled records' mappings), never one per
+ * row.
+ *
+ * Silently incomplete by design, and the caller falls back to the raw id: a
+ * pulled record that never landed a Carbon row has only the provider's
+ * remote id, a pulled payment's id is a composite of two remote ids, and a
+ * daily-consolidation journal marker backs no row at all.
+ *
+ * `recordId` is the CARBON row id — the same as `entityId` for a push, the
+ * mapped id for a pull — so the table's link goes somewhere real instead of
+ * to the provider's remote id.
+ */
+export async function getSyncOperationReadableIds(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  operations: SyncOperationReference[]
+): Promise<Record<string, { label: string; recordId: string }>> {
+  const pulledEntityIds = await getPulledEntityIds(
+    client,
+    companyId,
+    operations
+  );
+
+  // entityType -> the ids to look up, mapped back to the operation keys they
+  // came from (a journal reversal's id is the journal's id plus a suffix, so
+  // one row can answer two keys).
+  const byEntityType = new Map<string, Map<string, string[]>>();
+
+  for (const operation of operations) {
+    if (!(operation.entityType in SYNC_ENTITY_READABLE_ID_SOURCES)) continue;
+
+    let lookupId =
+      pulledEntityIds.get(syncOperationReadableIdKey(operation)) ??
+      operation.entityId;
+
+    if (operation.entityType === "journalEntry") {
+      if (lookupId.startsWith(DAILY_CONSOLIDATION_PREFIX)) continue;
+      if (lookupId.endsWith(JOURNAL_REVERSAL_SUFFIX)) {
+        lookupId = lookupId.slice(0, -JOURNAL_REVERSAL_SUFFIX.length);
+      }
+    } else if (lookupId.includes(":")) {
+      // A pulled payment's composite remote id — no Carbon row behind it.
+      continue;
+    }
+
+    const ids = byEntityType.get(operation.entityType) ?? new Map();
+    ids.set(lookupId, [
+      ...(ids.get(lookupId) ?? []),
+      syncOperationReadableIdKey(operation)
+    ]);
+    byEntityType.set(operation.entityType, ids);
+  }
+
+  if (byEntityType.size === 0) return {};
+
+  const results = await Promise.all(
+    Array.from(byEntityType.entries()).map(async ([entityType, ids]) => {
+      const source = SYNC_ENTITY_READABLE_ID_SOURCES[entityType]!;
+      // The table and column are chosen from the const map above, never from
+      // request input — but they are values, so the select string can't be
+      // typed. Cast, the same way the tie-out read in the route does.
+      const { data, error } = (await (client.from(source.table as any) as any)
+        .select(`id, ${source.column}`)
+        .eq("companyId", companyId)
+        .in("id", Array.from(ids.keys()))) as {
+        data: { id: string }[] | null;
+        error: unknown;
+      };
+
+      if (error || !data)
+        return [] as [string, { label: string; recordId: string }][];
+
+      return data.flatMap((row) => {
+        const value = (row as Record<string, unknown>)[source.column];
+        if (typeof value !== "string" || value.length === 0) return [];
+        return (ids.get(row.id) ?? []).map(
+          (key): [string, { label: string; recordId: string }] => [
+            key,
+            {
+              label: key.endsWith(JOURNAL_REVERSAL_SUFFIX)
+                ? `${value} (reversal)`
+                : value,
+              recordId: row.id
+            }
+          ]
+        );
+      });
+    })
+  );
+
+  return Object.fromEntries(results.flat());
+}

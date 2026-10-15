@@ -1,0 +1,263 @@
+---
+name: spec-writing
+description: Design a feature and write its spec at .ai/specs/{YYYY-MM-DD}-{slug}.md, with competitor research and explicit design decisions. Open questions are resolved with the user BEFORE the spec is written — the interview comes first, the document second. Use when designing or brainstorming a new feature, a new module, a data-model change, or any change touching 3+ files or crossing modules. Do not use for small bug fixes or one-file refactors, and do not start implementation from this skill — implementation starts only after the spec is written with every question resolved.
+---
+<!-- Workflow pattern inspired by Open Mercato (MIT License)
+     https://github.com/open-mercato/open-mercato
+     Copyright (c) 2025-2026 Open Mercato contributors -->
+
+# spec-writing — research, grill the open questions, THEN write the spec
+
+Input: a feature request. Output: a complete spec at
+`.ai/specs/{YYYY-MM-DD}-{slug}.md` written **after** every open question has
+been resolved with the user. The interview happens before the document exists,
+so the spec is written once, around real answers — not written around guesses
+and reworked after the fact.
+
+The spec is the single design artifact. Do not write separate "design docs" in
+other locations.
+
+**Announce at start:** "Using the spec-writing skill — designing {feature};
+I'll bring you the open questions before writing the spec."
+
+## When to write a spec
+
+| Situation | Action |
+|-----------|--------|
+| New module | Write spec |
+| Feature touching 3+ files | Write spec |
+| Data model change | Write spec |
+| Cross-module behavior change | Write spec |
+| Small bug fix or one-file refactor | Skip spec — use /root-cause + /fix |
+
+Lifecycle and naming rules live in `.ai/specs/AGENTS.md`. Read it once before
+your first spec.
+
+## Step 1: Scope the request
+
+If the request is ambiguous, ask the user at most 3–4 focused questions covering:
+**what** (the capability), **why** (the problem), **where** (ERP, MES, or both),
+**who** (the users). If the request is already clear, skip to Step 2.
+
+## Step 2: Read Carbon context
+
+Run all of these before designing anything:
+
+```bash
+ls .ai/specs/ .ai/specs/implemented/ .ai/specs/archived/ | grep -i {keyword}   # prior art — never duplicate a spec; archived = superseded, cite the replacement
+cat .ai/lessons.md                                          # known pitfalls
+cat .ai/docs/module-conventions.md                          # module layout rules
+cat apps/erp/app/modules/{module}/AGENTS.md                 # for every module touched
+```
+
+Then read the `.claude/rules/` files matching the domain (use the Task Router table
+in the root `AGENTS.md` to find them).
+
+Find the **closest sibling**: the existing record type users would call the same
+kind of thing (lease ↔ rental agreement ↔ contract, sales order ↔ purchase
+order, RMA ↔ supplier return). Read its routes and `ui/` components, not only
+its service functions. The spec copies its shape; every deviation is a Design
+Decision that goes to Step 5.
+
+## Step 3: Research competitors
+
+Invoke `/research {feature}`. This is mandatory for ERP-domain features
+(accounting, costing, tax, inventory valuation, RMA, planning, etc.) — do not
+invent domain logic. Findings land in `.ai/research/{slug}.md`; cite that file
+from the spec.
+
+## Step 4: Make the design decisions — and separate the questions
+
+For each significant decision (data model shape, status lifecycle, workflow,
+integration point):
+
+1. State the question.
+2. Cite what the research found ("SAP and NetSuite both…").
+3. List 2–3 options with one-line trade-offs.
+4. **Decide it yourself if the research + codebase settle it** — record the
+   choice and rationale for the spec's Design Decisions table.
+5. **If you cannot settle it, it is an open question** — genuine domain
+   ambiguity, scope boundaries, data-model alternatives with real trade-offs,
+   product-positioning calls, anything where the user's answer changes what
+   you build. Do NOT pick a placeholder and move on; do NOT write "TBD".
+
+Run every new or modified entity through this checklist; decided rows go in the
+Design Decisions table, unsettled ones join the question list:
+
+| # | Heuristic | Question to answer |
+|---|-----------|--------------------|
+| 1 | Multi-tenancy | Does every new table have `companyId` + composite PK `("id", "companyId")` + `id('prefix')` default? |
+| 2 | Service shape | Does every service function take `client` first, return `{data, error}`, never throw? |
+| 3 | RLS coverage | Does every new table have SELECT/INSERT/UPDATE/DELETE policies per `.claude/rules/conventions-database.md`? |
+| 4 | Permission scoping | Does `requirePermissions` in every route use the correct `{module}_{action}` scope? |
+| 5 | Form pattern | Does every form use `ValidatedForm` + `validator(zodSchema)` + a route action? |
+| 6 | Module layout | One `{module}.service.ts`, one `{module}.models.ts`, barrel `index.ts`? |
+| 7 | Backward compatibility | Any FROZEN/STABLE surface touched (see `BACKWARD_COMPATIBILITY.md`)? What is the migration path? |
+
+At least one open question is required before proceeding. Zero questions means
+you haven't thought hard enough — re-read the research and the heuristics table.
+
+## Step 5: Grill — resolve the questions with the user BEFORE writing
+
+> 🛑 HARD STOP: the spec file is not written while any question is unresolved.
+
+Invoke `/grill` on the question list (protocol: `.claude/skills/grill/SKILL.md` —
+the spec doesn't exist yet, so this is its artifact-less mode; resolutions
+carry into the spec's Open Questions section when it is written in Step 6).
+Interview **one question at a time** (group max 2–3 only for single-module,
+no-schema designs). For each question:
+
+- State the question and **why it matters** (what changes downstream).
+- Give your **recommended answer** with a one-line rationale, plus the
+  alternatives and their trade-offs.
+- Cross-check the user's answer against the codebase before accepting it — if
+  the answer contradicts something real (an existing table, a lesson in
+  `.ai/lessons.md`, a prior spec), say so and re-ask.
+- Record the resolution: `- [x] {Question} — **Answer:** {decision and rationale}`.
+
+The user may batch ("accept all recommendations") — that is their call to make,
+not yours to assume. Never resolve a question yourself to unblock work;
+resolutions come only from a human answer, a research finding, or an explicit
+documented "out of scope for v1" decision.
+
+### Autonomous mode (automated loops — conductor, headless/outer-loop runs)
+
+When this skill runs inside an automated loop with no human available, **do
+not invoke `/grill` and do not block waiting for answers.** Instead:
+
+- Resolve each question in this order: (1) codebase precedent, (2) research /
+  competitor consensus, (3) your recommended answer. Record it inline as
+  `- [x] {Question} — **Autonomous:** {answer + rationale}` so assumed
+  decisions are distinguishable from human ones at a glance.
+- Surface the full list of autonomous resolutions in the spec changelog AND in
+  the loop's "Assumed decisions" PR section — the human reviews them at the
+  PR, not mid-loop.
+- **Ask-First territory is never resolved autonomously** (root `AGENTS.md`:
+  production-critical schema, auth/RBAC/multi-tenancy, public contracts,
+  scope reductions, new production dependencies). A question in that
+  territory → the loop goes BLOCKED with the question stated crisply.
+
+## Step 6: Write the spec
+
+Only now. Copy `.ai/specs/template.md` to `.ai/specs/{YYYY-MM-DD}-{slug}.md`
+(today's date, kebab-case slug) and fill every section, with the Step-5
+resolutions baked into the design. Rules:
+
+- Write every sentence in STE-80 from the first draft (`.claude/rules/writing-ste.md` → Write-time habits). Never ask the human to check the style.
+- Prose follows STE-80 (`.claude/rules/writing-ste.md`): short sentences,
+  active voice, one term per concept. Tables over paragraphs for decisions.
+  Step 8 does the STE-80 review pass; the spec is not final until it passes.
+- Never paste research text or a subagent report into the spec as it is.
+  Rewrite it in STE-80 first.
+- The **Overview diagram** section holds exactly one Mermaid diagram that
+  explains the whole change (rules below). A Data Model section with new
+  tables may add a second one, an `erDiagram`. No other diagrams.
+- SQL sketches use `id('prefix')`, `companyId`, composite PK, audit columns —
+  never `gen_random_uuid()`.
+- Acceptance criteria must be testable: "user creates a PO with 3 lines and sees
+  correct totals in the list view", not "works correctly".
+- No `{placeholders}` left in the file; mark inapplicable sections `N/A` with a
+  reason.
+- The Open Questions section records the resolved Q&A (all boxes checked, each
+  with its inline answer) — it is the audit trail of Step 5, not a to-do list.
+
+### The overview diagram
+
+Choose the type with this table. The first row that matches wins.
+
+| The spec is mostly about… | Mermaid type |
+|---------------------------|--------------|
+| several independent fixes (a bundle) | `flowchart LR`, one `subgraph` per fix: old node → new node |
+| a status or lifecycle | `stateDiagram-v2`, one edge per transition, labelled with its trigger |
+| work that moves between people, modules or services | `sequenceDiagram`, one participant per actor |
+| a changed calculation or behavior | `flowchart LR`, two `subgraph`s named Before and After, the same steps in each |
+| new or changed tables only | `erDiagram` (precedent: `.ai/specs/implemented/2026-07-30-workflows-foundation.md`) |
+| none of the above | `flowchart LR` of the main steps |
+
+Syntax rules — nothing in this repo validates Mermaid, and a broken diagram
+only shows as an error in a preview. Keep to these:
+
+1. Put every node label in double quotes: `A["Pull from Inventory (old)"]`.
+   Parentheses, colons, slashes and `#` break unquoted labels.
+2. Node ids are plain letters and digits (`A`, `B2`, `oldPick`). No spaces,
+   no hyphens.
+3. Never write the word `end` as a node id or a bare label — it closes a
+   `subgraph`. Quote it: `E["end"]`.
+4. At most 12 nodes. A label is at most 30 characters.
+5. Mark what changes, do not color it: `:::hot` for a changed node, `:::new`
+   for an added node, with the two `classDef` lines from the template. Use no
+   other colors, so the diagram reads in light and dark themes.
+6. Put code identifiers in labels as plain text; backticks do not render.
+7. Every node and edge comes from the spec text or from code you opened. The
+   diagram adds no fact.
+
+Self-check before you continue: count the opening and closing lines of each
+`subgraph` (they must match), and confirm every edge names nodes that exist.
+
+## Step 7: New questions discovered while writing
+
+Writing the spec sometimes surfaces questions Step 4 missed. When that happens:
+
+- Add them to the Open Questions section as unchecked items with "why it
+  matters".
+- Take them back to the user (same protocol as Step 5) **before calling the
+  spec final** — the hard stop applies to these too. Do not say "we can figure
+  these out during implementation."
+
+## Step 8: Finalize
+
+After every question is resolved: add a changelog entry, set status per
+`.ai/specs/AGENTS.md`.
+
+Then do the STE-80 review pass (`.claude/rules/writing-ste.md` → Enforcement).
+Do it again after every later edit, including edits from `/grill`, `/plan`
+corrections and subagent results.
+
+1. Follow the 8 steps of the review pass in that rule, in order.
+2. Tick every box of the rule's self-check list.
+
+If a box still fails after 3 rewrite passes, STOP and report the failing lines.
+
+The spec is now ready for `/plan` (or `/feature`, which calls it).
+
+Then offer the reviewer view in one line: "Want an HTML explainer of this
+spec? (`/explain`)". Run `/explain` only on a yes.
+
+## Done when
+
+- [ ] Every open question was answered by the user BEFORE the spec was written
+      (Step 5), with the resolution recorded inline in the spec
+- [ ] Spec exists at `.ai/specs/{YYYY-MM-DD}-{slug}.md`, every section real content,
+      design reflecting the resolutions (no section contradicts an answer)
+- [ ] Research file exists and is linked from the spec
+- [ ] The Closest Sibling section names the sibling and the files the feature
+      copies (or N/A with the reason), and each deviation is a Design Decision
+- [ ] Every applicable heuristic (1–7) has a row in Design Decisions — no TBDs
+- [ ] The Overview diagram section has one Mermaid diagram, chosen from the
+      Step 6 table, that follows the syntax rules — not the template sample
+- [ ] Any questions surfaced during writing (Step 7) were also resolved before
+      the spec was called final
+- [ ] The STE-80 review pass is done after the last edit, and every
+      self-check box is ticked
+
+## Anti-patterns
+
+- Writing the spec first and interviewing the user afterward (the old flow —
+  it produces rework: the document gets written around guesses, then edited
+  around answers)
+- Writing a design doc anywhere other than `.ai/specs/`
+- Dumping all open questions in one message and accepting batch answers you
+  assumed rather than the user chose
+- Accepting an answer without checking it against the code
+- Marking questions resolved without human input
+- Skipping `/research` because "I know how ERPs work"
+- "TBD" in the Design Decisions table (that's an open question — Step 5 it)
+- Vague acceptance criteria ("feature works as expected")
+
+Red flags — thinking any of these means the gate is being defeated; STOP:
+
+- "I'll draft the spec now and confirm the questions after" (that IS the old flow)
+- "I'll mark this question resolved so we can keep moving"
+- "zero open questions — the design is clear" (you haven't looked hard enough)
+- "we can settle this during implementation"
+- "the user probably wants X, I'll assume it" (that assumption IS the question)

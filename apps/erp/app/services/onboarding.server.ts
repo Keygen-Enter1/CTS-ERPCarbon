@@ -1,0 +1,309 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { Readable } from "node:stream";
+import {
+  CarbonEdition,
+  getClaims,
+  makePermissionsFromClaims
+} from "@carbon/auth";
+import type { getCarbonServiceRole } from "@carbon/auth/client.server";
+import type { Database, Json } from "@carbon/database";
+import { trigger } from "@carbon/jobs";
+import { getLogger } from "@carbon/logger";
+import { Edition } from "@carbon/utils";
+import { getLocalTimeZone } from "@internationalized/date";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { nanoid } from "nanoid";
+import type { z } from "zod";
+import { insertEmployeeJob } from "~/modules/people";
+import { getLocationsList, upsertLocation } from "~/modules/resources";
+import {
+  type companyValidator,
+  getCompanies,
+  insertCompany,
+  seedCompany,
+  updateCompany
+} from "~/modules/settings";
+import { unpackBackupArchive } from "~/modules/settings/backups-archive.server";
+import { getDatabaseClient } from "~/services/database.server";
+
+type ServiceRole = ReturnType<typeof getCarbonServiceRole>;
+
+const logger = getLogger("erp", "onboarding");
+
+/**
+ * Provision a freshly-created company's data. "Restore from a backup" resolves
+ * to the user's uploaded `.carbon.tar.gz`, reseed-imported on top of an
+ * identity-only seed (the backup carries the chart of accounts + business data).
+ * With no backup — a clean choice — fall back to a full clean seed.
+ */
+export async function provisionCompanyData(
+  serviceRole: ServiceRole,
+  {
+    companyId,
+    userId,
+    backup
+  }: {
+    companyId: string;
+    userId: string;
+    backup: Blob | null;
+  }
+): Promise<void> {
+  if (!backup) {
+    const seed = await seedCompany(
+      serviceRole,
+      getDatabaseClient(),
+      companyId,
+      userId
+    );
+    if (seed.error) {
+      logger.error("Failed to seed company", { error: seed.error });
+      throw new Error("Fatal: failed to seed company");
+    }
+    return;
+  }
+
+  const seed = await seedCompany(
+    serviceRole,
+    getDatabaseClient(),
+    companyId,
+    userId,
+    {
+      identityOnly: true
+    }
+  );
+  if (seed.error) {
+    logger.error("Failed to seed company", { error: seed.error });
+    throw new Error("Fatal: failed to seed company");
+  }
+
+  // The user's `.carbon.tar.gz`: unpack into a fresh `exports/<name>/` folder so
+  // it imports like any other backup. Uploading the archive as one object would
+  // exceed the bucket's per-object size cap (413) for a real prod backup carrying
+  // media. The import reads the folder via readBackup(<name>).
+  const source = Readable.fromWeb(
+    backup.stream() as Parameters<typeof Readable.fromWeb>[0]
+  );
+  const { name: filePath } = await unpackBackupArchive(
+    serviceRole,
+    companyId,
+    source
+  );
+
+  // Kick off the import. The job runs asynchronously (the company's data
+  // populates shortly after onboarding finishes), but the *enqueue* is awaited
+  // and surfaced: a failed send (e.g. Inngest unreachable) would otherwise
+  // leave the company with only the identity seed — an empty chart of accounts
+  // — while onboarding reported success. Fail loudly instead, like the seed.
+  try {
+    await trigger("company-import", {
+      companyId,
+      userId,
+      filePath,
+      mode: "reseed",
+      importRunId: nanoid(),
+      autoFinalize: true
+    });
+  } catch (err) {
+    logger.error("Failed to start company data import", { error: err });
+    throw new Error("Fatal: failed to start company data import");
+  }
+}
+
+/**
+ * Enqueue the demo template. Callers must already have a headquarters location —
+ * the dataset's pre-flight requires one. A failed enqueue is fatal rather than
+ * silent, otherwise onboarding reports success over an empty company.
+ *
+ * `snapshot: true` so a signup-time template stays revertible from
+ * Settings → Demo Data later. The company is nearly empty at this point, so the
+ * snapshot costs almost nothing, and it keeps one code path rather than two.
+ */
+async function startCompanyTemplate(
+  companyId: string,
+  userId: string,
+  template: string | null
+): Promise<void> {
+  if (!template) return;
+  try {
+    await trigger("company-template", {
+      companyId,
+      userId,
+      datasetKey: template,
+      templateRunId: nanoid(),
+      snapshot: true
+    });
+  } catch (err) {
+    logger.error("Failed to start company template", { error: err });
+    throw new Error("Fatal: failed to start company template");
+  }
+}
+
+/**
+ * Refuse unless `userId` is an employee of `companyId` holding settings_update
+ * there. Reads claims fresh from the database (not the Redis cache) so a
+ * company the caller created moments ago in a failed first attempt counts.
+ */
+async function assertCanUpdateCompany(
+  serviceRole: ServiceRole,
+  userId: string,
+  companyId: string
+): Promise<void> {
+  const rawClaims = await getClaims(serviceRole, userId, companyId);
+  const claims = rawClaims.error
+    ? null
+    : makePermissionsFromClaims(rawClaims.data as Json[]);
+
+  const allowed =
+    claims?.role === "employee" &&
+    (claims.permissions.settings?.update ?? []).includes(companyId);
+
+  if (!allowed) {
+    logger.error("Onboarding re-entry refused: caller cannot update company", {
+      userId,
+      companyId,
+      role: claims?.role ?? null,
+      error: rawClaims.error
+    });
+    throw new Response("You do not have permission to update this company", {
+      status: 403
+    });
+  }
+}
+
+/**
+ * Insert-or-update the onboarding company, provision its data, and create the
+ * headquarters location plus the owner's employee job. Returns the companyId.
+ * Called by the data-choice step: a clean seed, a demo template, or (internal
+ * only) a restore from an uploaded backup.
+ */
+export async function provisionOnboardingCompany(
+  serviceRole: ServiceRole,
+  client: SupabaseClient<Database>,
+  {
+    userId,
+    companyData,
+    backup,
+    template
+  }: {
+    userId: string;
+    companyData: z.infer<typeof companyValidator> & {
+      industryId?: string | null;
+      customIndustryDescription?: string | null;
+    };
+    backup: Blob | null;
+    /** Dataset key for "Use a demo template", else null. */
+    template: string | null;
+  }
+): Promise<string> {
+  const companies = await getCompanies(client, userId);
+  const company = companies?.data?.[0];
+
+  const locations = await getLocationsList(client, company?.id ?? "");
+  const location = locations?.data?.[0];
+
+  const addressData = {
+    addressLine1: companyData.addressLine1,
+    addressLine2: companyData.addressLine2,
+    city: companyData.city,
+    stateProvince: companyData.stateProvince,
+    postalCode: companyData.postalCode,
+    countryCode: companyData.countryCode
+  };
+
+  // Re-entry: a company + location already exist — just update them. No reseed.
+  if (company && location) {
+    // The re-entry target is simply the caller's first membership, and the
+    // writes below run with the service role: they overwrite the company
+    // profile and, for a template, wipe its business data. So the caller must
+    // hold the authority that editing company settings needs — an employee
+    // with settings_update — or any portal user / regular employee could
+    // rewrite the company by POSTing this step.
+    await assertCanUpdateCompany(serviceRole, userId, company.id!);
+
+    const [companyUpdate, locationUpdate] = await Promise.all([
+      updateCompany(serviceRole, company.id!, {
+        ...companyData,
+        updatedBy: userId
+      }),
+      upsertLocation(serviceRole, {
+        ...location,
+        ...addressData,
+        timezone: companyData.timezone || getLocalTimeZone(),
+        updatedBy: userId
+      })
+    ]);
+    if (companyUpdate.error) {
+      logger.error("Failed to update company", { error: companyUpdate.error });
+      throw new Error("Fatal: failed to update company");
+    }
+    if (locationUpdate.error) {
+      logger.error("Failed to update location", {
+        error: locationUpdate.error
+      });
+      throw new Error("Fatal: failed to update location");
+    }
+    // Re-entry still honours the template. The job snapshots the company and
+    // then WIPES its business data before seeding (revertible from the
+    // snapshot) — it no longer refuses a company that already has items.
+    await startCompanyTemplate(company.id!, userId, template);
+    return company.id!;
+  }
+
+  const companyInsert = await insertCompany(serviceRole, companyData);
+  if (companyInsert.error) {
+    logger.error("Failed to insert company", { error: companyInsert.error });
+    throw new Error("Fatal: failed to insert company");
+  }
+  const companyId = companyInsert.data?.id;
+  if (!companyId) {
+    throw new Error("Fatal: failed to get company ID");
+  }
+
+  await provisionCompanyData(serviceRole, {
+    companyId,
+    userId,
+    backup
+  });
+
+  if (CarbonEdition === Edition.Cloud) {
+    trigger("onboard", {
+      type: "lead",
+      companyId,
+      userId
+    });
+  }
+
+  const locationInsert = await upsertLocation(serviceRole, {
+    ...addressData,
+    name: "Headquarters",
+    companyId,
+    timezone: companyData.timezone || getLocalTimeZone(),
+    createdBy: userId
+  });
+  if (locationInsert.error) {
+    logger.error("Failed to insert location", { error: locationInsert.error });
+    throw new Error("Fatal: failed to insert location");
+  }
+  const locationId = locationInsert.data?.id;
+  if (!locationId) {
+    throw new Error("Fatal: failed to get location ID");
+  }
+
+  const job = await insertEmployeeJob(serviceRole, {
+    id: userId,
+    companyId,
+    locationId
+  });
+  if (job.error) {
+    logger.error("Failed to insert job", { error: job.error });
+    throw new Error("Fatal: failed to insert job");
+  }
+
+  // Deliberately after upsertLocation — the pre-flight needs that location.
+  await startCompanyTemplate(companyId, userId, template);
+
+  return companyId;
+}

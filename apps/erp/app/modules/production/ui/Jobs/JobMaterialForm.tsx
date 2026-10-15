@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useCarbon } from "@carbon/auth";
+import { ValidatedForm } from "@carbon/form";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  Copy,
+  toast,
+  VStack
+} from "@carbon/react";
+import { getItemReadableId } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import { useEffect, useState } from "react";
+import { useFetcher, useLocation, useNavigate, useParams } from "react-router";
+import type { z } from "zod";
+import {
+  DefaultMethodType,
+  Hidden,
+  InputControlled,
+  Item,
+  Number,
+  NumberControlled,
+  Select,
+  Submit,
+  UnitOfMeasure
+} from "~/components/Form";
+import { itemTypeLabel } from "~/components/Form/itemTypeLabel";
+import { usePermissions, useRouteData, useUrlParams } from "~/hooks";
+import type { MethodItemType, MethodType } from "~/modules/shared";
+import { useItems } from "~/stores";
+import { path } from "~/utils/path";
+import type { jobOperationValidator } from "../../production.models";
+import { isJobLocked, jobMaterialValidator } from "../../production.models";
+import type { Job } from "../../types";
+
+type JobMaterialFormProps = {
+  initialValues: z.infer<typeof jobMaterialValidator> & {
+    jobMaterialMakeMethodId: string | null;
+  };
+  operations: z.infer<typeof jobOperationValidator>[];
+};
+
+const JobMaterialForm = ({
+  initialValues,
+  operations
+}: JobMaterialFormProps) => {
+  const fetcher = useFetcher<{ id: string; methodType: MethodType }>();
+  const { t, i18n } = useLingui();
+  const { carbon } = useCarbon();
+  const permissions = usePermissions();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const { jobId, materialId } = useParams();
+  if (!jobId) throw new Error("jobId not found");
+  if (!materialId) throw new Error("materialId not found");
+
+  const jobData = useRouteData<{ job: Job }>(path.to.job(jobId));
+
+  const [itemType, setItemType] = useState<MethodItemType>(
+    initialValues.itemType
+  );
+  const [itemData, setItemData] = useState<{
+    itemId: string;
+    methodType: MethodType;
+    description: string;
+    unitCost: number;
+    unitOfMeasureCode: string;
+    quantity: number;
+    itemReplenishmentSystem: string;
+  }>({
+    itemId: initialValues.itemId ?? "",
+    methodType: initialValues.methodType ?? "Pull from Inventory",
+    description: initialValues.description ?? "",
+    unitCost: initialValues.unitCost ?? 0,
+    unitOfMeasureCode: initialValues.unitOfMeasureCode ?? "EA",
+    quantity: initialValues.quantity ?? 1,
+    itemReplenishmentSystem: "Buy"
+  });
+
+  const onTypeChange = (value: MethodItemType | "Item") => {
+    if (value === itemType) return;
+    setItemType(value as MethodItemType);
+    setItemData({
+      itemId: "",
+      methodType: "" as "Pull from Inventory",
+      quantity: 1,
+      description: "",
+      unitCost: 0,
+      unitOfMeasureCode: "EA",
+      itemReplenishmentSystem: "Buy"
+    });
+  };
+
+  const onItemChange = async (itemId: string) => {
+    if (!carbon) return;
+
+    const [item, itemCost] = await Promise.all([
+      carbon
+        .from("item")
+        .select(
+          "name, readableIdWithRevision, type, unitOfMeasureCode, defaultMethodType, replenishmentSystem"
+        )
+        .eq("id", itemId)
+        .single(),
+      carbon.from("itemCost").select("unitCost").eq("itemId", itemId).single()
+    ]);
+
+    if (item.error) {
+      toast.error(t`Failed to load item details`);
+      return;
+    }
+
+    setItemData((d) => ({
+      ...d,
+      itemId,
+      description: item.data?.name ?? "",
+      unitCost: itemCost.data?.unitCost ?? 0,
+      unitOfMeasureCode: item.data?.unitOfMeasureCode ?? "EA",
+      methodType: item.data?.defaultMethodType ?? "Purchase to Order",
+      itemReplenishmentSystem: item.data?.replenishmentSystem ?? "Buy"
+    }));
+
+    if (item.data?.type) {
+      setItemType(item.data.type as MethodItemType);
+    }
+  };
+
+  const [, setSearchParams] = useUrlParams();
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  useEffect(() => {
+    const newPath = path.to.jobMakeMethod(
+      jobId,
+      initialValues.jobMakeMethodId!
+    );
+
+    setSearchParams({ materialId: initialValues.id ?? null });
+    navigate(newPath);
+  }, [
+    fetcher.data,
+    initialValues,
+    initialValues.id,
+    initialValues.methodType,
+    initialValues.jobMaterialMakeMethodId,
+    jobId,
+    location.pathname,
+    navigate
+  ]);
+
+  const isDisabled = isJobLocked(jobData?.job?.status);
+
+  const [items] = useItems();
+  const itemReadableId = getItemReadableId(items, itemData.itemId);
+
+  return (
+    <Card>
+      <ValidatedForm
+        method="post"
+        action={path.to.jobMaterial(jobId, initialValues?.id!)}
+        defaultValues={initialValues}
+        fetcher={fetcher}
+        validator={jobMaterialValidator}
+      >
+        <CardHeader>
+          <CardTitle className="line-clamp-2">{itemData.description}</CardTitle>
+          <CardDescription className="flex items-center gap-2">
+            {itemReadableId} <Copy text={itemReadableId ?? ""} />
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Hidden name="jobMakeMethodId" />
+          {itemData.methodType === "Make to Order" && (
+            <Hidden name="unitCost" value={itemData.unitCost} />
+          )}
+          <Hidden name="order" />
+          <VStack className="pt-4">
+            <div className="grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-3">
+              <Item
+                name="itemId"
+                label={i18n._(itemTypeLabel(itemType))}
+                type={itemType}
+                includeInactive
+                locationId={jobData?.job?.locationId ?? undefined}
+                onChange={(value) => {
+                  onItemChange(value?.value as string);
+                }}
+                onTypeChange={onTypeChange}
+              />
+              <InputControlled
+                name="description"
+                label={t`Description`}
+                value={itemData.description}
+                onChange={(newValue) => {
+                  setItemData((d) => ({ ...d, description: newValue }));
+                }}
+              />
+
+              <Select
+                name="jobOperationId"
+                label={t`Operation`}
+                termId="operation"
+                isClearable
+                options={operations.map((o) => ({
+                  value: o.id!,
+                  label: o.description
+                }))}
+              />
+
+              <DefaultMethodType
+                name="methodType"
+                label={t`Method Type`}
+                termId="method-type"
+                value={itemData.methodType}
+                replenishmentSystem={itemData.itemReplenishmentSystem}
+              />
+              <Number
+                name="quantity"
+                label={t`Quantity per Parent`}
+                termId="job-material-quantity-per-parent"
+              />
+              <UnitOfMeasure
+                name="unitOfMeasureCode"
+                value={itemData.unitOfMeasureCode}
+                onChange={(newValue) =>
+                  setItemData((d) => ({
+                    ...d,
+                    unitOfMeasureCode: newValue?.value ?? "EA"
+                  }))
+                }
+              />
+              {itemData.methodType !== "Make to Order" && (
+                <NumberControlled
+                  name="unitCost"
+                  label={t`Unit Cost`}
+                  value={itemData.unitCost}
+                  minValue={0}
+                />
+              )}
+            </div>
+          </VStack>
+        </CardContent>
+        <CardFooter>
+          <Submit
+            isDisabled={isDisabled || !permissions.can("update", "production")}
+          >
+            Save
+          </Submit>
+        </CardFooter>
+      </ValidatedForm>
+    </Card>
+  );
+};
+
+export default JobMaterialForm;

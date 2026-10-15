@@ -1,0 +1,1 @@
+ALTER TABLE "nonConformanceReviewer" ADD COLUMN "completedDate" TIMESTAMP WITH TIME ZONE;

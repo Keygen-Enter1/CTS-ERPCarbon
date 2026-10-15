@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { rejectCrossSiteNavigation } from "@carbon/auth/middleware/security.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { getErrorMessage, redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { NewRecordPage } from "~/components/NewRecordPage";
+import { useCompanyToday, useUrlParams, useUser } from "~/hooks";
+import {
+  createSalesInvoiceFromSalesOrder,
+  createSalesInvoiceFromShipment,
+  insertSalesInvoice,
+  salesInvoiceValidator
+} from "~/modules/invoicing";
+import SalesInvoiceForm from "~/modules/invoicing/ui/SalesInvoice/SalesInvoiceForm";
+import { getDatabaseClient } from "~/services/database.server";
+import { setCustomFields } from "~/utils/form";
+import type { Handle } from "~/utils/handle";
+import { path, requestReferrer } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: msg`Sales`,
+  to: path.to.sales,
+  module: "sales"
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  // Writes on GET: a link on another site must not trigger it.
+  rejectCrossSiteNavigation(request);
+  // we don't use the client here -- if they have this permission, we'll upgrade to a service role if needed
+  const { companyId, userId } = await requirePermissions(request, {
+    create: "invoicing"
+  });
+
+  const url = new URL(request.url);
+  const sourceDocument = url.searchParams.get("sourceDocument") ?? undefined;
+  const sourceDocumentId = url.searchParams.get("sourceDocumentId") ?? "";
+
+  let result: Awaited<ReturnType<typeof createSalesInvoiceFromSalesOrder>>;
+
+  switch (sourceDocument) {
+    case "Sales Order":
+      if (!sourceDocumentId) throw new Error("Missing sourceDocumentId");
+
+      result = await createSalesInvoiceFromSalesOrder(
+        getCarbonServiceRole(),
+        getDatabaseClient(),
+        sourceDocumentId,
+        companyId,
+        userId
+      );
+
+      if (result.error || !result?.data) {
+        throw redirect(
+          requestReferrer(request) ?? path.to.salesOrders,
+          await flash(
+            request,
+            error(
+              result.error,
+              getErrorMessage(result.error, "Failed to create sales invoice")
+            )
+          )
+        );
+      }
+
+      throw redirect(path.to.salesInvoice(result.data?.id!));
+
+    case "Shipment":
+      if (!sourceDocumentId) throw new Error("Missing sourceDocumentId");
+      result = await createSalesInvoiceFromShipment(
+        getCarbonServiceRole(),
+        getDatabaseClient(),
+        sourceDocumentId,
+        companyId,
+        userId
+      );
+
+      if (result.error || !result?.data) {
+        throw redirect(
+          requestReferrer(request) ?? path.to.shipment(sourceDocumentId),
+          await flash(
+            request,
+            error(
+              result.error,
+              getErrorMessage(result.error, "Failed to create sales invoice")
+            )
+          )
+        );
+      }
+
+      throw redirect(path.to.salesInvoice(result.data?.id!));
+
+    default:
+      return null;
+  }
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, companyGroupId, userId } =
+    await requirePermissions(request, {
+      create: "invoicing"
+    });
+
+  const formData = await request.formData();
+  const validation = await validator(salesInvoiceValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const { id: _id, ...d } = validation.data;
+
+  const result = await insertSalesInvoice(client, {
+    ...d,
+    invoiceId: d.invoiceId || undefined,
+    companyId,
+    companyGroupId,
+    createdBy: userId,
+    customFields: setCustomFields(formData)
+  });
+
+  if (result.error || !result.data) {
+    throw redirect(
+      path.to.invoicingSales,
+      await flash(
+        request,
+        error(result.error, "Failed to insert sales invoice")
+      )
+    );
+  }
+
+  throw redirect(path.to.salesInvoice(result.data.id));
+}
+
+export default function SalesInvoiceNewRoute() {
+  const [params] = useUrlParams();
+  const customerId = params.get("customerId");
+  const { defaults } = useUser();
+
+  const companyToday = useCompanyToday();
+  const initialValues = {
+    id: undefined,
+    invoiceId: undefined,
+    customerId: customerId ?? "",
+    locationId: defaults?.locationId ?? "",
+    dateIssued: companyToday
+  };
+
+  return (
+    <NewRecordPage>
+      <SalesInvoiceForm initialValues={initialValues} />
+    </NewRecordPage>
+  );
+}

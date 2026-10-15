@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { CreatableCombobox } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import { useDisclosure } from "@carbon/react";
+import { useLingui } from "@lingui/react/macro";
+import { useMemo, useRef, useState } from "react";
+import { Enumerable } from "~/components/Enumerable";
+import { useRouteData } from "~/hooks";
+import type {
+  CustomerStatus as CustomerStatusStatus,
+  getCustomerStatusesList
+} from "~/modules/sales";
+import CustomerStatusForm from "~/modules/sales/ui/CustomerStatuses/CustomerStatusForm";
+import { path } from "~/utils/path";
+import { useEmptyState } from "./emptyStates";
+
+type CustomerStatusSelectProps = Omit<ComboboxProps, "options">;
+
+const CustomerStatus = (props: CustomerStatusSelectProps) => {
+  const { t } = useLingui();
+  const newCustomerStatusModal = useDisclosure();
+  const [created, setCreated] = useState<string>("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const options = useCustomerStatuses();
+
+  const emptyMessage = useEmptyState("customerStatus", {
+    onCreate: () => newCustomerStatusModal.onOpen()
+  });
+
+  return (
+    <>
+      <CreatableCombobox
+        ref={triggerRef}
+        options={
+          options.map((o) => ({
+            value: o.value,
+            label: <Enumerable value={o.label} />
+          })) ?? []
+        }
+        emptyMessage={emptyMessage}
+        {...props}
+        label={props?.label ?? t`Customer Status`}
+        onCreateOption={(option) => {
+          newCustomerStatusModal.onOpen();
+          setCreated(option);
+        }}
+      />
+      {newCustomerStatusModal.isOpen && (
+        <CustomerStatusForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newCustomerStatusModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            name: created
+          }}
+        />
+      )}
+    </>
+  );
+};
+
+CustomerStatus.displayName = "CustomerStatus";
+
+export default CustomerStatus;
+
+export const useCustomerStatuses = (enabled = true) => {
+  const sharedCustomerData = useRouteData<{
+    customerStatuses: CustomerStatusStatus[];
+  }>(path.to.customerRoot);
+
+  const hasCustomerData = sharedCustomerData?.customerStatuses;
+
+  const customerStatusFetcher = useLoaderQuery<
+    Awaited<ReturnType<typeof getCustomerStatusesList>>
+  >(enabled && !hasCustomerData ? path.to.api.customerStatuses : null);
+
+  const options = useMemo(() => {
+    const dataSource =
+      (hasCustomerData
+        ? sharedCustomerData.customerStatuses
+        : customerStatusFetcher.data?.data) ?? [];
+
+    return dataSource.map((c) => ({
+      value: c.id,
+      label: c.name
+    }));
+  }, [
+    customerStatusFetcher.data?.data,
+    hasCustomerData,
+    sharedCustomerData?.customerStatuses
+  ]);
+
+  return options;
+};

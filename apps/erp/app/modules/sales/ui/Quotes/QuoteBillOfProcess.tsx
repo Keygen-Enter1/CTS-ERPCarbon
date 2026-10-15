@@ -1,0 +1,2750 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+"use client";
+import { useCarbon } from "@carbon/auth";
+import { Array as ArrayInput, Input, ValidatedForm } from "@carbon/form";
+import { useAction } from "@carbon/query";
+import type { JSONContent } from "@carbon/react";
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Badge,
+  Button,
+  Card,
+  CardAction,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Count,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  generateHTML,
+  HStack,
+  IconButton,
+  Label,
+  Loading,
+  MENU_ITEM_SHORTCUTS,
+  ToggleGroup,
+  ToggleGroupItem,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  toast,
+  useDebounce,
+  useDisclosure,
+  VStack
+} from "@carbon/react";
+import { Editor } from "@carbon/react/Editor";
+import { distinctItemText, INPUT_FORMAT } from "@carbon/utils";
+import { getLocalTimeZone, today } from "@internationalized/date";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { DragControls } from "motion/react";
+import { motion, Reorder, useDragControls } from "motion/react";
+import { nanoid } from "nanoid";
+import type { Dispatch, ReactNode, SetStateAction } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  LuActivity,
+  LuChevronRight,
+  LuCirclePlus,
+  LuDollarSign,
+  LuEllipsisVertical,
+  LuGripVertical,
+  LuHammer,
+  LuInfo,
+  LuList,
+  LuListChecks,
+  LuMaximize2,
+  LuMinimize2,
+  LuTriangleAlert
+} from "react-icons/lu";
+import { useFetcher, useFetchers, useParams } from "react-router";
+import type { z } from "zod";
+import {
+  DateTime,
+  DirectionAwareTabs,
+  EmployeeAvatar,
+  OperationTypeIcon,
+  TimeTypeIcon
+} from "~/components";
+import {
+  Hidden,
+  InputControlled,
+  Number,
+  NumberControlled,
+  Process,
+  Select,
+  SelectControlled,
+  StandardFactor,
+  Submit,
+  SupplierProcess,
+  Tool,
+  UnitHint,
+  WorkCenter
+} from "~/components/Form";
+import AssemblyInstruction from "~/components/Form/AssemblyInstruction";
+import InspectionDocument from "~/components/Form/InspectionDocument";
+import Procedure from "~/components/Form/Procedure";
+import { getUnitHint } from "~/components/Form/UnitHint";
+import UnitOfMeasure, {
+  useUnitOfMeasure
+} from "~/components/Form/UnitOfMeasure";
+import { ProcedureStepTypeIcon } from "~/components/Icons";
+import { ConfirmDelete } from "~/components/Modals";
+import type { Item, SortableItemRenderProps } from "~/components/SortableList";
+import {
+  SortableList,
+  SortableListItem,
+  SortableListItemPanel,
+  SortableListItemToggle
+} from "~/components/SortableList";
+import {
+  useCurrencyDecimals,
+  useImageUpload,
+  usePermissions,
+  useRouteData,
+  useUser
+} from "~/hooks";
+import {
+  OperationRowDetails,
+  OperationRowTitle
+} from "~/modules/items/ui/Item/MethodRow";
+import type {
+  OperationParameter,
+  OperationStep,
+  OperationTool
+} from "~/modules/shared";
+import {
+  methodOperationOrders,
+  operationParameterValidator,
+  operationStepValidator,
+  operationToolValidator,
+  operationTypes,
+  procedureStepType
+} from "~/modules/shared";
+import type { action as editQuoteOperationParameterAction } from "~/routes/x+/quote+/methods+/operation.parameter.$id";
+import type { action as newQuoteOperationParameterAction } from "~/routes/x+/quote+/methods+/operation.parameter.new";
+import type { action as editQuoteOperationStepAction } from "~/routes/x+/quote+/methods+/operation.step.$id";
+import type { action as editQuoteOperationToolAction } from "~/routes/x+/quote+/methods+/operation.tool.$id";
+import type { action as newQuoteOperationToolAction } from "~/routes/x+/quote+/methods+/operation.tool.new";
+import { useItems, useTools } from "~/stores";
+import { path } from "~/utils/path";
+import { quoteOperationValidator } from "../../sales.models";
+import type { Quotation } from "../../types";
+
+export type Operation = z.infer<typeof quoteOperationValidator> & {
+  workInstruction: JSONContent | null;
+  tags: string[];
+};
+
+type ItemWithData = Item & {
+  data: Operation;
+};
+
+type QuoteMaterial = {
+  itemId: string;
+};
+
+type QuoteBillOfProcessProps = {
+  quoteMakeMethodId: string;
+  itemId: string;
+  materials: QuoteMaterial[];
+  operations: (Operation & {
+    quoteOperationTool: OperationTool[];
+    quoteOperationParameter: OperationParameter[];
+    quoteOperationStep: OperationStep[];
+  })[];
+  tags: { name: string }[];
+};
+
+type PendingWorkInstructions = {
+  [key: string]: JSONContent;
+};
+
+type OrderState = {
+  [key: string]: number;
+};
+
+type CheckedState = {
+  [key: string]: boolean;
+};
+
+type TemporaryItems = {
+  [key: string]: Operation;
+};
+
+function makeItems(
+  operations: Operation[],
+  tags: { name: string }[]
+): ItemWithData[] {
+  return operations.map((operation) => makeItem(operation, tags));
+}
+
+function makeItem(
+  operation: Operation,
+  tags: { name: string }[]
+): ItemWithData {
+  return {
+    id: operation.id!,
+    title: (
+      <OperationRowTitle
+        description={operation.description}
+        operationType={operation.operationType}
+        processId={operation.processId}
+        supplierProcessId={operation.operationSupplierProcessId}
+      />
+    ),
+    checked: false,
+    order: operation.operationOrder,
+    details: <OperationRowDetails operation={operation} />,
+    data: operation
+  };
+}
+
+const initialOperation: Omit<
+  Operation,
+  "quoteMakeMethodId" | "order" | "quoteOperationTool" | "id"
+> = {
+  description: "",
+  laborRate: 0,
+  laborTime: 0,
+  laborUnit: "Minutes/Piece",
+  machineRate: 0,
+  machineTime: 0,
+  machineUnit: "Minutes/Piece",
+  operationUnitCost: 0,
+  operationLeadTime: 0,
+  operationOrder: "After Previous",
+  operationType: "Process",
+  assemblyInstructionId: "",
+  inspectionDocumentId: "",
+  overheadRate: 0,
+  processId: "",
+  procedureId: "",
+  setupTime: 0,
+  setupUnit: "Total Minutes",
+  tags: [],
+  workCenterId: "",
+  workInstruction: {}
+};
+
+const usePendingOperations = () => {
+  type PendingItem = ReturnType<typeof useFetchers>[number] & {
+    formData: FormData;
+  };
+  const { quoteId, lineId } = useParams();
+  if (!quoteId || !lineId) throw new Error("quoteId or lineId not found");
+
+  return useFetchers()
+    .filter((fetcher): fetcher is PendingItem => {
+      return (
+        (fetcher.formAction === path.to.newQuoteOperation(quoteId, lineId) ||
+          fetcher.formAction?.includes(
+            `/quote/methods/${quoteId}/${lineId}/operation`
+          )) ??
+        false
+      );
+    })
+    .reduce<z.infer<typeof quoteOperationValidator>[]>((acc, fetcher) => {
+      const formData = fetcher.formData;
+      const operation = quoteOperationValidator.safeParse(
+        Object.fromEntries(formData)
+      );
+
+      if (operation.success) {
+        return [...acc, operation.data];
+      }
+      return acc;
+    }, []);
+};
+
+const QuoteBillOfProcess = ({
+  quoteMakeMethodId,
+  itemId,
+  materials,
+  operations: initialOperations,
+  tags
+}: QuoteBillOfProcessProps) => {
+  const { carbon } = useCarbon();
+  const sortOrderFetcher = useFetcher<{}>();
+  const deleteOperationFetcher = useFetcher<{ success: boolean }>();
+  const permissions = usePermissions();
+  const { id: userId } = useUser();
+
+  const [allItems] = useItems();
+
+  const materialItemIds = useMemo(
+    () => new Set((materials ?? []).map((m) => m.itemId)),
+    [materials]
+  );
+
+  const itemMentions = useMemo(
+    () =>
+      allItems
+        .filter((item) => materialItemIds.has(item.id))
+        .map((item) => ({
+          id: item.id,
+          label: item.name ?? item.readableIdWithRevision,
+          helper: item.name
+            ? distinctItemText(item.name, item.readableIdWithRevision)
+            : undefined
+        })),
+    [allItems, materialItemIds]
+  );
+
+  const addOperationButtonRef = useRef<HTMLButtonElement>(null);
+
+  const { quoteId } = useParams();
+  if (!quoteId) throw new Error("quoteId not found");
+  const quoteData = useRouteData<{ quote: Quotation }>(path.to.quote(quoteId));
+
+  const isDisabled = quoteData?.quote?.status !== "Draft";
+  const isReadOnly = isDisabled || !permissions.can("update", "sales");
+
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [temporaryItems, setTemporaryItems] = useState<TemporaryItems>({});
+  const [workInstructions, setWorkInstructions] =
+    useState<PendingWorkInstructions>(() => {
+      return initialOperations.reduce((acc, operation) => {
+        if (operation.workInstruction) {
+          acc[operation.id!] = operation.workInstruction;
+        }
+        return acc;
+      }, {} as PendingWorkInstructions);
+    });
+  const [checkedState, setCheckedState] = useState<CheckedState>({});
+  // Only the rows this session has reordered. Every other row takes its order
+  // from the loaded data: a copy of all of them taken at mount hid a reorder
+  // made anywhere else until the page was reloaded.
+  const [orderState, setOrderState] = useState<OrderState>({});
+
+  const { t } = useLingui();
+
+  const operationsById = new Map<
+    string,
+    Operation & { quoteOperationTool: OperationTool[] }
+  >();
+
+  // Add initial operations to map
+  initialOperations.forEach((operation) => {
+    if (!operation.id) return;
+    operationsById.set(operation.id, operation);
+  });
+
+  const pendingOperations = usePendingOperations();
+
+  // Replace existing operations with pending ones
+  pendingOperations.forEach((pendingOperation) => {
+    if (!pendingOperation.id) {
+      operationsById.set("temporary", {
+        ...pendingOperation,
+        workInstruction: {},
+        quoteOperationTool: [],
+        tags: []
+      });
+    } else {
+      operationsById.set(pendingOperation.id, {
+        ...operationsById.get(pendingOperation.id)!,
+        ...pendingOperation
+      });
+    }
+  });
+
+  // Add temporary items
+  Object.entries(temporaryItems).forEach(([id, operation]) => {
+    operationsById.set(id, {
+      ...operation,
+      quoteOperationTool: []
+    });
+  });
+
+  const operations = Array.from(operationsById.values()).sort(
+    (a, b) => (orderState[a.id!] ?? a.order) - (orderState[b.id!] ?? b.order)
+  );
+
+  const items = makeItems(operations, tags).map((item) => ({
+    ...item,
+    checked: checkedState[item.id] ?? false
+  }));
+
+  const onUpdateWorkInstruction = useDebounce(
+    async (content: JSONContent) => {
+      if (selectedItemId !== null && !temporaryItems[selectedItemId])
+        await carbon
+          ?.from("quoteOperation")
+          .update({
+            workInstruction: content,
+            updatedAt: today(getLocalTimeZone()).toString(),
+            updatedBy: userId
+          })
+          .eq("id", selectedItemId!);
+    },
+    2500,
+    true
+  );
+
+  const onUploadImage = useImageUpload(`opportunity-line/${selectedItemId}`);
+
+  const onToggleItem = (id: string) => {
+    if (!permissions.can("update", "parts")) return;
+    setCheckedState((prev) => ({
+      ...prev,
+      [id]: !prev[id]
+    }));
+  };
+
+  // we create a temporary item and append it to the list
+  const onAddItem = () => {
+    const operationId = nanoid();
+
+    let newOrder = 1;
+    if (operations.length) {
+      newOrder = Math.max(...operations.map((op) => op.order)) + 1;
+    }
+
+    const newOperation: Operation = {
+      ...initialOperation,
+      id: operationId,
+      order: newOrder,
+      quoteMakeMethodId
+    };
+
+    setTemporaryItems((prev) => ({
+      ...prev,
+      [operationId]: newOperation
+    }));
+    setSelectedItemId(operationId);
+  };
+
+  const onRemoveItem = async (id: string) => {
+    if (!permissions.can("update", "sales")) return;
+
+    const operation = operationsById.get(id);
+    if (!operation) return;
+
+    if (temporaryItems[id]) {
+      setTemporaryItems((prev) => {
+        const { [id]: _, ...rest } = prev;
+        return rest;
+      });
+    } else {
+      deleteOperationFetcher.submit(
+        { id },
+        {
+          method: "post",
+          action: path.to.quoteOperationsDelete
+        }
+      );
+    }
+
+    setSelectedItemId(null);
+    setOrderState((prev) => {
+      const { [id]: _, ...rest } = prev;
+      return rest;
+    });
+  };
+
+  const onReorder = (items: ItemWithData[]) => {
+    if (!permissions.can("update", "sales") || isDisabled) return;
+    const newItems = items.map((item, index) => ({
+      ...item,
+      data: {
+        ...item.data,
+        order: index + 1
+      }
+    }));
+    const updates = newItems.reduce<Record<string, number>>((acc, item) => {
+      if (!temporaryItems[item.id]) {
+        acc[item.id] = item.data.order;
+      }
+      return acc;
+    }, {});
+
+    setOrderState((prev) => ({
+      ...prev,
+      ...updates
+    }));
+    updateSortOrder(updates);
+  };
+
+  const updateSortOrder = useDebounce(
+    (updates: Record<string, number>) => {
+      let formData = new FormData();
+      formData.append("updates", JSON.stringify(updates));
+      sortOrderFetcher.submit(formData, {
+        method: "post",
+        action: path.to.quoteOperationsOrder
+      });
+    },
+    1000,
+    true
+  );
+
+  const onCloseOnDrag = () => {
+    setCheckedState({});
+  };
+
+  const [tabChangeRerender, setTabChangeRerender] = useState<number>(1);
+  const renderListItem = ({
+    item,
+    items,
+    order,
+    onToggleItem,
+    onRemoveItem
+  }: SortableItemRenderProps<ItemWithData>) => {
+    const isOpen = item.id === selectedItemId;
+    const tools =
+      initialOperations.find((o) => o.id === item.id)?.quoteOperationTool ?? [];
+    const parameters =
+      initialOperations.find((o) => o.id === item.id)
+        ?.quoteOperationParameter ?? [];
+    const steps =
+      initialOperations.find((o) => o.id === item.id)?.quoteOperationStep ?? [];
+
+    const hasProcedure = !!item.data.procedureId;
+    const hasAssemblyInstruction = !!item.data.assemblyInstructionId;
+
+    const tabs = [
+      {
+        id: 0,
+        label: t`Details`,
+        content: (
+          <div className="flex w-full flex-col pr-2 py-2">
+            <motion.div
+              initial={{ opacity: 0, filter: "blur(4px)" }}
+              animate={{ opacity: 1, filter: "blur(0px)" }}
+              transition={{
+                type: "spring",
+                bounce: 0,
+                duration: 0.3
+              }}
+            >
+              <OperationForm
+                item={item}
+                itemId={itemId}
+                isDisabled={isDisabled}
+                workInstruction={workInstructions[item.id] ?? {}}
+                setWorkInstructions={setWorkInstructions}
+                setSelectedItemId={setSelectedItemId}
+                setTemporaryItems={setTemporaryItems}
+                temporaryItems={temporaryItems}
+                onSubmit={() => {
+                  setSelectedItemId(null);
+                  addOperationButtonRef.current?.scrollIntoView({
+                    behavior: "smooth",
+                    block: "nearest",
+                    inline: "center"
+                  });
+                }}
+              />
+            </motion.div>
+          </div>
+        )
+      },
+      {
+        id: 1,
+        disabled:
+          item.id in temporaryItems ||
+          hasProcedure ||
+          item.data.operationType === "Outside Processing",
+        label: (
+          <span className="flex items-center gap-2">
+            <span>
+              <Trans>Instructions</Trans>
+            </span>
+            {hasProcedure && (
+              <Tooltip>
+                <TooltipTrigger>
+                  <Badge variant="secondary">
+                    <LuListChecks />
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="opacity-100">
+                  <p>
+                    <Trans>
+                      Instructions are inherited from the procedure.
+                    </Trans>
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+          </span>
+        ),
+        content: (
+          <div className="flex flex-col">
+            <div>
+              {permissions.can("update", "parts") ? (
+                <Editor
+                  initialValue={
+                    workInstructions[item.id] ?? ({} as JSONContent)
+                  }
+                  onUpload={onUploadImage}
+                  onChange={(content) => {
+                    if (!permissions.can("update", "sales")) return;
+                    setWorkInstructions((prev) => ({
+                      ...prev,
+                      [item.id]: content
+                    }));
+                    onUpdateWorkInstruction(content);
+                  }}
+                  mentions={[{ char: "@", items: itemMentions }]}
+                  className="py-8"
+                />
+              ) : (
+                <div
+                  className="prose dark:prose-invert"
+                  dangerouslySetInnerHTML={{
+                    __html: generateHTML(
+                      item.data.workInstruction ?? ({} as JSONContent)
+                    )
+                  }}
+                />
+              )}
+            </div>
+          </div>
+        )
+      },
+
+      {
+        id: 2,
+        disabled:
+          item.id in temporaryItems ||
+          hasProcedure ||
+          item.data.operationType === "Outside Processing",
+        label: (
+          <span className="flex items-center gap-2">
+            <span>
+              <Trans>Parameters</Trans>
+            </span>
+            {hasProcedure && (
+              <Tooltip>
+                <TooltipTrigger>
+                  <Badge variant="secondary">
+                    <LuListChecks />
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="opacity-100">
+                  <p>
+                    <Trans>Parameters are inherited from the procedure.</Trans>
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {!hasProcedure && parameters.length > 0 && (
+              <Count count={parameters.length} />
+            )}
+          </span>
+        ),
+        content: (
+          <div className="flex w-full flex-col py-4">
+            <ParametersForm
+              parameters={parameters}
+              operationId={item.id!}
+              isDisabled={
+                selectedItemId === null || !!temporaryItems[selectedItemId!]
+              }
+              temporaryItems={temporaryItems}
+            />
+          </div>
+        )
+      },
+      {
+        id: 3,
+        disabled:
+          item.id in temporaryItems ||
+          hasProcedure ||
+          hasAssemblyInstruction ||
+          item.data.operationType === "Outside Processing",
+        label: (
+          <span className="flex items-center gap-2">
+            <span>
+              <Trans>Steps</Trans>
+            </span>
+            {(hasProcedure || hasAssemblyInstruction) && (
+              <Tooltip>
+                <TooltipTrigger>
+                  <Badge variant="secondary">
+                    <LuListChecks />
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="opacity-100">
+                  <p>
+                    {hasAssemblyInstruction ? (
+                      <Trans>
+                        Steps are inherited from the assembly instruction.
+                      </Trans>
+                    ) : (
+                      <Trans>
+                        Attributes are inherited from the procedure.
+                      </Trans>
+                    )}
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {!hasProcedure && !hasAssemblyInstruction && steps.length > 0 && (
+              <Count count={steps.length} />
+            )}
+          </span>
+        ),
+        content: (
+          <div className="flex w-full flex-col py-4">
+            <AttributesForm
+              steps={steps}
+              operationId={item.id!}
+              isDisabled={
+                selectedItemId === null || !!temporaryItems[selectedItemId!]
+              }
+              temporaryItems={temporaryItems}
+              itemMentions={itemMentions}
+            />
+          </div>
+        )
+      },
+      {
+        id: 4,
+        disabled:
+          item.id in temporaryItems ||
+          item.data.operationType === "Outside Processing",
+        label: (
+          <span className="flex items-center gap-2">
+            <span>
+              <Trans>Tools</Trans>
+            </span>
+            {tools.length > 0 && <Count count={tools.length} />}
+          </span>
+        ),
+        content: (
+          <div className="flex w-full flex-col py-4">
+            <ToolsForm
+              tools={tools}
+              operationId={item.id!}
+              isDisabled={
+                selectedItemId === null || !!temporaryItems[selectedItemId!]
+              }
+              temporaryItems={temporaryItems}
+            />
+          </div>
+        )
+      }
+    ];
+
+    return (
+      <SortableListItem<Operation>
+        isReadOnly={isReadOnly}
+        item={item}
+        items={items}
+        order={order}
+        key={item.id}
+        isExpanded={isOpen}
+        onSelectItem={setSelectedItemId}
+        onToggleItem={onToggleItem}
+        onRemoveItem={onRemoveItem}
+        handleDrag={onCloseOnDrag}
+        renderExtra={(item) => (
+          <div>
+            <SortableListItemToggle
+              isOpen={isOpen}
+              onToggle={() => setSelectedItemId(isOpen ? null : item.id)}
+            />
+            <SortableListItemPanel isOpen={isOpen}>
+              <DirectionAwareTabs
+                className="mr-auto"
+                tabs={tabs}
+                onChange={() => setTabChangeRerender(tabChangeRerender + 1)}
+              />
+            </SortableListItemPanel>
+          </div>
+        )}
+      />
+    );
+  };
+
+  return (
+    <Card>
+      <HStack className="justify-between">
+        <CardHeader>
+          <CardTitle>
+            <Trans>Bill of Process</Trans>
+          </CardTitle>
+        </CardHeader>
+
+        <CardAction>
+          <Button
+            ref={addOperationButtonRef}
+            variant="secondary"
+            isDisabled={
+              !permissions.can("update", "sales") ||
+              selectedItemId !== null ||
+              isDisabled
+            }
+            onClick={onAddItem}
+          >
+            <Trans>Add Operation</Trans>
+          </Button>
+        </CardAction>
+      </HStack>
+      <CardContent>
+        <SortableList
+          isReadOnly={isReadOnly}
+          items={items}
+          onReorder={onReorder}
+          onToggleItem={onToggleItem}
+          onRemoveItem={onRemoveItem}
+          renderItem={renderListItem}
+        />
+      </CardContent>
+    </Card>
+  );
+};
+
+export default QuoteBillOfProcess;
+
+function AttributesForm({
+  operationId,
+  isDisabled,
+  steps,
+  temporaryItems,
+  itemMentions
+}: {
+  operationId: string;
+  isDisabled: boolean;
+  steps: OperationStep[];
+  temporaryItems: TemporaryItems;
+  itemMentions: { id: string; label: string }[];
+}) {
+  const { t } = useLingui();
+  const fetcher = useFetcher<typeof newQuoteOperationParameterAction>();
+  const sortOrderFetcher = useFetcher<{ success: boolean }>();
+  const [type, setType] = useState<OperationStep["type"]>("Task");
+  const [numericControls, setNumericControls] = useState<string[]>([]);
+
+  // Initialize sort order state based on existing steps
+  const [sortOrder, setSortOrder] = useState<string[]>(() =>
+    [...steps]
+      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))
+      .map((step) => step.id || "")
+  );
+
+  // Update sort order when steps change
+  useEffect(() => {
+    // Also when the last step is deleted: its id must leave the order.
+    if (steps) {
+      const sorted = [...steps]
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))
+        .map((step) => step.id || "");
+      setSortOrder(sorted);
+    }
+  }, [steps]);
+
+  const onReorder = (newOrder: string[]) => {
+    if (isDisabled) return;
+
+    const updates: Record<string, number> = {};
+    newOrder.forEach((id, index) => {
+      updates[id] = index + 1;
+    });
+    setSortOrder(newOrder);
+    updateSortOrder(updates);
+  };
+
+  const updateSortOrder = useDebounce(
+    (updates: Record<string, number>) => {
+      let formData = new FormData();
+      formData.append("updates", JSON.stringify(updates));
+      sortOrderFetcher.submit(formData, {
+        method: "post",
+        action: path.to.quoteOperationStepOrder(operationId)
+      });
+    },
+    1000,
+    true
+  );
+
+  const [description, setDescription] = useState<JSONContent>({});
+
+  const onUploadImage = useImageUpload("parts");
+
+  const typeOptions = useMemo(
+    () =>
+      procedureStepType.map((type) => ({
+        label: (
+          <HStack>
+            <ProcedureStepTypeIcon type={type} className="mr-2" />
+            {type}
+          </HStack>
+        ),
+        value: type
+      })),
+    []
+  );
+
+  if (isDisabled && temporaryItems[operationId]) {
+    return (
+      <Alert className="max-w-[420px] mx-auto my-8">
+        <LuTriangleAlert />
+        <AlertTitle>
+          <Trans>Cannot add steps to unsaved operation</Trans>
+        </AlertTitle>
+        <AlertDescription>
+          Please save the operation before adding steps.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  return (
+    <Loading
+      className="flex flex-col gap-6"
+      isLoading={fetcher.state !== "idle"}
+      // this is a hack to re-render the editor component when the form is submitted with the default values
+    >
+      <div className="p-6 border rounded-lg bg-card mb-6">
+        <ValidatedForm
+          action={path.to.newQuoteOperationStep}
+          method="post"
+          validator={operationStepValidator}
+          fetcher={fetcher}
+          resetAfterSubmit
+          defaultValues={{
+            id: undefined,
+            name: "",
+            description: "",
+            type: "Task",
+            unitOfMeasureCode: "",
+            minValue: 0,
+            maxValue: 0,
+            listValues: [],
+            sortOrder:
+              steps.reduce((acc, a) => Math.max(acc, a.sortOrder ?? 0), 0) + 1,
+            operationId
+          }}
+          onSubmit={() => {
+            setType("Value");
+            setDescription([]);
+          }}
+          className="w-full"
+        >
+          <Hidden name="operationId" />
+          <Hidden name="sortOrder" />
+          <Hidden name="description" value={JSON.stringify(description)} />
+          <VStack spacing={4}>
+            <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+              <SelectControlled
+                name="type"
+                label={t`Type`}
+                options={typeOptions}
+                value={type}
+                onChange={(option) => {
+                  if (option) {
+                    setType(option.value as OperationStep["type"]);
+                  }
+                }}
+              />
+              <Input name="name" label={t`Name`} />
+            </div>
+
+            <VStack
+              spacing={2}
+              className="w-full col-span-2 max-md:col-span-full"
+            >
+              <Label>Description</Label>
+              <Editor
+                initialValue={description}
+                onUpload={onUploadImage}
+                onChange={(value) => {
+                  setDescription(value);
+                }}
+                mentions={[{ char: "@", items: itemMentions }]}
+                className="[&_.is-empty]:text-muted-foreground min-h-[120px] p-4 rounded-lg border w-full"
+              />
+            </VStack>
+
+            {type === "Measurement" && (
+              <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+                <UnitOfMeasure
+                  name="unitOfMeasureCode"
+                  label={t`Unit of Measure`}
+                />
+
+                <ToggleGroup
+                  type="multiple"
+                  value={numericControls}
+                  onValueChange={setNumericControls}
+                  className="justify-start items-start mt-6"
+                >
+                  <ToggleGroupItem size="sm" value="min">
+                    <LuMinimize2 className="mr-2" />
+                    Minimum
+                  </ToggleGroupItem>
+                  <ToggleGroupItem size="sm" value="max">
+                    <LuMaximize2 className="mr-2" />
+                    Maximum
+                  </ToggleGroupItem>
+                </ToggleGroup>
+
+                {numericControls.includes("min") && (
+                  <Number
+                    name="minValue"
+                    label={t`Minimum`}
+                    formatOptions={{
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 10
+                    }}
+                  />
+                )}
+                {numericControls.includes("max") && (
+                  <Number
+                    name="maxValue"
+                    label={t`Maximum`}
+                    formatOptions={{
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 10
+                    }}
+                  />
+                )}
+              </div>
+            )}
+            {type === "List" && (
+              <ArrayInput name="listValues" label={t`List Options`} />
+            )}
+
+            <Submit
+              leftIcon={<LuCirclePlus />}
+              isDisabled={isDisabled || fetcher.state !== "idle"}
+              isLoading={fetcher.state !== "idle"}
+            >
+              Save Step
+            </Submit>
+          </VStack>
+        </ValidatedForm>
+      </div>
+
+      {steps.length > 0 && (
+        <div className="border rounded-lg">
+          <Reorder.Group
+            axis="y"
+            values={sortOrder}
+            onReorder={onReorder}
+            className="w-full"
+          >
+            {sortOrder.map((stepId) => {
+              const step = steps.find((s) => s.id === stepId);
+              if (!step) return null;
+              const index = sortOrder.indexOf(stepId);
+              return (
+                <DraggableStepItem
+                  key={stepId}
+                  stepId={stepId}
+                  isDisabled={isDisabled}
+                >
+                  {(dragControls) => (
+                    <AttributesListItem
+                      attribute={step}
+                      operationId={operationId}
+                      typeOptions={typeOptions}
+                      isDisabled={isDisabled}
+                      dragControls={dragControls}
+                      itemMentions={itemMentions}
+                      className={cn(
+                        index === 0 && "rounded-t-lg",
+                        index === sortOrder.length - 1 &&
+                          "rounded-b-lg border-none"
+                      )}
+                    />
+                  )}
+                </DraggableStepItem>
+              );
+            })}
+          </Reorder.Group>
+        </div>
+      )}
+    </Loading>
+  );
+}
+
+function DraggableStepItem({
+  stepId,
+  isDisabled,
+  children
+}: {
+  stepId: string;
+  isDisabled: boolean;
+  children: (dragControls: DragControls) => ReactNode;
+}) {
+  const dragControls = useDragControls();
+  return (
+    <Reorder.Item
+      key={stepId}
+      value={stepId}
+      dragListener={false}
+      dragControls={dragControls}
+    >
+      {children(dragControls)}
+    </Reorder.Item>
+  );
+}
+
+function AttributesListItem({
+  attribute,
+  operationId,
+  typeOptions,
+  isDisabled = false,
+  dragControls,
+  itemMentions,
+  className
+}: {
+  attribute: OperationStep;
+  operationId: string;
+  typeOptions: { label: JSX.Element; value: string }[];
+  isDisabled?: boolean;
+  dragControls?: DragControls;
+  itemMentions: { id: string; label: string }[];
+  className?: string;
+}) {
+  const { t } = useLingui();
+  const {
+    name,
+    unitOfMeasureCode,
+    minValue,
+    maxValue,
+    id,
+    updatedBy,
+    updatedAt,
+    createdBy,
+    createdAt
+  } = attribute;
+
+  const disclosure = useDisclosure();
+  const deleteModalDisclosure = useDisclosure();
+  const submitted = useRef(false);
+  const fetcher = useAction<typeof editQuoteOperationStepAction>({
+    onSettled: () => {
+      if (submitted.current) {
+        disclosure.onClose();
+        submitted.current = false;
+      }
+    }
+  });
+
+  const [type, setType] = useState<OperationStep["type"]>(attribute.type);
+
+  const [numericControls, setNumericControls] = useState<string[]>(() => {
+    const controls = [];
+    if (type === "Measurement") {
+      if (minValue !== null) {
+        controls.push("min");
+      }
+      if (maxValue !== null) {
+        controls.push("max");
+      }
+    }
+    return controls;
+  });
+
+  const isUpdated = updatedBy !== null;
+  const person = isUpdated ? updatedBy : createdBy;
+  const date = updatedAt ?? createdAt;
+
+  const unitOfMeasures = useUnitOfMeasure();
+
+  const [description, setDescription] = useState<JSONContent>(
+    attribute.description ?? {}
+  );
+
+  const onUploadImage = useImageUpload("parts");
+
+  if (!id) return null;
+
+  return (
+    <div className={cn("border-b p-6 bg-card", className)}>
+      {disclosure.isOpen ? (
+        <ValidatedForm
+          action={path.to.quoteOperationStep(id)}
+          method="post"
+          validator={operationStepValidator}
+          fetcher={fetcher}
+          resetAfterSubmit
+          onSubmit={() => {
+            disclosure.onClose();
+            setType("Task");
+            setDescription({});
+          }}
+          defaultValues={{
+            ...attribute,
+            operationId
+          }}
+          className="w-full"
+        >
+          <Hidden name="operationId" />
+          <Hidden name="description" value={JSON.stringify(description)} />
+          <VStack spacing={4}>
+            <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+              <SelectControlled
+                name="type"
+                label={t`Type`}
+                options={typeOptions}
+                onChange={(option) => {
+                  if (option) {
+                    setType(option.value as OperationStep["type"]);
+                  }
+                }}
+              />
+              <Input name="name" label={t`Name`} />
+            </div>
+
+            <VStack
+              spacing={2}
+              className="w-full col-span-2 max-md:col-span-full"
+            >
+              <Label>Description</Label>
+              <Editor
+                initialValue={description}
+                onUpload={onUploadImage}
+                onChange={(value) => {
+                  setDescription(value);
+                }}
+                mentions={[{ char: "@", items: itemMentions }]}
+                className="[&_.is-empty]:text-muted-foreground min-h-[120px] p-4 rounded-lg border w-full"
+              />
+            </VStack>
+
+            {type === "Measurement" && (
+              <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+                <UnitOfMeasure
+                  name="unitOfMeasureCode"
+                  label={t`Unit of Measure`}
+                />
+
+                <ToggleGroup
+                  type="multiple"
+                  value={numericControls}
+                  onValueChange={setNumericControls}
+                  className="justify-start items-start mt-6"
+                >
+                  <ToggleGroupItem size="sm" value="min">
+                    <LuMinimize2 className="mr-2" />
+                    Minimum
+                  </ToggleGroupItem>
+                  <ToggleGroupItem size="sm" value="max">
+                    <LuMaximize2 className="mr-2" />
+                    Maximum
+                  </ToggleGroupItem>
+                </ToggleGroup>
+
+                {numericControls.includes("min") && (
+                  <Number
+                    name="minValue"
+                    label={t`Minimum`}
+                    formatOptions={{
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 10
+                    }}
+                  />
+                )}
+                {numericControls.includes("max") && (
+                  <Number
+                    name="maxValue"
+                    label={t`Maximum`}
+                    formatOptions={{
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 10
+                    }}
+                  />
+                )}
+              </div>
+            )}
+            {type === "List" && (
+              <ArrayInput name="listValues" label={t`List Options`} />
+            )}
+            <HStack className="w-full justify-end" spacing={2}>
+              <Button variant="secondary" onClick={disclosure.onClose}>
+                <Trans>Cancel</Trans>
+              </Button>
+              <Submit
+                isDisabled={fetcher.state !== "idle"}
+                isLoading={fetcher.state !== "idle"}
+              >
+                <Trans>Save</Trans>
+              </Submit>
+            </HStack>
+          </VStack>
+        </ValidatedForm>
+      ) : (
+        <div className="flex flex-1 justify-between items-center w-full">
+          <HStack spacing={4} className="w-1/2">
+            <IconButton
+              aria-label={t`Drag handle`}
+              icon={<LuGripVertical />}
+              variant="ghost"
+              disabled={isDisabled}
+              className="cursor-grab active:cursor-grabbing"
+              onPointerDown={(e) => {
+                if (!isDisabled && dragControls) dragControls.start(e);
+              }}
+              style={{ touchAction: "none" }}
+            />
+            <HStack spacing={4} className="flex-1">
+              <div className="bg-muted border rounded-full flex items-center justify-center p-2">
+                <ProcedureStepTypeIcon type={type} />
+              </div>
+              <VStack spacing={0}>
+                <HStack>
+                  <p className="text-foreground text-sm font-medium">
+                    {attribute.name}
+                  </p>
+                  {attribute.description &&
+                    Object.keys(attribute.description).length > 0 && (
+                      <Tooltip>
+                        <TooltipTrigger>
+                          <LuInfo className="text-muted-foreground size-3" />
+                        </TooltipTrigger>
+                        <TooltipContent side="right">
+                          <p
+                            className="prose prose-sm dark:prose-invert text-foreground text-sm"
+                            dangerouslySetInnerHTML={{
+                              __html: generateHTML(attribute.description)
+                            }}
+                          />
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
+                </HStack>
+                {attribute.type === "Measurement" && (
+                  <span className="text-xs text-muted-foreground">
+                    {attribute.minValue !== null && attribute.maxValue !== null
+                      ? `Must be between ${attribute.minValue} and ${
+                          attribute.maxValue
+                        } ${
+                          unitOfMeasures.find(
+                            (u) => u.value === unitOfMeasureCode
+                          )?.label
+                        }`
+                      : attribute.minValue !== null
+                        ? `Must be > ${attribute.minValue} ${
+                            unitOfMeasures.find(
+                              (u) => u.value === unitOfMeasureCode
+                            )?.label
+                          }`
+                        : attribute.maxValue !== null
+                          ? `Must be < ${attribute.maxValue} ${
+                              unitOfMeasures.find(
+                                (u) => u.value === unitOfMeasureCode
+                              )?.label
+                            }`
+                          : null}
+                  </span>
+                )}
+              </VStack>
+
+              {attribute.type === "List" &&
+                Array.isArray(attribute.listValues) && (
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <LuList className="size-4 text-muted-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {attribute.listValues.map((value) => (
+                        <p key={value} className="text-foreground text-sm">
+                          {value}
+                        </p>
+                      ))}
+                    </TooltipContent>
+                  </Tooltip>
+                )}
+            </HStack>
+          </HStack>
+          <div className="flex items-center justify-end gap-2">
+            <HStack spacing={2}>
+              <span className="text-xs text-muted-foreground">
+                {isUpdated ? "Updated" : "Created"}{" "}
+                <DateTime value={date} variant="relative" />
+              </span>
+              <EmployeeAvatar employeeId={person} withName={false} />
+            </HStack>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  aria-label={t`Open menu`}
+                  icon={<LuEllipsisVertical />}
+                  variant="ghost"
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.edit}
+                  onClick={disclosure.onOpen}
+                >
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.delete}
+                  destructive
+                  onClick={deleteModalDisclosure.onOpen}
+                >
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+      )}
+      {deleteModalDisclosure.isOpen && (
+        <ConfirmDelete
+          action={path.to.deleteQuoteOperationStep(id)}
+          isOpen={deleteModalDisclosure.isOpen}
+          name={name}
+          text={t`Are you sure you want to delete the ${name} attribute from this operation? This cannot be undone.`}
+          onCancel={() => {
+            deleteModalDisclosure.onClose();
+          }}
+          onSubmit={() => {
+            deleteModalDisclosure.onClose();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ParametersForm({
+  operationId,
+  isDisabled,
+  parameters,
+  temporaryItems
+}: {
+  operationId: string;
+  isDisabled: boolean;
+  parameters: OperationParameter[];
+  temporaryItems: TemporaryItems;
+}) {
+  const { t } = useLingui();
+  const fetcher = useFetcher<typeof newQuoteOperationParameterAction>();
+
+  if (isDisabled && temporaryItems[operationId]) {
+    return (
+      <Alert className="max-w-[420px] mx-auto my-8">
+        <LuTriangleAlert />
+        <AlertTitle>
+          <Trans>Cannot add parameters to unsaved operation</Trans>
+        </AlertTitle>
+        <AlertDescription>
+          Please save the operation before adding parameters.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="p-6 border rounded-lg bg-card">
+        <ValidatedForm
+          action={path.to.newQuoteOperationParameter}
+          method="post"
+          validator={operationParameterValidator}
+          fetcher={fetcher}
+          resetAfterSubmit
+          defaultValues={{
+            id: undefined,
+            key: "",
+            value: "",
+            operationId
+          }}
+          className="w-full"
+        >
+          <Hidden name="operationId" />
+          <VStack spacing={4}>
+            <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+              <Input
+                name="key"
+                label={t`Key`}
+                autoFocus={parameters.length === 0}
+              />
+              <Input name="value" label={t`Value`} />
+            </div>
+            <Submit
+              leftIcon={<LuCirclePlus />}
+              isDisabled={isDisabled || fetcher.state !== "idle"}
+              isLoading={fetcher.state !== "idle"}
+            >
+              Add Parameter
+            </Submit>
+          </VStack>
+        </ValidatedForm>
+      </div>
+
+      {parameters.length > 0 && (
+        <div className="border rounded-lg">
+          {[...parameters]
+            .sort((a, b) =>
+              String(a.id ?? "").localeCompare(String(b.id ?? ""))
+            )
+            .map((p, index) => (
+              <ParametersListItem
+                key={p.id}
+                parameter={p}
+                operationId={operationId}
+                className={cn(
+                  index === 0 && "rounded-t-lg",
+                  index === parameters.length - 1 && "rounded-b-lg border-none"
+                )}
+              />
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ParametersListItem({
+  parameter: { key, value, id, updatedBy, updatedAt, createdBy, createdAt },
+  operationId,
+  className
+}: {
+  parameter: OperationParameter;
+  operationId: string;
+  className?: string;
+}) {
+  const { t } = useLingui();
+  const disclosure = useDisclosure();
+  const deleteModalDisclosure = useDisclosure();
+  const submitted = useRef(false);
+  const fetcher = useAction<typeof editQuoteOperationParameterAction>({
+    onSettled: () => {
+      if (submitted.current) {
+        disclosure.onClose();
+        submitted.current = false;
+      }
+    }
+  });
+
+  const isUpdated = updatedBy !== null;
+  const person = isUpdated ? updatedBy : createdBy;
+  const date = updatedAt ?? createdAt;
+
+  if (!id) return null;
+
+  return (
+    <div className={cn("border-b p-6 bg-card", className)}>
+      {disclosure.isOpen ? (
+        <ValidatedForm
+          action={path.to.quoteOperationParameter(id)}
+          method="post"
+          validator={operationParameterValidator}
+          fetcher={fetcher}
+          resetAfterSubmit
+          onSubmit={() => {
+            disclosure.onClose();
+          }}
+          defaultValues={{
+            id: id,
+            key: key ?? "",
+            value: value ?? "",
+            operationId
+          }}
+          className="w-full"
+        >
+          <Hidden name="operationId" />
+          <VStack spacing={4}>
+            <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+              <Input name="key" label={t`Key`} />
+              <Input name="value" label={t`Value`} />
+            </div>
+            <HStack className="w-full justify-end" spacing={2}>
+              <Button variant="secondary" onClick={disclosure.onClose}>
+                Cancel
+              </Button>
+              <Submit
+                isDisabled={fetcher.state !== "idle"}
+                isLoading={fetcher.state !== "idle"}
+              >
+                Save
+              </Submit>
+            </HStack>
+          </VStack>
+        </ValidatedForm>
+      ) : (
+        <div className="flex flex-1 justify-between items-center w-full">
+          <HStack spacing={4} className="w-1/2">
+            <HStack spacing={4} className="flex-1">
+              <div className="bg-muted border rounded-full flex items-center justify-center p-2">
+                <LuActivity className="size-4" />
+              </div>
+              <VStack spacing={0}>
+                <span className="text-sm font-medium">{key}</span>
+              </VStack>
+              <span className="text-base text-muted-foreground text-right">
+                {value}
+              </span>
+            </HStack>
+          </HStack>
+          <div className="flex items-center justify-end gap-2">
+            <HStack spacing={2}>
+              <span className="text-xs text-muted-foreground">
+                {isUpdated ? "Updated" : "Created"}{" "}
+                <DateTime value={date} variant="relative" />
+              </span>
+              <EmployeeAvatar employeeId={person} withName={false} />
+            </HStack>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  aria-label="Open menu"
+                  icon={<LuEllipsisVertical />}
+                  variant="ghost"
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.edit}
+                  onClick={disclosure.onOpen}
+                >
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.delete}
+                  destructive
+                  onClick={deleteModalDisclosure.onOpen}
+                >
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+      )}
+      {deleteModalDisclosure.isOpen && (
+        <ConfirmDelete
+          action={path.to.deleteQuoteOperationParameter(id)}
+          isOpen={deleteModalDisclosure.isOpen}
+          name={key}
+          text={t`Are you sure you want to delete the ${key} parameter from this operation? This cannot be undone.`}
+          onCancel={() => {
+            deleteModalDisclosure.onClose();
+          }}
+          onSubmit={() => {
+            deleteModalDisclosure.onClose();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function OperationForm({
+  item,
+  itemId,
+  isDisabled,
+  workInstruction,
+  setWorkInstructions,
+  setTemporaryItems,
+  setSelectedItemId,
+  temporaryItems,
+  onSubmit
+}: {
+  item: ItemWithData;
+  itemId: string;
+  isDisabled: boolean;
+  workInstruction: JSONContent;
+  setWorkInstructions: Dispatch<SetStateAction<PendingWorkInstructions>>;
+  setTemporaryItems: Dispatch<SetStateAction<TemporaryItems>>;
+  setSelectedItemId: Dispatch<SetStateAction<string | null>>;
+  temporaryItems: TemporaryItems;
+  onSubmit: () => void;
+}) {
+  const { t } = useLingui();
+  const { quoteId, lineId } = useParams();
+  const { company } = useUser();
+  if (!quoteId) throw new Error("quoteId not found");
+  if (!lineId) throw new Error("lineId not found");
+
+  const fetcher = useFetcher<{
+    id: string;
+    success: boolean;
+    message: string;
+  }>();
+  const { carbon } = useCarbon();
+
+  const baseCurrency = company?.baseCurrencyCode ?? "USD";
+  const currencyDecimals = useCurrencyDecimals(baseCurrency);
+
+  useEffect(() => {
+    if (fetcher.data && fetcher.data.id) {
+      // Clear temporary item after successful save
+      setTemporaryItems((prev) => {
+        const { [item.id]: _, ...rest } = prev;
+        return rest;
+      });
+
+      if (fetcher.data?.success) {
+        toast.success(fetcher.data.message);
+      }
+      onSubmit();
+    }
+  }, [item.id, fetcher.data, setTemporaryItems, onSubmit]);
+
+  const machineDisclosure = useDisclosure();
+  const assemblyDisclosure = useDisclosure();
+  const laborDisclosure = useDisclosure();
+  const setupDisclosure = useDisclosure();
+  const costingDisclosure = useDisclosure();
+  const procedureDisclosure = useDisclosure();
+
+  const [processData, setProcessData] = useState<{
+    description: string;
+    laborRate: number;
+    laborTime: number;
+    laborUnit: string;
+    laborUnitHint: string;
+    machineRate: number;
+    machineTime: number;
+    machineUnit: string;
+    machineUnitHint: string;
+    operationMinimumCost: number;
+    operationLeadTime: number;
+    operationType: string;
+    assemblyInstructionId: string;
+    inspectionDocumentId: string;
+    operationUnitCost: number;
+    overheadRate: number;
+    processId: string;
+    procedureId: string;
+    setupTime: number;
+    setupUnit: string;
+    setupUnitHint: string;
+  }>({
+    description: item.data.description ?? "",
+    laborRate: item.data.laborRate ?? 0,
+    laborTime: item.data.laborTime ?? 0,
+    laborUnit: item.data.laborUnit ?? "Hours/Piece",
+    laborUnitHint: getUnitHint(item.data.laborUnit),
+    machineRate: item.data.machineRate ?? 0,
+    machineTime: item.data.machineTime ?? 0,
+    machineUnit: item.data.machineUnit ?? "Hours/Piece",
+    machineUnitHint: getUnitHint(item.data.machineUnit),
+    operationMinimumCost: item.data.operationMinimumCost ?? 0,
+    operationLeadTime: item.data.operationLeadTime ?? 0,
+    operationType: item.data.operationType ?? "Process",
+    assemblyInstructionId: item.data.assemblyInstructionId ?? "",
+    inspectionDocumentId: item.data.inspectionDocumentId ?? "",
+    operationUnitCost: item.data.operationUnitCost ?? 0,
+    overheadRate: item.data.overheadRate ?? 0,
+    processId: item.data.processId ?? "",
+    procedureId: item.data.procedureId ?? "",
+    setupTime: item.data.setupTime ?? 0,
+    setupUnit: item.data.setupUnit ?? "Total Minutes",
+    setupUnitHint: getUnitHint(item.data.setupUnit)
+  });
+
+  const onProcessChange = async (processId: string) => {
+    if (!carbon || !processId) return;
+    const [process, workCenters, supplierProcesses] = await Promise.all([
+      carbon.from("process").select("*").eq("id", processId).single(),
+      carbon
+        .from("workCenterProcess")
+        .select("workCenter(*)")
+        .eq("processId", processId)
+        .eq("workCenter.active", true),
+      carbon.from("supplierProcess").select("*").eq("processId", processId)
+    ]);
+
+    const activeWorkCenters =
+      workCenters?.data?.filter((wc) => Boolean(wc.workCenter)) ?? [];
+
+    if (process.error) throw new Error(process.error.message);
+
+    setProcessData((p) => ({
+      ...p,
+      processId,
+      procedureId: "",
+      description: process.data?.name ?? "",
+      laborUnit: process.data?.defaultStandardFactor ?? "Hours/Piece",
+      laborUnitHint: getUnitHint(process.data?.defaultStandardFactor),
+      laborRate:
+        // get the average labor rate from the work centers
+        activeWorkCenters.length
+          ? activeWorkCenters.reduce((acc, workCenter) => {
+              return (acc += workCenter.workCenter?.laborRate ?? 0);
+            }, 0) / activeWorkCenters.length
+          : p.laborRate,
+      machineUnit: process.data?.defaultStandardFactor ?? "Hours/Piece",
+      machineUnitHint: getUnitHint(process.data?.defaultStandardFactor),
+      machineRate:
+        // get the average labor rate from the work centers
+        activeWorkCenters.length
+          ? activeWorkCenters.reduce((acc, workCenter) => {
+              return (acc += workCenter.workCenter?.machineRate ?? 0);
+            }, 0) / activeWorkCenters.length
+          : p.machineRate,
+      // get the average quoting rate from the work centers
+      overheadRate: activeWorkCenters.length
+        ? activeWorkCenters?.reduce((acc, workCenter) => {
+            return (acc += workCenter.workCenter?.overheadRate ?? 0);
+          }, 0) / activeWorkCenters.length
+        : p.overheadRate,
+      operationMinimumCost:
+        supplierProcesses.data && supplierProcesses.data.length > 0
+          ? supplierProcesses.data.reduce((acc, sp) => {
+              return (acc += sp.minimumCost ?? 0);
+            }, 0) / supplierProcesses.data.length
+          : p.operationMinimumCost,
+      operationUnitCost: item.data.operationUnitCost ?? 0,
+      operationLeadTime:
+        supplierProcesses.data && supplierProcesses.data.length > 0
+          ? supplierProcesses.data.reduce((acc, sp) => {
+              return (acc += sp.leadTime ?? 0);
+            }, 0) / supplierProcesses.data.length
+          : p.operationLeadTime,
+      // processType and operationType share one enum — the process's type is the
+      // default operation type.
+      operationType: process.data?.processType ?? "Process"
+    }));
+  };
+
+  const onWorkCenterChange = async (workCenterId: string | null) => {
+    if (!carbon) return;
+    if (!workCenterId) {
+      // get the average costs
+      await onProcessChange(processData.processId);
+      return;
+    }
+
+    const { data, error } = await carbon
+      .from("workCenter")
+      .select("*")
+      .eq("id", workCenterId)
+      .single();
+
+    if (error) throw new Error(error.message);
+
+    setProcessData((d) => ({
+      ...d,
+      laborRate: data?.laborRate ?? 0,
+      laborUnit: data?.defaultStandardFactor ?? "Hours/Piece",
+      laborUnitHint: getUnitHint(data?.defaultStandardFactor),
+      machineRate: data?.machineRate ?? 0,
+      machineUnit: data?.defaultStandardFactor ?? "Hours/Piece",
+      machineUnitHint: getUnitHint(data?.defaultStandardFactor),
+      overheadRate: data?.overheadRate ?? 0
+    }));
+  };
+
+  const onSupplierProcessChange = async (supplierProcessId: string) => {
+    if (!carbon) return;
+    const { data, error } = await carbon
+      .from("supplierProcess")
+      .select("*")
+      .eq("id", supplierProcessId)
+      .single();
+
+    if (error) throw new Error(error.message);
+
+    setProcessData((d) => ({
+      ...d,
+      operationMinimumCost: data?.minimumCost ?? 0,
+      operationUnitCost: 0, // TODO: get the unit cost from the purchase order history
+      operationLeadTime: data?.leadTime ?? 0
+    }));
+  };
+
+  return (
+    <ValidatedForm
+      action={
+        temporaryItems[item.id]
+          ? path.to.newQuoteOperation(quoteId, lineId)
+          : path.to.quoteOperation(quoteId, lineId, item.id!)
+      }
+      method="post"
+      defaultValues={item.data}
+      validator={quoteOperationValidator}
+      className="w-full flex flex-col gap-y-4"
+      fetcher={fetcher}
+    >
+      <div>
+        <Hidden name="id" />
+        <Hidden name="quoteMakeMethodId" />
+        <Hidden name="order" />
+      </div>
+      <div className="grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-3">
+        <Process
+          name="processId"
+          label={t`Process`}
+          onChange={(value) => {
+            onProcessChange(value?.value as string);
+          }}
+        />
+        <SelectControlled
+          name="operationType"
+          label={t`Operation Type`}
+          termId="operation-type"
+          placeholder={t`Operation Type`}
+          options={operationTypes.map((o) => ({
+            value: o,
+            label: (
+              <span className="flex items-center gap-2">
+                <OperationTypeIcon type={o} />
+                <span>{o}</span>
+              </span>
+            )
+          }))}
+          value={processData.operationType}
+          onChange={(value) => {
+            const next = (value?.value as string) ?? "Process";
+            setProcessData((d) => ({
+              ...d,
+              operationType: next,
+              // Each type has exactly one instruction source — clear the ones
+              // that no longer apply (the upsert normalizes server-side too).
+              ...(next !== "Process" ? { procedureId: "" } : {}),
+              ...(next !== "Assembly" ? { assemblyInstructionId: "" } : {}),
+              ...(next !== "Inspection" ? { inspectionDocumentId: "" } : {}),
+              // Machine only applies to Process operations.
+              ...(next !== "Process" ? { machineTime: 0 } : {}),
+              // Crossing the in-house <-> Outside Processing boundary changes the
+              // meaningful time units; reset to defaults. Switching between in-house
+              // types keeps whatever units the user picked.
+              ...((next === "Outside Processing") !==
+              (d.operationType === "Outside Processing")
+                ? {
+                    setupUnit: "Total Minutes",
+                    laborUnit: "Minutes/Piece",
+                    machineUnit: "Minutes/Piece"
+                  }
+                : {})
+            }));
+          }}
+        />
+
+        {processData.operationType === "Outside Processing" ? (
+          <>
+            <SupplierProcess
+              name="operationSupplierProcessId"
+              label={t`Supplier`}
+              processId={processData.processId}
+              isOptional
+              onChange={(value) => {
+                if (value) {
+                  onSupplierProcessChange(value?.value as string);
+                }
+              }}
+            />
+            <NumberControlled
+              name="operationMinimumCost"
+              label={t`Minimum Cost`}
+              minValue={0}
+              value={processData.operationMinimumCost}
+              formatOptions={INPUT_FORMAT.rate(baseCurrency, currencyDecimals)}
+              onChange={(newValue) =>
+                setProcessData((d) => ({
+                  ...d,
+                  operationMinimumCost: newValue
+                }))
+              }
+            />
+            <NumberControlled
+              name="operationUnitCost"
+              label={t`Unit Cost`}
+              minValue={0}
+              value={processData.operationUnitCost}
+              formatOptions={INPUT_FORMAT.rate(baseCurrency, currencyDecimals)}
+              onChange={(newValue) =>
+                setProcessData((d) => ({
+                  ...d,
+                  operationUnitCost: newValue
+                }))
+              }
+            />
+            <NumberControlled
+              name="operationLeadTime"
+              label={t`Lead Time`}
+              minValue={0}
+              value={processData.operationLeadTime}
+              onChange={(newValue) =>
+                setProcessData((d) => ({
+                  ...d,
+                  operationLeadTime: newValue
+                }))
+              }
+            />
+          </>
+        ) : (
+          <WorkCenter
+            name="workCenterId"
+            label={t`Work Center`}
+            isOptional
+            processId={processData.processId}
+            onChange={(value) => {
+              if (value) {
+                onWorkCenterChange(value?.value as string);
+              }
+            }}
+            termId="work-center"
+          />
+        )}
+
+        <InputControlled
+          name="description"
+          label={t`Description`}
+          value={processData.description}
+          onChange={(newValue) => {
+            setProcessData((d) => ({ ...d, description: newValue }));
+          }}
+          className="col-span-2 max-md:col-span-full"
+        />
+
+        <Select
+          name="operationOrder"
+          label={t`Operation Order`}
+          placeholder={t`Operation Order`}
+          options={methodOperationOrders.map((o) => ({
+            value: o,
+            label: o
+          }))}
+        />
+      </div>
+
+      {processData.operationType !== "Outside Processing" && (
+        <>
+          <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4">
+            <HStack
+              className="w-full justify-between cursor-pointer"
+              onClick={setupDisclosure.onToggle}
+            >
+              <HStack>
+                <TimeTypeIcon type="Setup" />
+                <Label>
+                  <Trans>Setup</Trans>
+                </Label>
+              </HStack>
+              <HStack>
+                {(processData.setupTime ?? 0) > 0 && (
+                  <Badge variant="secondary">
+                    <TimeTypeIcon type="Setup" className="h-3 w-3 mr-1" />
+                    {processData.setupTime} {processData.setupUnit}
+                  </Badge>
+                )}
+                <IconButton
+                  icon={<LuChevronRight />}
+                  aria-label={
+                    setupDisclosure.isOpen ? t`Collapse Setup` : t`Expand Setup`
+                  }
+                  variant="ghost"
+                  size="md"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setupDisclosure.onToggle();
+                  }}
+                  className={`transition-transform ${
+                    setupDisclosure.isOpen ? "rotate-90" : ""
+                  }`}
+                />
+              </HStack>
+            </HStack>
+            <div
+              className={`grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-3 pb-4 ${
+                setupDisclosure.isOpen ? "" : "hidden"
+              }`}
+            >
+              <UnitHint
+                name="setupHint"
+                label={t`Setup`}
+                value={processData.setupUnitHint}
+                onChange={(hint) => {
+                  setProcessData((d) => ({
+                    ...d,
+                    setupUnitHint: hint,
+                    setupUnit:
+                      hint === "Fixed" ? "Total Minutes" : "Minutes/Piece"
+                  }));
+                }}
+              />
+              <NumberControlled
+                name="setupTime"
+                label={t`Setup Time`}
+                isOptional={false}
+                minValue={0}
+                value={processData.setupTime}
+                onChange={(newValue) =>
+                  setProcessData((d) => ({
+                    ...d,
+                    setupTime: newValue
+                  }))
+                }
+              />
+              <StandardFactor
+                name="setupUnit"
+                label={t`Setup Unit`}
+                isOptional={false}
+                hint={processData.setupUnitHint}
+                value={processData.setupUnit}
+                onChange={(newValue) => {
+                  setProcessData((d) => ({
+                    ...d,
+                    setupUnit: newValue?.value ?? "Total Minutes"
+                  }));
+                }}
+              />
+            </div>
+          </div>
+          <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4">
+            <HStack
+              className="w-full justify-between cursor-pointer"
+              onClick={laborDisclosure.onToggle}
+            >
+              <HStack>
+                <TimeTypeIcon type="Labor" />
+                <Label>
+                  <Trans>Labor</Trans>
+                </Label>
+              </HStack>
+              <HStack>
+                {(processData.laborTime ?? 0) > 0 && (
+                  <Badge variant="secondary">
+                    <TimeTypeIcon type="Labor" className="h-3 w-3 mr-1" />
+                    {processData.laborTime} {processData.laborUnit}
+                  </Badge>
+                )}
+                <IconButton
+                  icon={<LuChevronRight />}
+                  aria-label={
+                    laborDisclosure.isOpen ? t`Collapse Labor` : t`Expand Labor`
+                  }
+                  variant="ghost"
+                  size="md"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    laborDisclosure.onToggle();
+                  }}
+                  className={`transition-transform ${
+                    laborDisclosure.isOpen ? "rotate-90" : ""
+                  }`}
+                />
+              </HStack>
+            </HStack>
+            <div
+              className={`grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-3 pb-4 ${
+                laborDisclosure.isOpen ? "" : "hidden"
+              }`}
+            >
+              <UnitHint
+                name="laborHint"
+                label={t`Labor`}
+                value={processData.laborUnitHint}
+                onChange={(hint) => {
+                  setProcessData((d) => ({
+                    ...d,
+                    laborUnitHint: hint,
+                    laborUnit:
+                      hint === "Fixed" ? "Total Minutes" : "Minutes/Piece"
+                  }));
+                }}
+              />
+              <NumberControlled
+                name="laborTime"
+                label={t`Labor Time`}
+                isOptional={false}
+                minValue={0}
+                value={processData.laborTime}
+                onChange={(newValue) =>
+                  setProcessData((d) => ({
+                    ...d,
+                    laborTime: newValue
+                  }))
+                }
+              />
+              <StandardFactor
+                name="laborUnit"
+                label={t`Labor Unit`}
+                isOptional={false}
+                hint={processData.laborUnitHint}
+                value={processData.laborUnit}
+                onChange={(newValue) => {
+                  setProcessData((d) => ({
+                    ...d,
+                    laborUnit: newValue?.value ?? "Total Minutes"
+                  }));
+                }}
+              />
+            </div>
+          </div>
+
+          {processData.operationType === "Process" && (
+            <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4">
+              <HStack
+                className="w-full justify-between cursor-pointer"
+                onClick={machineDisclosure.onToggle}
+              >
+                <HStack>
+                  <TimeTypeIcon type="Machine" />
+                  <Label>
+                    <Trans>Machine</Trans>
+                  </Label>
+                </HStack>
+                <HStack>
+                  {(processData.machineTime ?? 0) > 0 && (
+                    <Badge variant="secondary">
+                      <TimeTypeIcon type="Machine" className="h-3 w-3 mr-1" />
+                      {processData.machineTime} {processData.machineUnit}
+                    </Badge>
+                  )}
+                  <IconButton
+                    icon={<LuChevronRight />}
+                    aria-label={
+                      machineDisclosure.isOpen
+                        ? t`Collapse Machine`
+                        : t`Expand Machine`
+                    }
+                    variant="ghost"
+                    size="md"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      machineDisclosure.onToggle();
+                    }}
+                    className={`transition-transform ${
+                      machineDisclosure.isOpen ? "rotate-90" : ""
+                    }`}
+                  />
+                </HStack>
+              </HStack>
+              <div
+                className={`grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-3 pb-4 ${
+                  machineDisclosure.isOpen ? "" : "hidden"
+                }`}
+              >
+                <UnitHint
+                  name="machineHint"
+                  label={t`Machine`}
+                  value={processData.machineUnitHint}
+                  onChange={(hint) => {
+                    setProcessData((d) => ({
+                      ...d,
+                      machineUnitHint: hint,
+                      machineUnit:
+                        hint === "Fixed" ? "Total Minutes" : "Minutes/Piece"
+                    }));
+                  }}
+                />
+                <NumberControlled
+                  name="machineTime"
+                  label={t`Machine Time`}
+                  isOptional={false}
+                  minValue={0}
+                  value={processData.machineTime}
+                  onChange={(newValue) =>
+                    setProcessData((d) => ({
+                      ...d,
+                      machineTime: newValue
+                    }))
+                  }
+                />
+                <StandardFactor
+                  name="machineUnit"
+                  label={t`Machine Unit`}
+                  isOptional={false}
+                  hint={processData.machineUnitHint}
+                  value={processData.machineUnit}
+                  onChange={(newValue) => {
+                    setProcessData((d) => ({
+                      ...d,
+                      machineUnit: newValue?.value ?? "Total Minutes"
+                    }));
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4">
+            <HStack
+              className="w-full justify-between cursor-pointer"
+              onClick={costingDisclosure.onToggle}
+            >
+              <HStack>
+                <LuDollarSign />
+                <Label>Costing</Label>
+              </HStack>
+              <IconButton
+                icon={<LuChevronRight />}
+                aria-label={
+                  costingDisclosure.isOpen
+                    ? "Collapse Costing"
+                    : "Expand Costing"
+                }
+                variant="ghost"
+                size="md"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  costingDisclosure.onToggle();
+                }}
+                className={`transition-transform ${
+                  costingDisclosure.isOpen ? "rotate-90" : ""
+                }`}
+              />
+            </HStack>
+            <div
+              className={`grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-3 pb-4 ${
+                costingDisclosure.isOpen ? "" : "hidden"
+              }`}
+            >
+              <NumberControlled
+                name="laborRate"
+                label={t`Labor Rate`}
+                minValue={0}
+                value={processData.laborRate}
+                formatOptions={INPUT_FORMAT.rate(
+                  baseCurrency,
+                  currencyDecimals
+                )}
+                onChange={(newValue) =>
+                  setProcessData((d) => ({
+                    ...d,
+                    laborRate: newValue
+                  }))
+                }
+              />
+              {processData.operationType === "Process" && (
+                <NumberControlled
+                  name="machineRate"
+                  label={t`Machine Rate`}
+                  minValue={0}
+                  value={processData.machineRate}
+                  formatOptions={INPUT_FORMAT.rate(
+                    baseCurrency,
+                    currencyDecimals
+                  )}
+                  onChange={(newValue) =>
+                    setProcessData((d) => ({
+                      ...d,
+                      machineRate: newValue
+                    }))
+                  }
+                />
+              )}
+              <NumberControlled
+                name="overheadRate"
+                label={t`Overhead Rate`}
+                minValue={0}
+                value={processData.overheadRate}
+                formatOptions={INPUT_FORMAT.rate(
+                  baseCurrency,
+                  currencyDecimals
+                )}
+                onChange={(newValue) =>
+                  setProcessData((d) => ({
+                    ...d,
+                    overheadRate: newValue
+                  }))
+                }
+              />
+            </div>
+          </div>
+
+          {processData.operationType === "Process" && (
+            <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4">
+              <HStack
+                className="w-full justify-between cursor-pointer"
+                onClick={procedureDisclosure.onToggle}
+              >
+                <HStack>
+                  <LuListChecks />
+                  <Label>Procedure</Label>
+                </HStack>
+                <HStack>
+                  {processData.procedureId && (
+                    <Badge variant="secondary">
+                      <LuListChecks className="h-3 w-3 mr-1" />
+                      Procedure
+                    </Badge>
+                  )}
+                  <IconButton
+                    icon={<LuChevronRight />}
+                    aria-label={
+                      procedureDisclosure.isOpen
+                        ? "Collapse Procedure"
+                        : "Expand Procedure"
+                    }
+                    variant="ghost"
+                    size="md"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      procedureDisclosure.onToggle();
+                    }}
+                    className={`transition-transform ${
+                      procedureDisclosure.isOpen ? "rotate-90" : ""
+                    }`}
+                  />
+                </HStack>
+              </HStack>
+              <div
+                className={`grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-1 pb-4 ${
+                  procedureDisclosure.isOpen ? "" : "hidden"
+                }`}
+              >
+                <Procedure
+                  name="procedureId"
+                  label={t`Procedure`}
+                  processId={processData.processId}
+                  value={processData.procedureId}
+                  onChange={(value) => {
+                    setProcessData((d) => ({
+                      ...d,
+                      procedureId: value?.value as string
+                    }));
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          {processData.operationType === "Assembly" && (
+            <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4">
+              <HStack
+                className="w-full justify-between cursor-pointer"
+                onClick={assemblyDisclosure.onToggle}
+              >
+                <HStack>
+                  <OperationTypeIcon type="Assembly" />
+                  <Label>Assembly Instruction</Label>
+                </HStack>
+                <HStack>
+                  {processData.assemblyInstructionId && (
+                    <Badge variant="secondary">
+                      <OperationTypeIcon
+                        type="Assembly"
+                        className="h-3 w-3 mr-1"
+                      />
+                      Assembly Instruction
+                    </Badge>
+                  )}
+                  <IconButton
+                    icon={<LuChevronRight />}
+                    aria-label={
+                      assemblyDisclosure.isOpen
+                        ? "Collapse Assembly Instruction"
+                        : "Expand Assembly Instruction"
+                    }
+                    variant="ghost"
+                    size="md"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      assemblyDisclosure.onToggle();
+                    }}
+                    className={`transition-transform ${
+                      assemblyDisclosure.isOpen ? "rotate-90" : ""
+                    }`}
+                  />
+                </HStack>
+              </HStack>
+              <div
+                className={`grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-1 pb-4 ${
+                  assemblyDisclosure.isOpen ? "" : "hidden"
+                }`}
+              >
+                <AssemblyInstruction
+                  name="assemblyInstructionId"
+                  label={t`Assembly Instruction`}
+                  itemId={itemId}
+                  value={processData.assemblyInstructionId}
+                  onChange={(value) => {
+                    setProcessData((d) => ({
+                      ...d,
+                      assemblyInstructionId: value?.value as string
+                    }));
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          {processData.operationType === "Inspection" && (
+            <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4">
+              <HStack className="w-full justify-between">
+                <HStack>
+                  <OperationTypeIcon type="Inspection" />
+                  <Label>Inspection Plan</Label>
+                </HStack>
+                {processData.inspectionDocumentId && (
+                  <Badge variant="secondary">
+                    <OperationTypeIcon
+                      type="Inspection"
+                      className="h-3 w-3 mr-1"
+                    />
+                    Inspection Plan
+                  </Badge>
+                )}
+              </HStack>
+              <div className="grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-1 pb-4">
+                <InspectionDocument
+                  name="inspectionDocumentId"
+                  label={t`Inspection Plan`}
+                  isOptional={false}
+                  itemId={itemId}
+                  value={processData.inspectionDocumentId}
+                  onChange={(value) => {
+                    setProcessData((d) => ({
+                      ...d,
+                      inspectionDocumentId: value?.value as string
+                    }));
+                  }}
+                />
+              </div>
+            </div>
+          )}
+        </>
+      )}
+      <motion.div
+        className="flex w-full items-center justify-end p-2"
+        initial={{ opacity: 0, filter: "blur(4px)" }}
+        animate={{ opacity: 1, filter: "blur(0px)" }}
+        transition={{
+          type: "spring",
+          bounce: 0,
+          duration: 0.25
+        }}
+      >
+        <motion.div layout className="ml-auto mr-1 pt-2">
+          <Submit
+            isDisabled={isDisabled || fetcher.state !== "idle"}
+            isLoading={fetcher.state === "submitting"}
+          >
+            <Trans>Save</Trans>
+          </Submit>
+        </motion.div>
+      </motion.div>
+    </ValidatedForm>
+  );
+}
+
+function ToolsListItem({
+  tool: { toolId, quantity, id, updatedBy, updatedAt, createdBy, createdAt },
+  operationId,
+  className
+}: {
+  tool: OperationTool;
+  operationId: string;
+  className?: string;
+}) {
+  const { t } = useLingui();
+  const disclosure = useDisclosure();
+  const deleteModalDisclosure = useDisclosure();
+  const submitted = useRef(false);
+  const fetcher = useAction<typeof editQuoteOperationToolAction>({
+    onSettled: () => {
+      if (submitted.current) {
+        disclosure.onClose();
+        submitted.current = false;
+      }
+    }
+  });
+
+  const tools = useTools();
+  const tool = tools.find((t) => t.id === toolId);
+  if (!tool || !id) return null;
+
+  const isUpdated = updatedBy !== null;
+  const person = isUpdated ? updatedBy : createdBy;
+  const date = updatedAt ?? createdAt;
+
+  return (
+    <div className={cn("border-b p-6 bg-card", className)}>
+      {disclosure.isOpen ? (
+        <ValidatedForm
+          action={path.to.quoteOperationTool(id)}
+          method="post"
+          validator={operationToolValidator}
+          fetcher={fetcher}
+          resetAfterSubmit
+          onSubmit={() => {
+            disclosure.onClose();
+          }}
+          defaultValues={{
+            id: id,
+            toolId: toolId ?? "",
+            quantity: quantity ?? 1,
+            operationId
+          }}
+          className="w-full"
+        >
+          <Hidden name="operationId" />
+          <VStack spacing={4}>
+            <div className="w-full grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
+              <Tool name="toolId" label={t`Tool`} autoFocus />
+              <Number name="quantity" label={t`Quantity`} />
+            </div>
+            <HStack className="w-full justify-end" spacing={2}>
+              <Button variant="secondary" onClick={disclosure.onClose}>
+                Cancel
+              </Button>
+              <Submit
+                isDisabled={fetcher.state !== "idle"}
+                isLoading={fetcher.state !== "idle"}
+              >
+                Save
+              </Submit>
+            </HStack>
+          </VStack>
+        </ValidatedForm>
+      ) : (
+        <div className="flex flex-1 justify-between items-center w-full">
+          <HStack spacing={4} className="w-1/2">
+            <HStack spacing={4} className="flex-1">
+              <div className="bg-muted border rounded-full flex items-center justify-center p-2">
+                <LuHammer className="size-4" />
+              </div>
+              <VStack spacing={0}>
+                <span className="text-sm font-medium">
+                  {tool.readableIdWithRevision}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {tool.name}
+                </span>
+              </VStack>
+              <span className="text-base text-muted-foreground text-right">
+                {quantity}
+              </span>
+            </HStack>
+          </HStack>
+          <div className="flex items-center justify-end gap-2">
+            <HStack spacing={2}>
+              <span className="text-xs text-muted-foreground">
+                {isUpdated ? "Updated" : "Created"}{" "}
+                <DateTime value={date} variant="relative" />
+              </span>
+              <EmployeeAvatar employeeId={person} withName={false} />
+            </HStack>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  aria-label="Open menu"
+                  icon={<LuEllipsisVertical />}
+                  variant="ghost"
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.edit}
+                  onClick={disclosure.onOpen}
+                >
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.delete}
+                  destructive
+                  onClick={deleteModalDisclosure.onOpen}
+                >
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+      )}
+      {deleteModalDisclosure.isOpen && (
+        <ConfirmDelete
+          action={path.to.deleteQuoteOperationTool(id)}
+          isOpen={deleteModalDisclosure.isOpen}
+          name={tool.readableIdWithRevision}
+          text={t`Are you sure you want to delete ${tool.readableIdWithRevision} from this operation? This cannot be undone.`}
+          onCancel={() => {
+            deleteModalDisclosure.onClose();
+          }}
+          onSubmit={() => {
+            deleteModalDisclosure.onClose();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ToolsForm({
+  operationId,
+  isDisabled,
+  tools,
+  temporaryItems
+}: {
+  operationId: string;
+  isDisabled: boolean;
+  tools: OperationTool[];
+  temporaryItems: TemporaryItems;
+}) {
+  const { t } = useLingui();
+  const fetcher = useFetcher<typeof newQuoteOperationToolAction>();
+
+  if (isDisabled && temporaryItems[operationId]) {
+    return (
+      <Alert className="max-w-[420px] mx-auto my-8">
+        <LuTriangleAlert />
+        <AlertTitle>
+          <Trans>Cannot add tools to unsaved operation</Trans>
+        </AlertTitle>
+        <AlertDescription>
+          Please save the operation before adding tools.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="p-6 border rounded-lg bg-card">
+        <ValidatedForm
+          action={path.to.newQuoteOperationTool}
+          method="post"
+          validator={operationToolValidator}
+          fetcher={fetcher}
+          resetAfterSubmit
+          defaultValues={{
+            id: undefined,
+            toolId: "",
+            quantity: 1,
+            operationId
+          }}
+          className="w-full"
+        >
+          <Hidden name="operationId" />
+          <VStack spacing={4}>
+            <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+              <Tool name="toolId" label={t`Tool`} autoFocus />
+              <Number name="quantity" label={t`Quantity`} />
+            </div>
+
+            <Submit
+              leftIcon={<LuCirclePlus />}
+              isDisabled={isDisabled || fetcher.state !== "idle"}
+              isLoading={fetcher.state !== "idle"}
+            >
+              Save Tool
+            </Submit>
+          </VStack>
+        </ValidatedForm>
+      </div>
+
+      {tools.length > 0 && (
+        <div className="border rounded-lg">
+          {[...tools]
+            .sort((a, b) =>
+              String(a.id ?? "").localeCompare(String(b.id ?? ""))
+            )
+            .map((t, index) => (
+              <ToolsListItem
+                key={t.id}
+                tool={t}
+                operationId={operationId}
+                className={cn(
+                  index === 0 && "rounded-t-lg",
+                  index === tools.length - 1 && "rounded-b-lg border-none"
+                )}
+              />
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ValidatedForm } from "@carbon/form";
+import {
+  Card,
+  CardContent,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  HStack,
+  useViewport
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useState } from "react";
+import { useFetcher, useParams } from "react-router";
+import type { z } from "zod";
+import {
+  Customer,
+  CustomerContact,
+  CustomerLocation,
+  Hidden,
+  PaymentTerm,
+  Submit
+} from "~/components/Form";
+import { usePermissions, useRouteData } from "~/hooks";
+import { path } from "~/utils/path";
+import { isQuoteLocked, quotePaymentValidator } from "../../sales.models";
+import type { Quotation } from "../../types";
+
+type QuotePaymentFormProps = {
+  initialValues: z.infer<typeof quotePaymentValidator>;
+};
+
+const QuotePaymentForm = ({ initialValues }: QuotePaymentFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const fetcher = useFetcher<{}>();
+  const [customer, setCustomer] = useState<string | undefined>(
+    initialValues.invoiceCustomerId
+  );
+
+  const { quoteId } = useParams();
+  if (!quoteId) throw new Error("quoteId not found");
+  const routeData = useRouteData<{
+    quote: Quotation;
+  }>(path.to.quote(quoteId));
+
+  const isLocked = isQuoteLocked(routeData?.quote?.status);
+  const isEditable = !isLocked;
+  const { isPhone } = useViewport();
+  const quoteStatus = routeData?.quote?.status ?? "";
+  const isDisabled = !isEditable || !permissions.can("update", "sales");
+
+  return (
+    <Card>
+      <ValidatedForm
+        method="post"
+        action={path.to.quotePayment(initialValues.id)}
+        validator={quotePaymentValidator}
+        defaultValues={initialValues}
+        fetcher={fetcher}
+        isDisabled={isLocked}
+      >
+        <CardHeader>
+          <CardTitle>
+            <Trans>Payment</Trans>
+          </CardTitle>
+          {isPhone && isLocked ? (
+            <p className="text-sm text-muted-foreground">
+              <Trans>
+                Locked while the quote is {quoteStatus}. Reopen it to edit.
+              </Trans>
+            </p>
+          ) : null}
+        </CardHeader>
+        <CardContent>
+          <Hidden name="id" />
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-x-8 gap-y-4 w-full">
+            <Customer
+              name="invoiceCustomerId"
+              label={t`Invoice Customer`}
+              termId="invoice-customer"
+              onChange={(value) => setCustomer(value?.value as string)}
+            />
+            <CustomerLocation
+              name="invoiceCustomerLocationId"
+              label={t`Invoice Location`}
+              customer={customer}
+            />
+            <CustomerContact
+              name="invoiceCustomerContactId"
+              label={t`Invoice Contact`}
+              customer={customer}
+            />
+
+            <PaymentTerm
+              name="paymentTermId"
+              label={t`Payment Term`}
+              termId="customer-payment-term"
+            />
+          </div>
+        </CardContent>
+        <CardFooter>
+          <HStack>
+            <Submit isDisabled={isDisabled}>
+              <Trans>Save</Trans>
+            </Submit>
+          </HStack>
+        </CardFooter>
+      </ValidatedForm>
+    </Card>
+  );
+};
+
+export default QuotePaymentForm;

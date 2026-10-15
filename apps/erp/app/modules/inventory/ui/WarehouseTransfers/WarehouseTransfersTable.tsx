@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem,
+  useDisclosure
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo, useState } from "react";
+import {
+  LuBookMarked,
+  LuCalendar,
+  LuClock,
+  LuHash,
+  LuMapPin,
+  LuPencil,
+  LuTrash,
+  LuUser
+} from "react-icons/lu";
+import { useNavigate } from "react-router";
+import { DateTime, EmployeeAvatar, Hyperlink, New, Table } from "~/components";
+import { ConfirmDelete } from "~/components/Modals";
+import { usePermissions, useRealtime, useUrlParams } from "~/hooks";
+import { useCustomColumns } from "~/hooks/useCustomColumns";
+import { usePeople } from "~/stores";
+import { path } from "~/utils/path";
+import { warehouseTransferStatusType } from "../../inventory.models";
+import type { WarehouseTransfer } from "../../types";
+import WarehouseTransferStatus from "./WarehouseTransferStatus";
+
+type WarehouseTransfersTableProps = {
+  data: WarehouseTransfer[];
+  count: number;
+};
+
+const WarehouseTransfersTable = memo(
+  ({ data, count }: WarehouseTransfersTableProps) => {
+    useRealtime(
+      "warehouseTransfer",
+      `id=in.(${data.map((d) => d.id).join(",")})`
+    );
+
+    const [params] = useUrlParams();
+    const { t } = useLingui();
+    const navigate = useNavigate();
+    const permissions = usePermissions();
+
+    const rows = useMemo(() => data, [data]);
+    const [people] = usePeople();
+    const customColumns =
+      useCustomColumns<WarehouseTransfer>("warehouseTransfer");
+
+    const columns = useMemo<ColumnDef<WarehouseTransfer>[]>(() => {
+      const result: ColumnDef<(typeof rows)[number]>[] = [
+        {
+          accessorKey: "transferId",
+          header: t`Transfer ID`,
+          cell: ({ row }) => (
+            <Hyperlink to={path.to.warehouseTransferDetails(row.original.id!)}>
+              {row.original.transferId}
+            </Hyperlink>
+          ),
+          meta: {
+            mobile: "P1",
+            icon: <LuBookMarked />
+          }
+        },
+        {
+          accessorKey: "status",
+          header: t`Status`,
+          cell: (item) => {
+            const status =
+              item.getValue<(typeof warehouseTransferStatusType)[number]>();
+            return <WarehouseTransferStatus status={status} />;
+          },
+          meta: {
+            mobile: "P2",
+            filter: {
+              type: "static",
+              options: warehouseTransferStatusType.map((type) => ({
+                value: type,
+                label: <WarehouseTransferStatus status={type} />
+              }))
+            },
+            pluralHeader: t`Statuses`,
+            icon: <LuClock />
+          }
+        },
+        {
+          id: "fromLocation",
+          header: t`From Location`,
+          cell: ({ row }) => row.original.fromLocation?.name || "N/A",
+          meta: {
+            mobile: "P3",
+            icon: <LuMapPin />
+          }
+        },
+        {
+          id: "toLocation",
+          header: t`To Location`,
+          cell: ({ row }) => row.original.toLocation?.name || "N/A",
+          meta: {
+            icon: <LuMapPin />
+          }
+        },
+        {
+          accessorKey: "reference",
+          header: t`Reference`,
+          cell: (item) => item.getValue(),
+          meta: {
+            icon: <LuHash />
+          }
+        },
+        {
+          accessorKey: "transferDate",
+          header: t`Transfer Date`,
+          cell: (item) => {
+            const date = item.getValue<string>();
+            return date ? <DateTime value={date} variant="date" /> : "N/A";
+          },
+          meta: {
+            mobile: "P2",
+            filter: {
+              type: "dateRange"
+            },
+            icon: <LuCalendar />
+          }
+        },
+        {
+          accessorKey: "expectedReceiptDate",
+          header: t`Expected Receipt`,
+          cell: (item) => {
+            const date = item.getValue<string>();
+            return date ? <DateTime value={date} variant="date" /> : "N/A";
+          },
+          meta: {
+            filter: {
+              type: "dateRange"
+            },
+            icon: <LuCalendar />
+          }
+        },
+        {
+          id: "createdBy",
+          header: t`Created By`,
+          cell: ({ row }) => (
+            <EmployeeAvatar employeeId={row.original.createdBy} />
+          ),
+          meta: {
+            filter: {
+              type: "static",
+              options: people.map((employee) => ({
+                value: employee.id,
+                label: employee.name
+              }))
+            },
+            icon: <LuUser />
+          }
+        },
+        {
+          accessorKey: "createdAt",
+          header: t`Created At`,
+          cell: (item) => (
+            <DateTime value={item.getValue<string>()} variant="date" />
+          ),
+          meta: {
+            icon: <LuCalendar />
+          }
+        },
+        {
+          id: "updatedBy",
+          header: t`Updated By`,
+          cell: ({ row }) => (
+            <EmployeeAvatar employeeId={row.original.updatedBy} />
+          ),
+          meta: {
+            filter: {
+              type: "static",
+              options: people.map((employee) => ({
+                value: employee.id,
+                label: employee.name
+              }))
+            },
+            icon: <LuUser />
+          }
+        },
+        {
+          accessorKey: "updatedAt",
+          header: t`Updated At`,
+          cell: (item) => (
+            <DateTime value={item.getValue<string>()} variant="date" />
+          ),
+          meta: {
+            icon: <LuCalendar />
+          }
+        }
+      ];
+
+      return [...result, ...customColumns];
+    }, [people, customColumns, t]);
+
+    const [selectedTransfer, setSelectedTransfer] =
+      useState<WarehouseTransfer | null>(null);
+    const deleteTransferModal = useDisclosure();
+
+    const renderContextMenu = useCallback(
+      (row: WarehouseTransfer) => {
+        return (
+          <>
+            <MenuItem
+              shortcut={
+                row.status !== "Draft"
+                  ? MENU_ITEM_SHORTCUTS.view
+                  : MENU_ITEM_SHORTCUTS.edit
+              }
+              disabled={!permissions.can("update", "inventory")}
+              onClick={() => {
+                navigate(
+                  `${path.to.warehouseTransferDetails(
+                    row.id!
+                  )}?${params.toString()}`
+                );
+              }}
+            >
+              <MenuIcon icon={<LuPencil />} />
+              {row.status !== "Draft" ? t`View Transfer` : t`Edit Transfer`}
+            </MenuItem>
+            <MenuItem
+              shortcut={MENU_ITEM_SHORTCUTS.delete}
+              disabled={
+                !permissions.can("delete", "inventory") ||
+                row.status === "Draft"
+              }
+              destructive
+              onClick={() => {
+                setSelectedTransfer(row);
+                deleteTransferModal.onOpen();
+              }}
+            >
+              <MenuIcon icon={<LuTrash />} />
+              <Trans>Delete Transfer</Trans>
+            </MenuItem>
+          </>
+        );
+      },
+      [deleteTransferModal, navigate, params, permissions, t]
+    );
+
+    return (
+      <>
+        <Table<(typeof data)[number]>
+          data={data}
+          columns={columns}
+          count={count}
+          defaultColumnPinning={{
+            left: ["transferId"]
+          }}
+          defaultColumnVisibility={{
+            createdAt: false,
+            createdBy: false,
+            updatedAt: false,
+            updatedBy: false
+          }}
+          primaryAction={
+            permissions.can("create", "inventory") && (
+              <New
+                label={t`Warehouse Transfer`}
+                to={path.to.newWarehouseTransfer}
+              />
+            )
+          }
+          renderContextMenu={renderContextMenu}
+          title={t`Warehouse Transfers`}
+          table="warehouseTransfer"
+          withSavedView
+        />
+        {selectedTransfer && selectedTransfer.id && (
+          <ConfirmDelete
+            action={path.to.deleteWarehouseTransfer(selectedTransfer.id)}
+            isOpen={deleteTransferModal.isOpen}
+            name={selectedTransfer.transferId!}
+            text={`Are you sure you want to delete ${selectedTransfer.transferId!}? This cannot be undone.`}
+            onCancel={() => {
+              deleteTransferModal.onClose();
+              setSelectedTransfer(null);
+            }}
+            onSubmit={() => {
+              deleteTransferModal.onClose();
+              setSelectedTransfer(null);
+            }}
+          />
+        )}
+      </>
+    );
+  }
+);
+
+WarehouseTransfersTable.displayName = "WarehouseTransfersTable";
+export default WarehouseTransfersTable;

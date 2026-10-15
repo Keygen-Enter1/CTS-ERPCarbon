@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type {
+  getAttribute,
+  getAttributeCategories,
+  getAttributeCategory,
+  getContacts,
+  getDepartments,
+  getDepartmentsTree,
+  getEmployeeJob,
+  getEmployeeSummary,
+  getHolidays,
+  getPeople,
+  getShifts
+} from "./people.service";
+
+export type Attribute = NonNullable<
+  Awaited<ReturnType<typeof getAttribute>>["data"]
+>;
+
+export type AttributeCategory = NonNullable<
+  Awaited<ReturnType<typeof getAttributeCategories>>["data"]
+>[number];
+
+export type AttributeCategoryDetailType = NonNullable<
+  Awaited<ReturnType<typeof getAttributeCategory>>["data"]
+>;
+
+export type AttributeDataType = {
+  id: number;
+  label: string;
+  isBoolean: boolean;
+  isDate: boolean;
+  isList: boolean;
+  isNumeric: boolean;
+  isText: boolean;
+  isLink: boolean;
+  isUser: boolean;
+  isCustomer: boolean;
+  isSupplier: boolean;
+};
+
+export type Department = NonNullable<
+  Awaited<ReturnType<typeof getDepartments>>["data"]
+>[number];
+
+export type DepartmentTreeNode = NonNullable<
+  Awaited<ReturnType<typeof getDepartmentsTree>>["data"]
+>[number];
+
+export type EmployeeJob = NonNullable<
+  Awaited<ReturnType<typeof getEmployeeJob>>["data"]
+>;
+
+export type EmployeeSummary = NonNullable<
+  Awaited<ReturnType<typeof getEmployeeSummary>>["data"]
+>;
+
+export type Holiday = NonNullable<
+  Awaited<ReturnType<typeof getHolidays>>["data"]
+>[number];
+
+export type Person = NonNullable<
+  Awaited<ReturnType<typeof getPeople>>["data"]
+>[number];
+
+export type Shift = NonNullable<
+  Awaited<ReturnType<typeof getShifts>>["data"]
+>[number];
+
+export type Contact = NonNullable<
+  Awaited<ReturnType<typeof getContacts>>["data"]
+>[number];

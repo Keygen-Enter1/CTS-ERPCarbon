@@ -1,0 +1,1 @@
+UPDATE "plan" SET "stripePriceId" = 'price_1SUTjAFV6ecOa0XvFfPSaxD8' WHERE "id" = 'STARTER';

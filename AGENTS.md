@@ -1,0 +1,245 @@
+# Carbon — Agent Guidelines
+
+Carbon is a manufacturing ERP/MES/QMS. It contains apps for ERP, MES, academy, and starter.
+
+## Always
+
+- Check the Task Router below before research or coding; a single task may match multiple rows — read all relevant guides.
+- Use the closest package/module `AGENTS.md` for local architecture, imports, and validation commands.
+- Follow `.claude/rules/` for subsystem-specific conventions (auto-loaded via `paths:` frontmatter).
+- Read `.ai/lessons.md` before non-trivial changes to avoid known pitfalls.
+- Preserve behavior unless the user or a spec explicitly asks for a behavior change.
+- Keep changes minimal, focused, and integrated through real call sites.
+- Use existing components — grep `packages/react/src/` and `apps/erp/app/components/` before writing UI.
+- A new record type copies its closest sibling — the record users would call the same kind of thing (lease ↔ rental agreement ↔ contract, sales order ↔ purchase order, RMA ↔ supplier return) — routes and UI file for file. Name the sibling in the spec and the plan. Ask before you deviate from it (see `.ai/lessons.md` → "A new record type copies its sibling's UI").
+- Enter plan mode for non-trivial tasks (3+ steps or architectural decisions).
+- Use subagents liberally to keep the main context window clean.
+- Run `pnpm run generate:types` after schema/migration changes, BEFORE typechecking.
+- Start every new source file with its SPDX license header — AGPL, or the commercial one under `packages/ee/` and in `.ee.` files. Run the fixer (`pnpm --filter @carbon/checks license-headers`) rather than hand-typing it. Moving a file into or out of `packages/ee/`, or adding/removing `.ee.` in its name, changes its license and so its header.
+- Resolve every merge or rebase conflict with the `resolving-merge-conflicts` skill (`.claude/skills/resolving-merge-conflicts/SKILL.md`): load it before touching a conflicted file. Its checks here are the scoped typecheck and tests, Biome, and `pnpm --filter @carbon/checks clobbers` when migrations are involved.
+- Never claim work is complete without running verification commands. Evidence before assertions — run the command, read the output, then state the result.
+
+## Ask First
+
+- Ask before reducing scope, changing architecture, changing public contracts, or adding production dependencies.
+- Ask before changing database schema in production-critical tables.
+- Ask before modifying authentication, RBAC, or multi-tenancy logic.
+- Ask before touching multiple modules in a way not covered by an existing spec.
+
+## Never
+
+- Never use `npm` — always `pnpm`.
+- Never use JavaScript `Date` for parsing, formatting, or arithmetic — use `@internationalized/date` + `@carbon/utils` `formatDate` (see `.claude/rules/date-handling.md`).
+- Never expose cross-tenant data or skip `companyId` scoping.
+- Never query inside a loop (N+1) — collect the ids and make one `.in()` call, an embed, or a view (see `.claude/rules/database-patterns.md`).
+- Never chain Supabase-client writes and call it a transaction — the client has none. Use a Kysely transaction (inside a server function when apps, the API or jobs share the write), or an RPC when it must also be callable through PostgREST.
+- Never construct a DB connection/pool/Kysely client inside a `{module}.service.ts` — service files are re-exported through the module barrel that client components import, so they are bundled for the browser. Build the client in a `.server` file (`getDatabaseClient()` from `~/services/database.server`) and pass it into the service as a `db: Kysely<KyselyDatabase>` argument from the route action. Enforced by the `no-db-client-in-service` check (`@carbon/checks`).
+- Never hand-edit generated DB types (`@carbon/database` types).
+- Never name a field, column, enum or form label "Kind" (or `*Kind`). Name what the choice decides — `revenueType` (One-time / Recurring), `billingFrequency`, `entryType`. "Kind" tells the reader nothing (see `.claude/rules/conventions-database.md`).
+- Never scatter service/models files — one `{module}.service.ts` and one `{module}.models.ts` per module.
+- Never rebuild the database to test changes — wait for the user.
+- Never commit credentials, tokens, or private keys.
+
+## Validation Commands
+
+Choose the smallest relevant set for the change:
+
+```bash
+pnpm exec turbo run typecheck --filter=<pkg>   # TypeScript (scoped — whole-repo typecheck OOMs)
+pnpm run lint                # Biome linting
+pnpm run test                # Unit tests
+pnpm run build               # Full build
+pnpm db:migrate:new <name>   # Create new migration
+pnpm db:migrate              # Apply pending migrations
+pnpm run generate:types      # Regenerate DB types (after migrations)
+pnpm db:check:datasets       # Do the demo datasets still apply? (pre-commit gate)
+pnpm db:check:backups        # Would existing customer backups still restore? (pre-commit gate)
+```
+
+`typecheck`, `test`, `lint` and `build` are cached by Turborepo: a package re-runs
+only when its own files, a workspace dependency's files, or the lockfile changed
+(`--force` re-runs regardless). That is only correct while a task reads nothing
+outside that set. A package whose task reads other paths declares them in its own
+`turbo.json` — as `inputs`, or `"cache": false` when it scans the repo
+(`packages/checks`, `docs/content`) — and a package that needs a generated root
+artifact depends on the task that makes it (`apps/erp/turbo.json`).
+
+Both `db:check:*` commands read your live local schema. They run from
+`scripts/git-hooks/pre-commit`, so run `pnpm db:migrate` before either — a stale database makes
+the dataset check fail for the wrong reason and makes the backup check refuse to give
+a verdict at all. Run by hand, both write nothing; from the hook, `db:check:backups`
+additionally regenerates and stages `packages/jobs/manifests/schema.json` on success.
+
+## Task Router — Where to Find Detailed Guidance
+
+IMPORTANT: Before any research or coding, match the task to this table. A single task often maps to **multiple rows** — read **all** matching guides before starting.
+
+| Task | Guide |
+|------|-------|
+| **Database & Schema** | |
+| Creating a database migration | `.claude/rules/workflow-database-migration.md` |
+| Database conventions (tables, RLS, multi-tenancy) | `.claude/rules/conventions-database.md` |
+| Database access patterns (clients, Kysely, RPCs) | `.claude/rules/database-patterns.md` |
+| Migration SQL patterns (enums, views, triggers) | `.claude/rules/database-migration-patterns.md` |
+| RLS policies and RLS helpers (authz manifest) | `.claude/rules/authz-manifest.md` |
+| Working with the database package | `packages/database/AGENTS.md` |
+| **Server & Services** | |
+| Writing service functions | `.claude/rules/conventions-services.md` |
+| Authentication, RBAC, permissions | `.claude/rules/authentication-system.md` + `packages/auth/AGENTS.md` |
+| Account settings modal (ERP, MES, starter) | `packages/account/AGENTS.md` |
+| Background jobs and events (Inngest) | `.claude/rules/event-system.md` + `packages/jobs/AGENTS.md` |
+| Server functions (privileged/transactional writes shared by apps and jobs) | `packages/server-functions/AGENTS.md` |
+| Adding a Deno edge function (embedding only) | `.claude/rules/workflow-edge-function.md` |
+| Adding event handlers | `.claude/rules/workflow-event-system.md` |
+| **UI & Forms** | |
+| Building forms (ValidatedForm + zod) | `.claude/rules/conventions-forms.md` + `packages/form/AGENTS.md` |
+| UI components and conventions | `.claude/rules/conventions-ui.md` + `packages/react/AGENTS.md` |
+| i18n / translations (Lingui) | `.claude/rules/i18n-lingui-system.md` + `packages/locale/AGENTS.md` |
+| Flash messages and toasts | `.claude/rules/flash-system.md` |
+| Document templates / customizer | `.claude/rules/document-template-customizer.md` |
+| **Domain Modules** | |
+| Purchasing (POs, receipts, conversion factors) | `.claude/rules/purchasing-conversion-factors.md` + `modules/purchasing/AGENTS.md` |
+| Inventory (lots, bins, adjustments) | `.claude/rules/inventory-system.md` + `modules/inventory/AGENTS.md` |
+| Production (work orders, scheduling, routings) | `.claude/rules/scheduling-data-structures.md` + `modules/production/AGENTS.md` |
+| MES (shop floor, job operations) | `.claude/rules/mes-job-operation-ui.md` |
+| Quality (inspections, NCRs, CAPAs) | `modules/quality/AGENTS.md` |
+| Sales (quotes, orders) | `.claude/rules/quote-discount-system.md` + `modules/sales/AGENTS.md` |
+| Accounting (GL, journal entries) | `.claude/rules/accounting-sync-handlers.md` + `modules/accounting/AGENTS.md` |
+| Items / Parts / BOM | `.claude/rules/material-tables.md` + `modules/items/AGENTS.md` |
+| Issues (NCR, CAPA, ECO, RMA) | `.claude/rules/issue-module.md` |
+| Traceability / lot tracking | `.claude/rules/traceability-model.md` |
+| Revision system | `.claude/rules/revision-system.md` |
+| Item supersession (phase-out / successor swaps) | `.claude/rules/supersession-system.md` |
+| Kanban | `.claude/rules/kanban-system.md` |
+| Workflows (customer automation rules) | `.claude/rules/workflow-event-catalog.md` + `.claude/rules/workflow-matcher.md` + `.claude/rules/workflow-engine.md` + `packages/ee/src/workflows/AGENTS.md` |
+| Workflow run history + retention | `.claude/rules/workflow-run-history.md` |
+| Fixed assets | `.claude/rules/fixed-asset-lifecycle.md` |
+| Rental agreements / leases / revenue recognition | `apps/erp/app/modules/sales/AGENTS.md` (Rentals) + `apps/erp/app/modules/accounting/AGENTS.md` (Revenue recognition, Sales-type leases) + `.claude/rules/fixed-asset-lifecycle.md` + `.claude/rules/accounting-sync-handlers.md` |
+| Lessee leases (ASC 842, leases the company pays) / lease runs | `apps/erp/app/modules/purchasing/AGENTS.md` (Leases) + `apps/erp/app/modules/accounting/AGENTS.md` (Run types, Lessee leases, Lease Liabilities report, Lessee cutover) + `apps/erp/app/modules/invoicing/AGENTS.md` (Lease line) + `.claude/rules/fixed-asset-lifecycle.md` (purchase option) |
+| Risk register | `.claude/rules/risk-register-module.md` |
+| **Infrastructure** | |
+| File uploads, images, HEIC, MIME types, CAD formats | `packages/files/AGENTS.md` |
+| PDF generation | `.claude/rules/pdf-generation-patterns.md` + `packages/documents/AGENTS.md` |
+| Email templates (notification / transactional / broadcast design) | `.claude/rules/email-design.md` + `packages/documents/AGENTS.md` |
+| Printing system | `.claude/rules/printing-system.md` + `packages/printing/AGENTS.md` |
+| CSV import/export | `.claude/rules/csv-import-system.md` + `.claude/rules/table-csv-export.md` |
+| Changelog entries (authoring + the feed) | `.claude/rules/changelog-authoring.md` |
+| Writing/shipping a changelog entry (end to end) | `.claude/skills/changelog-entry/SKILL.md` |
+| Billing / Stripe | `.claude/rules/billing-system.md` + `packages/stripe/AGENTS.md` |
+| Deployment (SST) | `.claude/rules/sst-deployment-infrastructure.md` |
+| Audit log system | `.claude/rules/audit-log-system.md` |
+| Shipments / receipts UI | `.claude/rules/shipments-receipts-ui-patterns.md` |
+| AI chat / SDK | `.claude/rules/chat-ai-sdk-info.md` |
+| Docs content, glossary, in-app agent knowledge base | `.claude/rules/agent-knowledge-base.md` + `docs/content/AGENTS.md` |
+| **Integrations** | |
+| Ramp integration (charges, accounting-provider sync) | `.claude/rules/ramp-integration.md` |
+| Jira integration | `.claude/rules/jira-integration.md` |
+| Linear integration | `.claude/rules/linear-integration.md` |
+| OEE providers / machine monitoring (Sense, loaded operation, unattributed machine time) | `.claude/rules/oee-provider.md` + `apps/erp/app/modules/production/AGENTS.md` |
+| Xero API / webhooks | `.claude/rules/xero-api-contact-structure.md` + `.claude/rules/xero-webhooks.md` |
+| Redis (shared dev) | `.claude/rules/dev-shared-redis.md` |
+| Client cache (`cachedClientLoader`, `useLoaderQuery`, `useAction`) | `.claude/rules/clientAction-patterns.md` + `packages/query/AGENTS.md` |
+| Realtime (broadcast, `handle.realtime`, live lists, change log) | `.claude/rules/realtime-system.md` + `packages/query/AGENTS.md` |
+| Event triggers and interceptors (attachments manifest) | `.claude/rules/authz-manifest.md` |
+| **Architecture** | |
+| General coding conventions | `.claude/rules/coding-conventions.md` |
+| Date & time handling (no JS `Date`) | `.claude/rules/date-handling.md` |
+| Numeric precision & formatting (two scales, named kinds, tax pair) | `.claude/rules/numeric-precision.md` |
+| Project overview | `.claude/rules/project-overview.md` |
+| Customer/supplier DB schema | `.claude/rules/customer-supplier-database-schema.md` |
+| User/employee/job relationships | `.claude/rules/user-employee-job-relationships.md` |
+| Company backup/restore | `.claude/rules/company-backup-restore.md` |
+| Onboarding demo templates / dev seed datasets | `.claude/rules/onboarding-company-templates.md` |
+| Environment configuration | `.claude/rules/environment-configuration.md` |
+| MCP tools reference | `.claude/rules/mcp-tools-reference.md` |
+| Adding a new module | `.ai/docs/module-conventions.md` |
+| Creating/refreshing an AGENTS.md | `.claude/skills/create-agents-md/SKILL.md` |
+| **Design Specs** | |
+| Check existing specs before building | `.ai/specs/` + `.ai/specs/implemented/` (superseded designs: `.ai/specs/archived/`, history only) |
+| Writing a new spec | `.claude/skills/spec-writing/SKILL.md` + `.claude/rules/writing-ste.md` |
+| Explain a spec/plan as an HTML page (diagram + plain prose) | `.claude/skills/explain/SKILL.md` |
+| **Workflows** | |
+| Skills index — pipelines + all skills | `.claude/skills/README.md` |
+| Competitor research for a feature | `.claude/skills/research/SKILL.md` |
+| Feature pipeline (research→spec→plan→execute) | `.claude/skills/feature/SKILL.md` |
+| Stress-test a plan or design (grill interview) | `.claude/skills/grill/SKILL.md` |
+| Implementation plan from a spec | `.claude/skills/plan/SKILL.md` |
+| Execute an approved plan | `.claude/skills/execute/SKILL.md` |
+| Bug fix: root-cause analysis (read-only) | `.claude/skills/root-cause/SKILL.md` |
+| Bug fix: runtime instrumentation | `.claude/skills/debugging-difficult-bugs/SKILL.md` |
+| Bug fix: end-to-end pipeline (diagnose → fix → verify → commit) | `.claude/skills/fix/SKILL.md` |
+| Pre-commit verification gate | `.claude/skills/check-and-commit/SKILL.md` |
+| Feature build (doer→gate→judge loop) | `.claude/skills/conductor/SKILL.md` |
+| Browser-verify a feature | `.claude/skills/test/SKILL.md` |
+| Repo audit → handoff plans | `.claude/skills/improve/SKILL.md` |
+| Review your own branch before PR | `.claude/skills/self-review/SKILL.md` |
+| Resolving a merge or rebase conflict (always) | `.claude/skills/resolving-merge-conflicts/SKILL.md` |
+| Test-first work: good tests, seams, anti-patterns | `.claude/skills/tdd/SKILL.md` + `.claude/skills/test-driven-development/SKILL.md` |
+
+## Core Principles
+
+- **Simplicity First:** Make every change as simple as possible. Minimize code impact.
+- **No Laziness:** Identify root causes. Avoid temporary fixes. Senior developer standards.
+- **Minimal Impact:** Touch only what is necessary. Avoid introducing new bugs.
+- **Demand Elegance:** For non-trivial changes, pause and ask whether there is a more elegant solution.
+
+## Workflow Orchestration
+
+### Plan First
+
+- Enter plan mode for any non-trivial task (3+ steps or architectural decisions).
+- If something goes wrong, stop and re-plan immediately.
+- Write implementation plans to `.ai/plans/{date}-{slug}.md` with checkable progress items (run logs go in `.ai/runs/`).
+
+### Subagent Strategy
+
+- Use subagents liberally to keep the main context window clean.
+- Offload research, exploration, and parallel analysis to subagents.
+- One task per subagent to ensure focused execution.
+
+### Verification Before Done
+
+- Never declare a task complete without proving it works.
+- Ask: "Would a staff engineer approve this?"
+- Run tests, check build, demonstrate correctness.
+
+### Self-Improvement Loop
+
+- After corrections, update `.ai/lessons.md` with the `Context → Problem → Rule → Applies to` format.
+- Review lessons at the start of each session when relevant to the task.
+
+## Architecture Quick Reference
+
+- **Monorepo**: pnpm workspaces + Turborepo
+- **Framework**: React Router v7 (NOT Remix), flat routes via `remix-flat-routes`
+- **Database**: Supabase (Postgres) with RLS, typed via `@carbon/database` + Kysely
+- **Background jobs**: Inngest (NOT Trigger.dev), via `@carbon/jobs`
+- **Apps**: `erp` (main), `mes` (shop floor), `academy` (training), `starter` (example)
+- **Packages**: 30 under `packages/` — account, auth, database, lib, react, query, form, documents, jobs, notifications, config, env, checks, harness, dev, stripe, ee, tiptap, locale, utils, files, kv, printing, onboarding, logger, server-functions, planning, api, viewer, workflows-core — plus `@carbon/content` at `docs/content` (docs MDX + glossary)
+- **Multi-tenancy**: every table has `companyId` + composite PK `("id", "companyId")`
+- **IDs**: `id('prefix')` default in SQL
+- **Imports**: `~/*` → app code; `@carbon/*` → workspace packages
+- **Precision**: `@carbon/utils` re-exports `@carbon/database/precision` (and the accounting-currency, posting and ledger helpers) by design — `@carbon/utils` depends on `@carbon/database`, never the reverse
+- **Licensing**: open-core (root `LICENSE`). Everything under `packages/ee/` and every file whose name contains `.ee.` is under the Carbon Commercial License (`packages/ee/LICENSE`); all other first-party code is AGPL-3.0-only. Each source file states its license in a leading SPDX header (`LicenseRef-Carbon-Commercial` or `AGPL-3.0-only`), enforced by the `spdx-license-header` check (`@carbon/checks`); generated and third-party files carry none. See `.claude/rules/commercial-licensing.md`.
+
+## ERP Module Layout
+
+```
+apps/erp/app/modules/{module}/
+├── {module}.models.ts    # zod validators + derived types
+├── {module}.service.ts   # Supabase/Kysely data operations
+├── {module}.server.ts    # server-only helpers (optional)
+├── types.ts              # shared types (optional)
+├── index.ts              # barrel re-export
+└── ui/                   # feature components
+```
+
+MES is lighter: services in `apps/mes/app/services/`, components in `apps/mes/app/components/`.
+
+## Rules (`.claude/rules/`)
+
+Internal technical context for each subsystem lives in `.claude/rules/` (the source of truth, tracked in git) and is copied to `.codex/rules/` by `install-skills.sh`. Claude Code auto-loads rules via `paths:` frontmatter when you work in matching areas. Update the relevant rule when you learn something durable about a subsystem. The source of truth is always the code and schema first.
+
+## Browser Automation
+
+With the user's permission, use the `/auth` and `/test` skill to verify fixes.

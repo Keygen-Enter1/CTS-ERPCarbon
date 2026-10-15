@@ -1,0 +1,805 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { TermId } from "@carbon/content/glossary";
+import { downloadCsv } from "@carbon/files/csv";
+import { ValidatedForm } from "@carbon/form";
+import {
+  Badge,
+  Button,
+  Heading,
+  HStack,
+  IconButton,
+  LabelWithHelp,
+  useCloseRoute
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useCallback, useMemo, useState } from "react";
+import { LuDownload } from "react-icons/lu";
+import { Combobox, Hidden, Submit } from "~/components/Form";
+import { usePermissions } from "~/hooks";
+import { path } from "~/utils/path";
+import { defaultAccountValidator } from "../../accounting.models";
+import type { AccountListItem } from "../../types";
+
+const formValidator = defaultAccountValidator.extend({
+  salesShippingRevenueAccount:
+    defaultAccountValidator.shape.salesShippingRevenueAccount.unwrap()
+});
+
+type BadgeType = "Asset" | "Liability" | "Equity" | "Revenue" | "Expense";
+
+type AccountDefaultField = {
+  name: string;
+  label: string;
+  description: string;
+  badgeType: BadgeType;
+  termId?: TermId;
+};
+
+type CategoryGroup = {
+  id: string;
+  title: string;
+  description: string;
+  fields: AccountDefaultField[];
+};
+
+const badgeColors: Record<
+  BadgeType,
+  "green" | "red" | "blue" | "yellow" | "orange"
+> = {
+  Asset: "green",
+  Liability: "red",
+  Equity: "blue",
+  Revenue: "yellow",
+  Expense: "orange"
+};
+
+type AccountDefaultsFormProps = {
+  balanceSheetAccounts: AccountListItem[];
+  incomeStatementAccounts: AccountListItem[];
+  initialValues: Record<string, string>;
+};
+
+/** The account default fields, grouped as the defaults page shows them.
+ *  Built in a hook so labels and descriptions go through `t`. The tooltip body
+ *  comes from the glossary via `termId`; the on-row `description` is the short
+ *  context shown below the label. */
+export function useAccountDefaultGroups(): CategoryGroup[] {
+  const { t } = useLingui();
+  return useMemo<CategoryGroup[]>(
+    () => [
+      {
+        id: "cash-banking",
+        title: t`Cash & Banking`,
+        description: t`Configure default accounts for cash and bank transactions`,
+        fields: [
+          {
+            name: "bankCashAccount",
+            label: t`Bank - Cash`,
+            description: t`Primary cash account for bank transactions`,
+            badgeType: "Asset",
+            termId: "account-default-bank-cash"
+          },
+          {
+            name: "bankLocalCurrencyAccount",
+            label: t`Bank - Local Currency`,
+            description: t`Bank account denominated in the local currency`,
+            badgeType: "Asset",
+            termId: "account-default-bank-local-currency"
+          },
+          {
+            name: "bankForeignCurrencyAccount",
+            label: t`Bank - Foreign Currency`,
+            description: t`Bank account denominated in a foreign currency`,
+            badgeType: "Asset",
+            termId: "account-default-bank-foreign-currency"
+          }
+        ]
+      },
+      {
+        id: "receivables",
+        title: t`Accounts Receivable`,
+        description: t`Default accounts for customer transactions and receivables`,
+        fields: [
+          {
+            name: "receivablesAccount",
+            label: t`Receivables`,
+            description: t`Accounts receivable for amounts owed by customers`,
+            badgeType: "Asset",
+            termId: "account-default-receivables"
+          },
+          {
+            name: "prepaymentAccount",
+            label: t`Prepayments`,
+            description: t`Account for advance payments made before goods or services are received`,
+            badgeType: "Liability",
+            termId: "account-default-prepayments"
+          },
+          {
+            name: "customerWriteOffAccount",
+            label: t`Customer Write-Off (Bad Debt)`,
+            description: t`Expense account for customer balances written off as uncollectable on AR settlement`,
+            badgeType: "Expense"
+          },
+          {
+            name: "deferredRevenueAccount",
+            label: t`Deferred Revenue`,
+            description: t`Liability credited when a service-dated or rental invoice line is billed before the revenue is earned; released by recognition runs`,
+            badgeType: "Liability",
+            termId: "account-default-deferred-revenue"
+          },
+          {
+            name: "contractAssetAccount",
+            label: t`Contract Assets`,
+            description: t`Unbilled receivable for rent earned before it is invoiced`,
+            badgeType: "Asset",
+            termId: "account-default-contract-assets"
+          },
+          {
+            name: "netInvestmentInLeasesAccount",
+            label: t`Net Investment in Leases`,
+            description: t`Receivable recognized at commencement of a sales-type lease, reduced by each rental payment`,
+            badgeType: "Asset",
+            termId: "account-default-net-investment-in-leases"
+          }
+        ]
+      },
+      {
+        id: "inventory",
+        title: t`Inventory`,
+        description: t`Configure default accounts for inventory management`,
+        fields: [
+          {
+            name: "rawMaterialsAccount",
+            label: t`Raw Materials`,
+            description: t`On-hand value of purchased stock and components (Buy items)`,
+            badgeType: "Asset",
+            termId: "account-default-raw-materials"
+          },
+          {
+            name: "finishedGoodsAccount",
+            label: t`Finished Goods`,
+            description: t`On-hand value of manufactured goods (Make items)`,
+            badgeType: "Asset",
+            termId: "account-default-finished-goods"
+          },
+          {
+            name: "workInProgressAccount",
+            label: t`Work in Progress (WIP)`,
+            description: t`Account for production orders not yet completed`,
+            badgeType: "Asset",
+            termId: "account-default-wip"
+          }
+        ]
+      },
+      {
+        id: "fixed-assets",
+        title: t`Fixed Assets`,
+        description: t`Default accounts for long-term assets and depreciation`,
+        fields: [
+          {
+            name: "assetAquisitionCostAccount",
+            label: t`Asset Acquisition Cost`,
+            description: t`Account for the purchase cost of fixed assets`,
+            badgeType: "Asset",
+            termId: "account-default-asset-acquisition-cost"
+          },
+          {
+            name: "assetAquisitionCostOnDisposalAccount",
+            label: t`Asset Cost on Disposal`,
+            description: t`Account for the cost of fixed assets when disposed`,
+            badgeType: "Asset",
+            termId: "account-default-asset-cost-on-disposal"
+          },
+          {
+            name: "accumulatedDepreciationAccount",
+            label: t`Accumulated Depreciation`,
+            description: t`Contra-asset account for total depreciation of fixed assets`,
+            badgeType: "Asset",
+            termId: "account-default-accumulated-depreciation"
+          },
+          {
+            name: "accumulatedDepreciationOnDisposalAccount",
+            label: t`Accumulated Depreciation on Disposal`,
+            description: t`Depreciation reversal when a fixed asset is disposed`,
+            badgeType: "Asset",
+            termId: "account-default-accumulated-depreciation-on-disposal"
+          }
+        ]
+      },
+      {
+        id: "leases",
+        title: t`Leases (Lessee)`,
+        description: t`Default accounts for leases the company pays, under ASC 842`,
+        fields: [
+          {
+            name: "rightOfUseAssetAccount",
+            label: t`Right-of-Use Assets`,
+            description: t`Asset recognized at lease commencement for the right to use a leased asset`,
+            badgeType: "Asset"
+          },
+          {
+            name: "accumulatedRightOfUseAmortizationAccount",
+            label: t`Accumulated Amortization – Right-of-Use Assets`,
+            description: t`Contra-asset account for the amortization of right-of-use assets`,
+            badgeType: "Asset"
+          },
+          {
+            name: "leaseLiabilityAccount",
+            label: t`Lease Liabilities`,
+            description: t`Present value of the lease payments not yet paid, reduced by each lease invoice`,
+            badgeType: "Liability"
+          },
+          {
+            name: "operatingLeaseExpenseAccount",
+            label: t`Operating Lease Expense`,
+            description: t`Straight-line lease cost of operating leases, and the payments of short-term leases`,
+            badgeType: "Expense"
+          },
+          {
+            name: "variableLeaseExpenseAccount",
+            label: t`Variable Lease Expense`,
+            description: t`Lease charges that are not part of the fixed payments, such as usage or maintenance`,
+            badgeType: "Expense"
+          },
+          {
+            name: "rightOfUseAmortizationExpenseAccount",
+            label: t`Amortization – Right-of-Use Assets`,
+            description: t`Straight-line amortization of finance lease right-of-use assets`,
+            badgeType: "Expense"
+          },
+          {
+            name: "leaseInterestExpenseAccount",
+            label: t`Interest Expense – Leases`,
+            description: t`Interest on finance lease liabilities`,
+            badgeType: "Expense"
+          }
+        ]
+      },
+      {
+        id: "payables",
+        title: t`Accounts Payable`,
+        description: t`Configure default accounts for supplier transactions`,
+        fields: [
+          {
+            name: "payablesAccount",
+            label: t`Payables`,
+            description: t`Accounts payable for amounts owed to suppliers`,
+            badgeType: "Liability",
+            termId: "account-default-payables"
+          },
+          {
+            name: "supplierPrepaymentAccount",
+            label: t`Supplier Prepayments`,
+            description: t`Asset account for advance payments made to suppliers before goods or services are received`,
+            badgeType: "Asset"
+          },
+          {
+            name: "goodsReceivedNotInvoicedAccount",
+            label: t`GR/IR Clearing`,
+            description: t`Clearing account for goods received / invoice received matching`,
+            badgeType: "Liability",
+            termId: "account-default-gr-ir"
+          },
+          {
+            name: "supplierWriteOffAccount",
+            label: t`Supplier Write-Off Income`,
+            description: t`Other Income account for supplier balances cleared without full payment on AP settlement`,
+            badgeType: "Revenue"
+          },
+          {
+            name: "employeeReimbursementsPayableAccount",
+            label: t`Employee Reimbursements Payable`,
+            description: t`Liability account for amounts owed to employees for expense reimbursements. Falls back to Payables when unset`,
+            badgeType: "Liability"
+          }
+        ]
+      },
+      {
+        id: "taxes",
+        title: t`Taxes`,
+        description: t`Default accounts for tax-related transactions`,
+        fields: [
+          {
+            name: "salesTaxPayableAccount",
+            label: t`Sales Tax Payable`,
+            description: t`Liability account for sales tax collected from customers`,
+            badgeType: "Liability",
+            termId: "account-default-sales-tax-payable"
+          },
+          {
+            name: "purchaseTaxPayableAccount",
+            label: t`Purchase Tax Payable`,
+            description: t`Liability account for tax paid on purchases`,
+            badgeType: "Liability",
+            termId: "account-default-purchase-tax-payable"
+          },
+          {
+            name: "reverseChargeSalesTaxPayableAccount",
+            label: t`Reverse Charge Sales Tax`,
+            description: t`Tax liability for reverse-charge transactions`,
+            badgeType: "Liability",
+            termId: "account-default-reverse-charge-sales-tax"
+          },
+          {
+            name: "deferredTaxLiabilityAccountId",
+            label: t`Deferred Tax Liability`,
+            description: t`Liability account for deferred taxes from accelerated depreciation`,
+            badgeType: "Liability",
+            termId: "account-default-deferred-tax-liability"
+          }
+        ]
+      },
+      {
+        id: "equity",
+        title: t`Equity`,
+        description: t`Configure default equity and retained earnings accounts`,
+        fields: [
+          {
+            name: "retainedEarningsAccount",
+            label: t`Retained Earnings`,
+            description: t`Equity account for accumulated profits or losses`,
+            badgeType: "Equity",
+            termId: "account-default-retained-earnings"
+          },
+          {
+            name: "currencyTranslationAccount",
+            label: t`Currency Translation`,
+            description: t`Equity account for currency translation adjustments (CTA)`,
+            badgeType: "Equity",
+            termId: "account-default-currency-translation"
+          },
+          {
+            name: "migrationClearingAccount",
+            label: t`Migration Clearing`,
+            description: t`Equity account that offsets the opening balances when accounting is set up. It must total zero.`,
+            badgeType: "Equity",
+            termId: "account-default-migration-clearing"
+          }
+        ]
+      },
+      {
+        id: "revenue",
+        title: t`Sales & Revenue`,
+        description: t`Default accounts for sales and income`,
+        fields: [
+          {
+            name: "salesAccount",
+            label: t`Sales`,
+            description: t`Default account for posting sales revenue from invoices`,
+            badgeType: "Revenue",
+            termId: "account-default-sales"
+          },
+          {
+            name: "salesShippingRevenueAccount",
+            label: t`Shipping Revenue`,
+            description: t`Revenue account for shipping charged to customers`,
+            badgeType: "Revenue",
+            termId: "account-default-sales-shipping-revenue"
+          },
+          {
+            name: "salesDiscountAccount",
+            label: t`Sales Discounts`,
+            description: t`Contra-revenue account for discounts given on sales`,
+            badgeType: "Revenue",
+            termId: "account-default-sales-discounts"
+          },
+          {
+            name: "customerPaymentDiscountAccount",
+            label: t`Customer Payment Discounts`,
+            description: t`Discounts given to customers for early payment`,
+            badgeType: "Revenue",
+            termId: "account-default-customer-payment-discounts"
+          },
+          {
+            name: "realizedExchangeGainAccount",
+            label: t`Realized Exchange Gain`,
+            description: t`Other Income account for FX gains when a payment settles a foreign-currency invoice at a more favorable rate`,
+            badgeType: "Revenue"
+          },
+          {
+            name: "rentalIncomeAccount",
+            label: t`Rental Income`,
+            description: t`Revenue recognized straight-line for operating rentals and for variable rental charges`,
+            badgeType: "Revenue",
+            termId: "account-default-rental-income"
+          },
+          {
+            name: "leaseRevenueAccount",
+            label: t`Lease Revenue`,
+            description: t`Revenue recognized at commencement of a sales-type lease`,
+            badgeType: "Revenue",
+            termId: "account-default-lease-revenue"
+          },
+          {
+            name: "leaseInterestIncomeAccount",
+            label: t`Interest Income – Leases`,
+            description: t`Other Income account for the monthly interest earned on the net investment in sales-type leases`,
+            badgeType: "Revenue",
+            termId: "account-default-lease-interest-income"
+          }
+        ]
+      },
+      {
+        id: "cogs",
+        title: t`Cost of Goods Sold`,
+        description: t`Default accounts for the cost of goods sold and indirect purchases`,
+        fields: [
+          {
+            name: "costOfGoodsSoldAccount",
+            label: t`Cost of Goods Sold`,
+            description: t`Expense account for the cost of items sold`,
+            badgeType: "Expense",
+            termId: "account-default-cogs"
+          },
+          {
+            name: "indirectCostAccount",
+            label: t`Indirect Materials & Services`,
+            description: t`Expense account for non-inventory purchases (services, supplies)`,
+            badgeType: "Expense",
+            termId: "account-default-indirect-materials-services"
+          },
+          {
+            name: "supplierPaymentDiscountAccount",
+            label: t`Supplier Payment Discounts`,
+            description: t`Discounts earned for early payment to suppliers`,
+            badgeType: "Expense",
+            termId: "account-default-supplier-payment-discounts"
+          }
+        ]
+      },
+      {
+        id: "absorption",
+        title: t`Absorption`,
+        description: t`Credit accounts used when manufacturing costs are absorbed into WIP`,
+        fields: [
+          {
+            name: "laborAbsorptionAccount",
+            label: t`Labor & Machine Absorption`,
+            description: t`Credit account when labor/machine time is absorbed into WIP`,
+            badgeType: "Expense",
+            termId: "account-default-labor-machine-absorption"
+          },
+          {
+            name: "overheadAbsorptionAccount",
+            label: t`Overhead Absorption`,
+            description: t`Credit account when overhead is absorbed into WIP`,
+            badgeType: "Expense",
+            termId: "account-default-overhead-absorption"
+          }
+        ]
+      },
+      {
+        id: "variances",
+        title: t`Standard Cost Variances`,
+        description: t`Accounts for recording differences between actual and standard costs`,
+        fields: [
+          {
+            name: "purchaseVarianceAccount",
+            label: t`Purchase Price Variance`,
+            description: t`Variance between actual purchase price and standard cost`,
+            badgeType: "Expense",
+            termId: "account-default-purchase-price-variance"
+          },
+          {
+            name: "inventoryAdjustmentVarianceAccount",
+            label: t`Inventory Adjustment`,
+            description: t`Variance from physical inventory count adjustments`,
+            badgeType: "Expense",
+            termId: "account-default-inventory-adjustment"
+          },
+          {
+            name: "scrapAccount",
+            label: t`Scrap / Cost of Quality`,
+            description: t`Write-off of stock scrapped or returned via inspection rejects and NCR dispositions`,
+            badgeType: "Expense"
+          },
+          {
+            name: "materialVarianceAccount",
+            label: t`Material Usage Variance`,
+            description: t`Variance between actual and standard BOM component consumption`,
+            badgeType: "Expense",
+            termId: "account-default-material-usage-variance"
+          },
+          {
+            name: "laborAndMachineVarianceAccount",
+            label: t`Labor & Machine Variance`,
+            description: t`Variance between actual and standard routing hours and rates`,
+            badgeType: "Expense",
+            termId: "account-default-labor-machine-variance"
+          },
+          {
+            name: "overheadVarianceAccount",
+            label: t`Overhead Variance`,
+            description: t`Variance between applied and actual manufacturing overhead`,
+            badgeType: "Expense",
+            termId: "account-default-overhead-variance"
+          },
+          {
+            name: "lotSizeVarianceAccount",
+            label: t`Lot Size Variance`,
+            description: t`Fixed cost amortization variance when batch size differs from standard`,
+            badgeType: "Expense",
+            termId: "account-default-lot-size-variance"
+          },
+          {
+            name: "subcontractingVarianceAccount",
+            label: t`Subcontracting Variance`,
+            description: t`Variance in outside processing costs`,
+            badgeType: "Expense",
+            termId: "account-default-subcontracting-variance"
+          }
+        ]
+      },
+      {
+        id: "expenses",
+        title: t`Operating Expenses`,
+        description: t`Default accounts for business expenses`,
+        fields: [
+          {
+            name: "maintenanceAccount",
+            label: t`Maintenance Expense`,
+            description: t`Expense account for equipment and facility maintenance`,
+            badgeType: "Expense",
+            termId: "account-default-maintenance-expense"
+          },
+          {
+            name: "assetDepreciationExpenseAccount",
+            label: t`Depreciation Expense`,
+            description: t`Periodic depreciation expense for fixed assets`,
+            badgeType: "Expense",
+            termId: "account-default-depreciation-expense"
+          },
+          {
+            name: "assetGainOnDisposalAccount",
+            label: t`Gain on Disposal`,
+            description: t`Gains recognized on disposal of fixed assets`,
+            badgeType: "Revenue",
+            termId: "account-default-gain-on-disposal"
+          },
+          {
+            name: "assetLossOnDisposalAccount",
+            label: t`Loss on Disposal`,
+            description: t`Losses recognized on disposal of fixed assets`,
+            badgeType: "Expense",
+            termId: "account-default-loss-on-disposal"
+          },
+          {
+            name: "serviceChargeAccount",
+            label: t`Service Charges`,
+            description: t`Bank and financial service charge expenses`,
+            badgeType: "Expense",
+            termId: "account-default-service-charges"
+          },
+          {
+            name: "interestAccount",
+            label: t`Interest`,
+            description: t`Interest income or expense from banking activities`,
+            badgeType: "Expense",
+            termId: "account-default-interest"
+          },
+          {
+            name: "roundingAccount",
+            label: t`Rounding Account`,
+            description: t`Account for small rounding differences in transactions`,
+            badgeType: "Expense",
+            termId: "account-default-rounding-account"
+          },
+          {
+            name: "deferredTaxExpenseAccountId",
+            label: t`Deferred Tax Expense`,
+            description: t`Expense account for deferred tax adjustments on depreciation`,
+            badgeType: "Expense",
+            termId: "account-default-deferred-tax-expense"
+          },
+          {
+            name: "realizedExchangeLossAccount",
+            label: t`Realized Exchange Loss`,
+            description: t`Expense account for FX losses when a payment settles a foreign-currency invoice at a less favorable rate`,
+            badgeType: "Expense"
+          }
+        ]
+      }
+    ],
+    [t]
+  );
+}
+
+const AccountDefaultsForm = ({
+  balanceSheetAccounts,
+  incomeStatementAccounts,
+  initialValues
+}: AccountDefaultsFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const closeRoute = useCloseRoute();
+  const onClose = () => closeRoute();
+  const [salesAccount, setSalesAccount] = useState(initialValues.salesAccount);
+
+  const isDisabled = !permissions.can("update", "accounting");
+  const categoryGroups = useAccountDefaultGroups();
+
+  const accountOptions: Record<
+    BadgeType,
+    { value: string; label: string | JSX.Element }[]
+  > = useMemo(() => {
+    const toOption = (c: AccountListItem) => ({
+      value: c.id,
+      label: (
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-mono text-muted-foreground">
+            {c.number}
+          </span>
+          <span className="text-xs text-foreground truncate">{c.name}</span>
+        </div>
+      )
+    });
+    const byClass = (accounts: AccountListItem[], accountClass: BadgeType) =>
+      accounts.filter((c) => c.class === accountClass).map(toOption);
+
+    return {
+      Asset: byClass(balanceSheetAccounts, "Asset"),
+      Liability: byClass(balanceSheetAccounts, "Liability"),
+      Equity: byClass(balanceSheetAccounts, "Equity"),
+      Revenue: byClass(incomeStatementAccounts, "Revenue"),
+      Expense: byClass(incomeStatementAccounts, "Expense")
+    };
+  }, [incomeStatementAccounts, balanceSheetAccounts]);
+
+  const accountsById = useMemo(() => {
+    const map = new Map<string, AccountListItem>();
+    for (const account of [
+      ...balanceSheetAccounts,
+      ...incomeStatementAccounts
+    ]) {
+      map.set(account.id, account);
+    }
+    return map;
+  }, [balanceSheetAccounts, incomeStatementAccounts]);
+
+  // Export every default-account slot with its category and the GL account it is
+  // currently mapped to (from the saved defaults). Built from the same
+  // `categoryGroups` the form renders, so the CSV mirrors the page.
+  const onExportCSV = useCallback(() => {
+    const columns = {
+      group: t`Group`,
+      defaultAccount: t`Default Account`,
+      category: t`Category`,
+      accountNumber: t`Account Number`,
+      accountName: t`Account Name`
+    };
+    const rows = categoryGroups.flatMap((group) =>
+      group.fields.map((field) => {
+        const account = accountsById.get(initialValues[field.name] ?? "");
+        return {
+          [columns.group]: group.title,
+          [columns.defaultAccount]: field.label,
+          [columns.category]: field.badgeType,
+          [columns.accountNumber]: account?.number ?? "",
+          [columns.accountName]: account?.name ?? ""
+        };
+      })
+    );
+    downloadCsv(rows, "default-accounts.csv");
+  }, [categoryGroups, accountsById, initialValues, t]);
+
+  return (
+    <ValidatedForm
+      validator={formValidator}
+      method="post"
+      action={path.to.accountingDefaults}
+      defaultValues={initialValues}
+      className="w-full"
+    >
+      <Hidden name="intent" value="all" />
+      <div className="rounded-lg border border-border bg-card">
+        <div className="flex items-center justify-between border-b border-border p-6 max-md:flex-col max-md:items-start max-md:gap-3 max-md:p-4">
+          <div>
+            <Heading as="h1" size="h3">
+              <Trans>Default Accounts</Trans>
+            </Heading>
+            <p className="text-sm text-muted-foreground">
+              <Trans>
+                Configure the default accounts used for various transaction
+                types across your system
+              </Trans>
+            </p>
+          </div>
+          <HStack>
+            <IconButton
+              size="md"
+              variant="secondary"
+              aria-label={t`Export CSV`}
+              title={t`Export CSV`}
+              icon={<LuDownload />}
+              onClick={onExportCSV}
+            />
+            <Submit isDisabled={isDisabled}>
+              <Trans>Save</Trans>
+            </Submit>
+            <Button size="md" variant="solid" onClick={onClose}>
+              <Trans>Cancel</Trans>
+            </Button>
+          </HStack>
+        </div>
+        <div className="flex flex-col gap-8 p-6 max-md:gap-6 max-md:p-4">
+          {categoryGroups.map((group) => (
+            <div
+              key={group.id}
+              className="border border-border rounded-lg max-md:border-0"
+            >
+              <div className="py-6 px-4 border-b border-border max-md:px-0 max-md:pt-0 max-md:pb-3">
+                <h2 className="text-base font-semibold text-foreground">
+                  {group.title}
+                </h2>
+                <p className="text-xs text-muted-foreground">
+                  {group.description}
+                </p>
+              </div>
+              <div className="flex flex-col gap-3 p-4 max-md:gap-5 max-md:px-0">
+                {group.fields.map((field) => (
+                  <div
+                    key={field.name}
+                    className="group rounded-lg border border-border p-4 transition-colors hover:border-muted-foreground/30 max-md:border-0 max-md:p-0"
+                  >
+                    <div className="flex items-start justify-between gap-4 max-md:flex-col max-md:items-stretch max-md:gap-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <h3 className="text-sm font-medium text-foreground">
+                            {field.termId ? (
+                              <LabelWithHelp
+                                variant="inline"
+                                termId={field.termId}
+                              >
+                                {field.label}
+                              </LabelWithHelp>
+                            ) : (
+                              field.label
+                            )}
+                          </h3>
+                          <Badge variant={badgeColors[field.badgeType]}>
+                            {field.badgeType}
+                          </Badge>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {field.description}
+                        </p>
+                      </div>
+                      <div className="flex-shrink-0 w-64 max-md:w-full">
+                        <Combobox
+                          name={field.name}
+                          options={
+                            field.name === "salesShippingRevenueAccount"
+                              ? accountOptions.Revenue.filter(
+                                  (account) => account.value !== salesAccount
+                                )
+                              : accountOptions[field.badgeType]
+                          }
+                          onChange={
+                            field.name === "salesAccount"
+                              ? (account) =>
+                                  setSalesAccount(account?.value ?? "")
+                              : undefined
+                          }
+                          isRequired={
+                            field.name === "salesShippingRevenueAccount" ||
+                            undefined
+                          }
+                          size="sm"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </ValidatedForm>
+  );
+};
+
+export default AccountDefaultsForm;

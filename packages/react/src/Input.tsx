@@ -1,0 +1,456 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { VariantProps } from "class-variance-authority";
+import { cva } from "class-variance-authority";
+import type { HTMLAttributes, InputHTMLAttributes } from "react";
+import { cloneElement, createContext, forwardRef, useContext } from "react";
+import * as ReactAria from "react-aria-components";
+
+import { cn } from "./utils/cn";
+import { getValidChildren } from "./utils/react";
+import { usePhoneAutoFocus } from "./Viewport";
+
+const InputGroupContext = createContext<boolean>(false);
+
+const inputGroupVariants = cva(
+  "flex relative w-full bg-transparent text-foreground focus-within:outline-none border border-input",
+  {
+    variants: {
+      size: {
+        lg: "h-12 rounded-lg",
+        md: "h-10 rounded-md max-md:h-11",
+        sm: "h-8 rounded-md max-md:h-11",
+        xs: "h-6 rounded max-md:h-11"
+      },
+      isDisabled: {
+        true: "opacity-50 disabled:cursor-not-allowed",
+        false: ""
+      },
+      isInvalid: {
+        true: "border-destructive focus-within:ring-destructive",
+        false: ""
+      },
+      insetRing: {
+        false:
+          "outline-none focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
+        true: "focus-within:outline-none focus-within:box-shadow-[inset 0 0 0 2px var(--ring-color)]"
+      }
+    },
+    defaultVariants: {
+      size: "md",
+      isDisabled: false,
+      isInvalid: false,
+      insetRing: false
+    }
+  }
+);
+
+export interface InputGroupProps
+  extends Omit<InputHTMLAttributes<HTMLInputElement>, "size">,
+    VariantProps<typeof inputGroupVariants> {
+  isDisabled?: boolean;
+  isInvalid?: boolean;
+}
+
+const InputGroup = forwardRef<HTMLDivElement, InputGroupProps>(
+  (
+    {
+      className,
+      isInvalid = false,
+      isDisabled = false,
+      insetRing,
+      size,
+      children,
+      ...props
+    },
+    ref
+  ) => {
+    const validChildren = getValidChildren(children);
+
+    const _children = validChildren.map((child, index) => {
+      const isDomElement = typeof child.type === "string";
+      const extraProps: any = {
+        key: index,
+        className: child.props.className
+      };
+
+      if (!isDomElement) {
+        extraProps.isFirstChild = index === 0;
+        extraProps.isLastChild = index === validChildren.length - 1;
+        extraProps.size = size;
+        extraProps.isInvalid = isInvalid;
+        extraProps.isDisabled = isDisabled;
+      }
+
+      return cloneElement(child, extraProps);
+    });
+
+    return (
+      <InputGroupContext.Provider value={true}>
+        <div
+          className={cn(
+            inputGroupVariants({
+              size,
+              isDisabled,
+              isInvalid,
+              insetRing,
+              className
+            })
+          )}
+          {...props}
+          ref={ref}
+        >
+          {_children}
+        </div>
+      </InputGroupContext.Provider>
+    );
+  }
+);
+InputGroup.displayName = "InputGroup";
+
+export const inputVariants = cva(
+  "flex w-full px-3 py-1 bg-transparent text-foreground transition-colors placeholder:text-muted-foreground disabled:opacity-50 rounded-md ",
+  {
+    variants: {
+      size: {
+        lg: "h-12 rounded-lg px-4 text-base",
+        md: "h-10 rounded-md px-4 text-sm max-md:h-11 max-md:text-base",
+        sm: "h-8 rounded-md px-3 text-sm max-md:h-11 max-md:text-base",
+        xs: "h-6 rounded px-2 text-sm max-md:h-11 max-md:text-base"
+      },
+      isInputGroup: {
+        true: "h-auto outline-none focus-within:outline-none",
+        false:
+          "border border-input shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed file:border-0 file:bg-transparent file:text-sm file:font-medium"
+      },
+      isFirstChild: {
+        true: "",
+        false: ""
+      },
+      isLastChild: {
+        true: "",
+        false: ""
+      },
+      isInvalid: {
+        true: "border-destructive ring-destructive focus-visible:ring-destructive",
+        false: ""
+      },
+      isReadOnly: {
+        true: "text-muted-foreground",
+        false: ""
+      },
+      isDisabled: {
+        true: "text-muted-foreground",
+        false: ""
+      },
+      borderless: {
+        true: "border-none px-0 outline-none ring-transparent focus:ring-transparent focus:ring-offset-0 focus-visible:ring-transparent focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 shadow-none",
+        false: ""
+      }
+    },
+    compoundVariants: [
+      {
+        isFirstChild: false,
+        isInputGroup: true,
+        class: "rounded-l-none border-l-0"
+      },
+      {
+        isLastChild: false,
+        isInputGroup: true,
+        class: "rounded-r-none border-r-0"
+      },
+      {
+        isInvalid: true,
+        isInputGroup: false,
+        class: "focus-visible:ring-destructive"
+      }
+    ],
+    defaultVariants: {
+      size: "md",
+      isInputGroup: false,
+      isFirstChild: false,
+      isLastChild: false,
+      isInvalid: false,
+      borderless: false
+    }
+  }
+);
+
+export interface InputProps
+  extends Omit<InputHTMLAttributes<HTMLInputElement>, "size">,
+    VariantProps<typeof inputVariants> {
+  isFirstChild?: boolean;
+  isLastChild?: boolean;
+  isInvalid?: boolean;
+  isDisabled?: boolean;
+  isReadOnly?: boolean;
+  borderless?: boolean;
+}
+
+const Input = forwardRef<HTMLInputElement, InputProps>(
+  (
+    {
+      className,
+      size,
+      isFirstChild = true,
+      isLastChild = true,
+      isInvalid = false,
+      isDisabled,
+      isReadOnly = false,
+      borderless = false,
+      type = "text",
+      ...props
+    },
+    ref
+  ) => {
+    const isInputGroup = useContext(InputGroupContext) ?? false;
+    const disabled = isDisabled ?? props.disabled ?? false;
+    const autoFocus = usePhoneAutoFocus(props.autoFocus);
+
+    return (
+      <ReactAria.Input
+        className={cn(
+          inputVariants({
+            size,
+            isInputGroup,
+            isFirstChild,
+            isLastChild,
+            isInvalid,
+            isReadOnly,
+            isDisabled: disabled,
+            borderless
+          }),
+          className
+        )}
+        {...props}
+        autoFocus={autoFocus}
+        // Explicit disabled must survive the spread; it was being overwritten.
+        disabled={disabled}
+        readOnly={isReadOnly}
+        ref={ref}
+        type={type}
+      />
+    );
+  }
+);
+Input.displayName = "Input";
+
+const inputAddonVariants = cva(
+  "flex items-center justify-center bg-muted text-muted-foreground border border-input",
+  {
+    variants: {
+      placement: {
+        left: "",
+        right: ""
+      },
+      size: {
+        lg: "h-12 px-3",
+        md: "h-10 px-3 max-md:h-11",
+        sm: "h-8 px-2 max-md:h-11",
+        xs: "h-6 px-1 max-md:h-11"
+      },
+      isDisabled: {
+        true: "opacity-50 cursor-not-allowed bg-muted text-muted-foreground",
+        false: ""
+      }
+    },
+    compoundVariants: [
+      {
+        placement: "left",
+        size: "lg",
+        class: "rounded-l-lg"
+      },
+      {
+        placement: "left",
+        size: "md",
+        class: "rounded-l-md"
+      },
+      {
+        placement: "left",
+        size: "sm",
+        class: "rounded-l"
+      },
+      {
+        placement: "left",
+        size: "xs",
+        class: "rounded-l"
+      },
+      {
+        placement: "right",
+        size: "lg",
+        class: "rounded-r-lg"
+      },
+      {
+        placement: "right",
+        size: "md",
+        class: "rounded-r-md"
+      },
+      {
+        placement: "right",
+        size: "sm",
+        class: "rounded-r"
+      },
+      {
+        placement: "right",
+        size: "xs",
+        class: "rounded-r"
+      }
+    ],
+    defaultVariants: {
+      size: "md",
+      isDisabled: false
+    }
+  }
+);
+
+export interface InputAddonProps
+  extends HTMLAttributes<HTMLDivElement>,
+    VariantProps<typeof inputAddonVariants> {
+  isDisabled?: boolean;
+}
+
+const InputLeftAddon = forwardRef<HTMLDivElement, InputAddonProps>(
+  ({ className, size, isDisabled = false, ...props }, ref) => {
+    return (
+      <div
+        className={cn(
+          inputAddonVariants({
+            placement: "left",
+            size,
+            isDisabled,
+            className
+          })
+        )}
+        {...props}
+        ref={ref}
+      />
+    );
+  }
+);
+InputLeftAddon.displayName = "InputLeftAddon";
+
+const InputRightAddon = forwardRef<HTMLDivElement, InputAddonProps>(
+  ({ className, size, isDisabled = false, ...props }, ref) => {
+    return (
+      <div
+        className={cn(
+          inputAddonVariants({
+            placement: "right",
+            size,
+            isDisabled,
+            className
+          })
+        )}
+        {...props}
+        ref={ref}
+      />
+    );
+  }
+);
+InputRightAddon.displayName = "InputRightAddon";
+
+const inputElementVariants = cva(
+  "flex w-auto h-full space-x-2 whitespace-nowrap items-center justify-center",
+  {
+    variants: {
+      size: {
+        lg: "h-12",
+        md: "h-10 max-md:h-11",
+        sm: "h-8 max-md:h-11",
+        xs: "h-6 max-md:h-11"
+      },
+      placement: {
+        left: "pl-2",
+        right: "pr-2"
+      },
+      isDisabled: {
+        true: "opacity-50 cursor-not-allowed",
+        false: ""
+      }
+    },
+    defaultVariants: {
+      isDisabled: false
+    }
+  }
+);
+
+export interface InputElementProps
+  extends HTMLAttributes<HTMLDivElement>,
+    VariantProps<typeof inputElementVariants> {
+  isFirstChild?: boolean;
+  isLastChild?: boolean;
+  isDisabled?: boolean;
+  isInvalid?: boolean;
+}
+
+const InputLeftElement = forwardRef<HTMLDivElement, InputElementProps>(
+  (
+    {
+      className,
+      size,
+      isFirstChild,
+      isLastChild,
+      isDisabled = false,
+      isInvalid,
+      ...props
+    },
+    ref
+  ) => {
+    return (
+      <div
+        className={cn(
+          inputElementVariants({
+            size,
+            placement: "left",
+            isDisabled,
+            className
+          })
+        )}
+        {...props}
+        ref={ref}
+      />
+    );
+  }
+);
+InputLeftElement.displayName = "InputLeftElement";
+
+const InputRightElement = forwardRef<HTMLDivElement, InputElementProps>(
+  (
+    {
+      className,
+      size,
+      isFirstChild,
+      isLastChild,
+      isDisabled = false,
+      ...props
+    },
+    ref
+  ) => {
+    return (
+      <div
+        className={cn(
+          inputElementVariants({
+            size,
+            placement: "right",
+            isDisabled,
+            className
+          })
+        )}
+        {...props}
+        ref={ref}
+      />
+    );
+  }
+);
+InputRightElement.displayName = "InputRightElement";
+
+export {
+  Input,
+  InputGroup,
+  InputLeftAddon,
+  InputLeftElement,
+  InputRightAddon,
+  InputRightElement
+};

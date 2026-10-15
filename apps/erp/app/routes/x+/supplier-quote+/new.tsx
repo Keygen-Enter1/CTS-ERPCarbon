@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { ActionFunctionArgs } from "react-router";
+import { NewRecordPage } from "~/components/NewRecordPage";
+import { useCompanyToday, useUrlParams, useUser } from "~/hooks";
+import {
+  insertSupplierQuote,
+  supplierQuoteValidator
+} from "~/modules/purchasing";
+import { SupplierQuoteForm } from "~/modules/purchasing/ui/SupplierQuote";
+import { requireCompanyRecord } from "~/modules/shared/shared.server";
+import { setCustomFields } from "~/utils/form";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: msg`Supplier Quote`,
+  to: path.to.supplierQuotes,
+  module: "purchasing"
+};
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, companyGroupId, userId } =
+    await requirePermissions(request, {
+      create: "purchasing",
+      bypassRls: true
+    });
+
+  const formData = await request.formData();
+  const validation = await validator(supplierQuoteValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const { id: _id, ...data } = validation.data;
+
+  // bypassRls hands back the service role: the supplier (and its contact and
+  // location) on the form must belong to this company.
+  await Promise.all([
+    requireCompanyRecord(client, "supplier", companyId, {
+      id: data.supplierId
+    }),
+    data.supplierContactId
+      ? requireCompanyRecord(client, "supplierContact", companyId, {
+          id: data.supplierContactId
+        })
+      : null,
+    data.supplierLocationId
+      ? requireCompanyRecord(client, "supplierLocation", companyId, {
+          id: data.supplierLocationId
+        })
+      : null
+  ]);
+
+  const result = await insertSupplierQuote(client, {
+    ...data,
+    supplierQuoteId: data.supplierQuoteId || undefined,
+    companyId,
+    companyGroupId,
+    createdBy: userId,
+    customFields: setCustomFields(formData)
+  });
+
+  if (result.error || !result.data) {
+    throw redirect(
+      path.to.supplierQuotes,
+      await flash(
+        request,
+        error(result.error, "Failed to insert supplier quote")
+      )
+    );
+  }
+
+  throw redirect(path.to.supplierQuote(result.data.id));
+}
+
+export default function SupplierQuoteNewRoute() {
+  const [params] = useUrlParams();
+  const { company } = useUser();
+  const supplierId = params.get("supplierId");
+  const companyToday = useCompanyToday();
+  const initialValues = {
+    supplierContactId: "",
+    supplierId: supplierId ?? "",
+    supplierReference: "",
+    expirationDate: "",
+    quotedDate: companyToday,
+    supplierQuoteId: undefined,
+    status: "Draft" as const,
+    currencyCode: company.baseCurrencyCode,
+    exchangeRate: undefined,
+    exchangeRateUpdatedAt: "",
+    supplierQuoteType: "Purchase" as const
+  };
+
+  return (
+    <NewRecordPage>
+      <SupplierQuoteForm initialValues={initialValues} />
+    </NewRecordPage>
+  );
+}

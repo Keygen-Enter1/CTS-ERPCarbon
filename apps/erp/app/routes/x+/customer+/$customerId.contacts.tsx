@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { redirect } from "@carbon/utils";
+import type { LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import { getCustomerContacts } from "~/modules/sales";
+import { CustomerContacts } from "~/modules/sales/ui/Customer";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    view: "sales"
+  });
+
+  const { customerId } = params;
+  if (!customerId) throw new Error("Could not find customerId");
+
+  const contacts = await getCustomerContacts(client, customerId);
+  if (contacts.error) {
+    throw redirect(
+      path.to.customer(customerId),
+      await flash(
+        request,
+        error(contacts.error, "Failed to fetch customer contacts")
+      )
+    );
+  }
+
+  return {
+    contacts: contacts.data ?? []
+  };
+}
+
+export default function CustomerContactsRoute() {
+  const { contacts } = useLoaderData<typeof loader>();
+
+  return <CustomerContacts contacts={contacts} />;
+}

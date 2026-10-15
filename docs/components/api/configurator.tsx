@@ -1,0 +1,389 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+"use client";
+
+import * as Dialog from "@radix-ui/react-dialog";
+import { usePathname } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
+import { parseBaseUrl } from "./base-url-parse";
+import {
+  CARBON_REGIONS,
+  DEFAULT_API_BASE,
+  DEFAULT_APP_ORIGIN
+} from "./config-constants";
+
+import { HOST_PLACEHOLDER, useApiConfig } from "./config-context";
+
+function ServerIcon({ className }: { className?: string }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className={`shrink-0 ${className ?? ""}`}>
+      <rect x="2" y="2.5" width="12" height="4.5" rx="1.2" stroke="currentColor" strokeWidth="1.2" />
+      <rect x="2" y="9" width="12" height="4.5" rx="1.2" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="4.6" cy="4.75" r="0.7" fill="currentColor" />
+      <circle cx="4.6" cy="11.25" r="0.7" fill="currentColor" />
+    </svg>
+  );
+}
+
+function KeyIcon({ className }: { className?: string }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" className={`shrink-0 ${className ?? ""}`}>
+      <circle cx="5.5" cy="5.5" r="3" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M7.6 7.6 13 13M11 11l1.4-1.4M9.6 9.6 11 8.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function Check({ className }: { className?: string }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 14 14" fill="none" className={`shrink-0 ${className ?? ""}`}>
+      <path d="M3 7.2l2.6 2.6L11 4.4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function EyeIcon({ off }: { off: boolean }) {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path d="M1.5 8S3.8 3.8 8 3.8 14.5 8 14.5 8 12.2 12.2 8 12.2 1.5 8 1.5 8Z" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="8" cy="8" r="1.9" stroke="currentColor" strokeWidth="1.2" />
+      {off && <path d="M2.5 2.5l11 11" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />}
+    </svg>
+  );
+}
+
+function ModeCard({
+  active,
+  onClick,
+  title,
+  sub,
+}: {
+  active: boolean;
+  onClick: () => void;
+  title: string;
+  sub: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`relative flex flex-col items-start gap-0.5 rounded-[10px] border px-3 py-2.5 text-left transition-colors ${
+        active
+          ? "border-ed-brand bg-ed-brand/7"
+          : "border-ed-warm-300 bg-white hover:border-ed-warm-500"
+      }`}
+    >
+      <span className={`text-ed-13 font-semi ${active ? "text-ed-brand-ink" : "text-ed-ink"}`}>
+        {title}
+      </span>
+      <span className="font-mono text-ed-11 text-ed-ink/50">
+        {sub}
+      </span>
+      {active && <Check className="absolute right-2.5 top-2.5 text-ed-brand-ink" />}
+    </button>
+  );
+}
+
+/** The two planes configure DIFFERENT hosts, so they get different choices.
+ *
+ *  The Carbon API is served by the app, and Carbon Cloud runs it in three regions —
+ *  so the reader picks a region (or their own instance). The Data API is one `rest.`
+ *  host, so it keeps "not sure / cloud / self-hosted". They write different fields
+ *  (`appBase` vs `base`), which is what lets one surface's choice survive the
+ *  other's. */
+type CarbonMode = (typeof CARBON_REGIONS)[number]["id"] | "self";
+type DataMode = "unknown" | "cloud" | "self";
+
+export function Configurator() {
+  const {
+    base,
+    setBase,
+    appBase,
+    setAppBase,
+    isDefault,
+    isUnknown,
+    apiKey,
+    setApiKey,
+    openRequest,
+  } = useApiConfig();
+  // The sidebar already swaps its tree under /api/data (see ContextualNav); the
+  // host control above it follows the same split.
+  const isDataApi = (usePathname() ?? "").startsWith("/api/data");
+
+  const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<DataMode>("unknown");
+  const [region, setRegion] = useState<CarbonMode>("us");
+  const [url, setUrl] = useState("");
+  const [key, setKey] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [urlError, setUrlError] = useState("");
+
+  // Each surface's trigger names the host ITS samples actually call. With nothing
+  // configured both show the placeholder rather than a hostname — showing a reader
+  // on their own instance a carbon.ms host is the bug that state exists to fix.
+  const shown = isDataApi ? base : appBase;
+  const host =
+    shown === null ? HOST_PLACEHOLDER : shown.replace(/^https?:\/\//, "");
+
+  // Seed the draft from current config whenever the dialog opens.
+  const onOpenChange = (next: boolean) => {
+    if (next) {
+      const matched = CARBON_REGIONS.find((r) => r.origin === appBase);
+      // No region configured yet defaults the CARD to US — the origin every sample
+      // on this surface is authored against — while the trigger keeps saying
+      // `<your-host>` until Save makes it the reader's own choice.
+      setRegion(matched ? matched.id : appBase ? "self" : "us");
+      setMode(isUnknown ? "unknown" : isDefault ? "cloud" : "self");
+      const selfUrl = isDataApi
+        ? isUnknown || isDefault
+          ? ""
+          : (base ?? "")
+        : matched
+          ? ""
+          : (appBase ?? "");
+      setUrl(selfUrl);
+      setKey(apiKey);
+      setShowKey(false);
+      setUrlError("");
+    }
+    setOpen(next);
+  };
+
+  // A <your-host> click anywhere in the tree bumps openRequest; open in response.
+  // Two Configurators are mounted at once (sidebar + mobile drawer) and both see
+  // the bump, so each answers only when its own trigger is the visible one —
+  // otherwise a single click would open two dialogs. Skipped on mount so the
+  // dialog doesn't spring open on first paint.
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const seenRequest = useRef(openRequest);
+  useEffect(() => {
+    if (openRequest === seenRequest.current) return;
+    seenRequest.current = openRequest;
+    const el = triggerRef.current;
+    if (el && (el.offsetWidth || el.offsetHeight)) onOpenChange(true);
+  }, [openRequest]);
+
+  const save = () => {
+    const selfHosted = isDataApi ? mode === "self" : region === "self";
+    let typed: string | null = null;
+    if (selfHosted) {
+      const result = parseBaseUrl(url);
+      if ("error" in result) {
+        setUrlError(result.error);
+        return;
+      }
+      typed = result.url;
+    }
+
+    if (isDataApi) {
+      if (typed) setBase(typed);
+      // REST host only — NOT the paired app origin. `appOrigin()` already resolves
+      // the cloud base to app.carbon.ms on its own, and passing it here overwrote
+      // a region the reader had chosen on the Carbon API surface.
+      else if (mode === "cloud") setBase(DEFAULT_API_BASE);
+      else setBase(null);
+    } else {
+      setAppBase(
+        typed ?? CARBON_REGIONS.find((r) => r.id === region)?.origin ?? null
+      );
+    }
+    setApiKey(key);
+    setOpen(false);
+  };
+
+  // Follows the card the reader has SELECTED, not what is saved: someone picking
+  // EU or their own instance should be sent to that instance's key settings, and
+  // the region cards are the only place this surface knows the origin from.
+  const draftOrigin =
+    region === "self"
+      ? url.trim().replace(/\/+$/, "")
+      : CARBON_REGIONS.find((r) => r.id === region)?.origin;
+  const keyOrigin =
+    (isDataApi ? appBase : draftOrigin) || appBase || DEFAULT_APP_ORIGIN;
+
+  const reset = () => {
+    setMode("unknown");
+    setRegion("us");
+    setUrl("");
+    setKey("");
+    setUrlError("");
+  };
+
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Trigger asChild>
+        <button
+          ref={triggerRef}
+          type="button"
+          className="group mb-3.5 flex w-full items-center gap-2 rounded-lg border border-ed-warm-300 bg-white px-2.5 py-2 text-left text-ed-ink/58 transition-colors hover:border-ed-warm-500 data-[state=open]:border-ed-warm-500"
+        >
+          <ServerIcon />
+          <span className="min-w-0 flex-1 truncate font-mono text-ed-13 text-ed-ink">
+            {host}
+          </span>
+          {apiKey && (
+            <span
+              title="API key set"
+              className="inline-flex items-center gap-[3px] rounded-[5px] bg-ed-green-text/12 px-[5px] py-0.5 text-ed-green-text"
+            >
+              <KeyIcon />
+            </span>
+          )}
+          <svg
+            className="shrink-0 text-ed-ink/48 transition-transform group-data-[state=open]:rotate-180"
+            width="11"
+            height="11"
+            viewBox="0 0 12 12"
+            fill="none"
+          >
+            <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      </Dialog.Trigger>
+
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-[100] bg-ed-ink/32 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
+        <Dialog.Content className="fixed left-1/2 top-[50%] z-[101] flex w-[calc(100vw-32px)] max-w-110 -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-[14px] border border-ed-warm-300 bg-ed-paper shadow-[0_24px_60px_-12px_rgba(38,35,35,0.28)] data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-3 border-b border-ed-warm-150 px-5 py-4">
+            <div>
+              <Dialog.Title className="m-0 text-ed-16 font-semi text-ink">API configuration</Dialog.Title>
+              <Dialog.Description className="m-0 mt-[3px] text-ed-13 leading-normal text-ed-ink/60">
+                {isDataApi
+                  ? "Tune the base URL and key used across the code samples."
+                  : "Pick the instance the code samples should call, and the key they carry."}
+              </Dialog.Description>
+            </div>
+            <Dialog.Close
+              aria-label="Close"
+              className="-mr-[4px] -mt-[2px] shrink-0 rounded-[7px] p-[5px] text-ed-ink/50 transition-colors hover:bg-ed-hairline/70 hover:text-ed-ink"
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden>
+                <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              </svg>
+            </Dialog.Close>
+          </div>
+
+          {/* Body */}
+          <div className="flex flex-col gap-[18px] px-5 py-[18px]">
+            <section>
+              <p className="m-0 mb-2 font-mono text-ed-11 font-semibold uppercase tracking-[0.07em] text-ed-ink/50">
+                Environment
+              </p>
+              {isDataApi ? (
+                <div className="grid grid-cols-3 gap-2">
+                  <ModeCard active={mode === "unknown"} onClick={() => setMode("unknown")} title="Not sure" sub="<your-host>" />
+                  <ModeCard active={mode === "cloud"} onClick={() => setMode("cloud")} title="Carbon Cloud" sub="rest.carbon.ms" />
+                  <ModeCard active={mode === "self"} onClick={() => setMode("self")} title="Self-hosted" sub="Your instance" />
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  {CARBON_REGIONS.map((r) => (
+                    <ModeCard
+                      key={r.id}
+                      active={region === r.id}
+                      onClick={() => setRegion(r.id)}
+                      title={r.label}
+                      sub={r.origin.replace(/^https?:\/\//, "")}
+                    />
+                  ))}
+                  <ModeCard active={region === "self"} onClick={() => setRegion("self")} title="Self-hosted" sub="Your instance" />
+                </div>
+              )}
+              {(isDataApi ? mode === "self" : region === "self") && (
+                <div className="mt-2">
+                  <input
+                    value={url}
+                    autoFocus
+                    onChange={(e) => {
+                      setUrl(e.target.value);
+                      if (urlError) setUrlError("");
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") save();
+                    }}
+                    placeholder={
+                      isDataApi
+                        ? "https://api.your-domain.com"
+                        : "https://carbon.your-domain.com"
+                    }
+                    aria-invalid={!!urlError}
+                    className={`w-full rounded-lg border bg-white px-[11px] py-[9px] font-mono text-ed-12 text-ed-ink outline-none placeholder:text-ed-ink/42 ${
+                      urlError ? "border-ed-red-bright focus:border-ed-red-bright" : "border-ed-warm-300 focus:border-ed-brand"
+                    }`}
+                  />
+                  {urlError && (
+                    <p className="mt-[5px] text-ed-11 leading-[1.3] text-ed-red-bright">{urlError}</p>
+                  )}
+                </div>
+              )}
+            </section>
+
+            <section>
+              <p className="m-0 mb-2 font-mono text-ed-11 font-semibold uppercase tracking-[0.07em] text-ed-ink/50">
+                API key
+              </p>
+              <div className="relative">
+                <input
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") save();
+                  }}
+                  type={showKey ? "text" : "password"}
+                  placeholder="crbn_…"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="w-full rounded-lg border border-ed-warm-300 bg-white py-[9px] pl-[11px] pr-[38px] font-mono text-ed-12 text-ed-ink outline-none transition-colors placeholder:text-ed-ink/42 focus:border-ed-brand"
+                />
+                {key && (
+                  <button
+                    type="button"
+                    aria-label={showKey ? "Hide key" : "Show key"}
+                    onClick={() => setShowKey((s) => !s)}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-md p-[5px] text-ed-ink/50 transition-colors hover:bg-ed-hairline/70 hover:text-ed-ink"
+                  >
+                    <EyeIcon off={showKey} />
+                  </button>
+                )}
+              </div>
+              <p className="m-0 mt-[7px] text-ed-12 leading-normal text-ed-ink/55">
+                Stored in this browser only and dropped into the samples. Never sent to Carbon.{" "}
+                <a
+                  href={`${keyOrigin}/x/settings/api-keys`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-ed-brand-ink no-underline hover:underline"
+                >
+                  Create a key ↗
+                </a>
+              </p>
+            </section>
+          </div>
+
+          {/* Footer */}
+          <div className="flex items-center justify-between gap-2.5 border-t border-ed-warm-150 px-5 py-3.5">
+            <button
+              type="button"
+              onClick={reset}
+              className="rounded-lg px-2.5 py-2 text-ed-13 font-book text-ed-ink/60 transition-colors hover:bg-ed-hairline/70 hover:text-ed-ink"
+            >
+              Reset to defaults
+            </button>
+            <button
+              type="button"
+              onClick={save}
+              className="group relative inline-flex h-[38px] items-center justify-center rounded-lg px-[18px]"
+            >
+              <span aria-hidden className="pointer-events-none absolute inset-0 rounded-lg cta-btn-dark" />
+              <span aria-hidden className="pointer-events-none absolute inset-0 rounded-lg btn-dark-hover opacity-0 transition-opacity duration-200 ease-out group-hover:opacity-100" />
+              <span className="text-on-dark relative z-10 text-ed-13 font-book tracking-[0.15px]">Save</span>
+            </button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}

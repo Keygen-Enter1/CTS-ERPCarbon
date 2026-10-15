@@ -1,0 +1,601 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import {
+  Hidden,
+  Number,
+  Select,
+  Submit,
+  useControlField,
+  ValidatedForm,
+  validator
+} from "@carbon/form";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  ChoiceSelect,
+  ScrollArea,
+  toast
+} from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useEffect } from "react";
+import {
+  LuLayers,
+  LuPackageCheck,
+  LuShield,
+  LuShieldCheck,
+  LuTimerReset,
+  LuTriangleAlert,
+  LuUndo2
+} from "react-icons/lu";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useFetcher, useLoaderData } from "react-router";
+import { SettingsPage, SettingsPageHeading } from "~/components/SettingsPage";
+import SettingsSectionHeader from "~/components/SettingsSectionHeader";
+import {
+  getCompanySettings,
+  incompletePickingListPolicyValidator,
+  kanbanOutputTypes,
+  kanbanOutputValidator,
+  returnPickedMaterialTimingValidator,
+  shelfLifeSettingsValidator,
+  updateIncompletePickingListPolicySetting,
+  updateKanbanOutputSetting,
+  updateReturnPickedMaterialTimingSetting,
+  updateShelfLifeSettings
+} from "~/modules/settings";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+type CalculatedInputScope = "AllInputs" | "ManagedInputsOnly";
+type ExpiredEntityPolicy = "Warn" | "Block" | "BlockWithOverride";
+type IncompletePickingListPolicy = "warn" | "error";
+type ReturnPickedMaterialTiming = "job" | "operation";
+
+export const handle: Handle = {
+  breadcrumb: msg`Inventory`,
+  to: path.to.inventorySettings
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "settings"
+  });
+
+  const companySettings = await getCompanySettings(client, companyId);
+  if (!companySettings.data)
+    throw redirect(
+      path.to.settings,
+      await flash(
+        request,
+        error(companySettings.error, "Failed to get company settings")
+      )
+    );
+  return { companySettings: companySettings.data };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    update: "settings"
+  });
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  switch (intent) {
+    case "kanbanOutput":
+      const kanbanOutputValidation = await validator(
+        kanbanOutputValidator
+      ).validate(formData);
+
+      if (kanbanOutputValidation.error) {
+        return { success: false, message: "Invalid form data" };
+      }
+
+      const kanbanOutputResult = await updateKanbanOutputSetting(
+        client,
+        companyId,
+        kanbanOutputValidation.data.kanbanOutput
+      );
+      if (kanbanOutputResult.error)
+        return {
+          success: false,
+          message: kanbanOutputResult.error.message
+        };
+
+      return { success: true, message: "Kanban output setting updated" };
+
+    case "shelfLife":
+      const shelfLifeValidation = await validator(
+        shelfLifeSettingsValidator
+      ).validate(formData);
+
+      if (shelfLifeValidation.error) {
+        return { success: false, message: "Invalid form data" };
+      }
+
+      const shelfLifeResult = await updateShelfLifeSettings(client, companyId, {
+        nearExpiryWarningDays: shelfLifeValidation.data.nearExpiryWarningDays,
+        defaultShelfLifeDays: shelfLifeValidation.data.defaultShelfLifeDays,
+        calculatedInputScope: shelfLifeValidation.data.calculatedInputScope,
+        expiredEntityPolicy: shelfLifeValidation.data.expiredEntityPolicy
+      });
+      if (shelfLifeResult.error)
+        return {
+          success: false,
+          message: shelfLifeResult.error.message
+        };
+
+      return {
+        success: true,
+        message: "Shelf life & expiry settings updated"
+      };
+
+    case "incompletePickingListPolicy":
+      const pickingPolicyValidation = await validator(
+        incompletePickingListPolicyValidator
+      ).validate(formData);
+
+      if (pickingPolicyValidation.error) {
+        return { success: false, message: "Invalid form data" };
+      }
+
+      const pickingPolicyResult =
+        await updateIncompletePickingListPolicySetting(
+          client,
+          companyId,
+          pickingPolicyValidation.data.incompletePickingListPolicy
+        );
+      if (pickingPolicyResult.error)
+        return {
+          success: false,
+          message: pickingPolicyResult.error.message
+        };
+
+      return {
+        success: true,
+        message: "Picking list completion policy updated"
+      };
+
+    case "returnPickedMaterialTiming":
+      const returnTimingValidation = await validator(
+        returnPickedMaterialTimingValidator
+      ).validate(formData);
+
+      if (returnTimingValidation.error) {
+        return { success: false, message: "Invalid form data" };
+      }
+
+      const returnTimingResult = await updateReturnPickedMaterialTimingSetting(
+        client,
+        companyId,
+        returnTimingValidation.data.returnPickedMaterialTiming
+      );
+      if (returnTimingResult.error)
+        return {
+          success: false,
+          message: returnTimingResult.error.message
+        };
+
+      return {
+        success: true,
+        message: "Material return timing updated"
+      };
+  }
+
+  return { success: false, message: "Invalid form data" };
+}
+
+const outputLabels: Record<(typeof kanbanOutputTypes)[number], string> = {
+  label: "Label",
+  qrcode: "QR Code",
+  url: "URL"
+};
+
+export default function InventorySettingsRoute() {
+  const { t } = useLingui();
+  const { companySettings } = useLoaderData<typeof loader>();
+  const fetcher = useFetcher<typeof action>();
+
+  useEffect(() => {
+    if (fetcher.data?.success === true && fetcher?.data?.message) {
+      toast.success(fetcher.data.message);
+    }
+
+    if (fetcher.data?.success === false && fetcher?.data?.message) {
+      toast.error(fetcher.data.message);
+    }
+  }, [fetcher.data?.message, fetcher.data?.success]);
+
+  return (
+    <ScrollArea className="w-full h-[calc(100dvh-var(--topbar-height)-var(--content-inset))]">
+      <SettingsPage className="gap-4">
+        <SettingsPageHeading>
+          <Trans>Inventory</Trans>
+        </SettingsPageHeading>
+
+        <SettingsSectionHeader>
+          <Trans>Kanban</Trans>
+        </SettingsSectionHeader>
+
+        <Card>
+          <ValidatedForm
+            method="post"
+            validator={kanbanOutputValidator}
+            defaultValues={{
+              kanbanOutput: companySettings.kanbanOutput ?? "qrcode"
+            }}
+            fetcher={fetcher}
+          >
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Trans>Kanban Output</Trans>
+              </CardTitle>
+              <CardDescription>
+                <Trans>
+                  Style of kanban output to show in the Kanban table
+                </Trans>
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Hidden name="intent" value="kanbanOutput" />
+              <div className="flex flex-col gap-8 max-w-[400px]">
+                <div className="flex flex-col gap-2">
+                  <Select
+                    name="kanbanOutput"
+                    label={t`Output`}
+                    options={kanbanOutputTypes.map((type) => ({
+                      value: type,
+                      label: outputLabels[type]
+                    }))}
+                  />
+                </div>
+              </div>
+            </CardContent>
+            <CardFooter>
+              <Submit>
+                <Trans>Save</Trans>
+              </Submit>
+            </CardFooter>
+          </ValidatedForm>
+        </Card>
+
+        <SettingsSectionHeader>
+          <Trans>Traceability</Trans>
+        </SettingsSectionHeader>
+
+        <Card>
+          <ValidatedForm
+            method="post"
+            validator={shelfLifeSettingsValidator}
+            defaultValues={(() => {
+              const blob =
+                (companySettings.inventoryShelfLife as {
+                  nearExpiryWarningDays?: number | null;
+                  defaultShelfLifeDays?: number;
+                  calculatedInputScope?: "AllInputs" | "ManagedInputsOnly";
+                  expiredEntityPolicy?: "Warn" | "Block" | "BlockWithOverride";
+                } | null) ?? {};
+              return {
+                nearExpiryWarningDays: blob.nearExpiryWarningDays ?? undefined,
+                defaultShelfLifeDays: blob.defaultShelfLifeDays ?? 7,
+                calculatedInputScope: blob.calculatedInputScope ?? "AllInputs",
+                expiredEntityPolicy: blob.expiredEntityPolicy ?? "Block"
+              };
+            })()}
+            fetcher={fetcher}
+          >
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Trans>Shelf life</Trans>
+              </CardTitle>
+              <CardDescription>
+                <Trans>
+                  Manage how shelf life is tracked, computed, and enforced
+                  across inventory.
+                </Trans>
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Hidden name="intent" value="shelfLife" />
+              <div className="flex flex-col gap-8 max-w-[640px]">
+                <ShelfLifeNumbers />
+                <div className="flex flex-col gap-3">
+                  <ShelfLifeSectionLabel
+                    title={t`Calculated finished-good expiry`}
+                    description={t`When a finished product's shelf life is set to Calculated, pick which consumed inputs feed the calculation.`}
+                  />
+                  <CalculatedInputScopeChoice />
+                </div>
+                <div className="flex flex-col gap-3">
+                  <ShelfLifeSectionLabel
+                    title={t`When expired stock is used`}
+                    description={t`Decide what an operator sees if they try to issue a batch or serial that's already expired.`}
+                  />
+                  <ExpiredEntityPolicyChoice />
+                </div>
+              </div>
+            </CardContent>
+            <CardFooter>
+              <Submit>
+                <Trans>Save</Trans>
+              </Submit>
+            </CardFooter>
+          </ValidatedForm>
+        </Card>
+
+        <Card>
+          <ValidatedForm
+            method="post"
+            validator={incompletePickingListPolicyValidator}
+            defaultValues={{
+              incompletePickingListPolicy:
+                (companySettings.incompletePickingListPolicy as
+                  | IncompletePickingListPolicy
+                  | null
+                  | undefined) ?? "warn"
+            }}
+            fetcher={fetcher}
+          >
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Trans>Finishing an incomplete pick</Trans>
+              </CardTitle>
+              <CardDescription>
+                <Trans>
+                  Decide what happens when an operator presses Finish on the
+                  shop floor with material still unpicked.
+                </Trans>
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Hidden name="intent" value="incompletePickingListPolicy" />
+              <div className="flex flex-col gap-3 max-w-[640px]">
+                <IncompletePickingListPolicyChoice />
+              </div>
+            </CardContent>
+            <CardFooter>
+              <Submit>
+                <Trans>Save</Trans>
+              </Submit>
+            </CardFooter>
+          </ValidatedForm>
+        </Card>
+
+        <Card>
+          <ValidatedForm
+            method="post"
+            validator={returnPickedMaterialTimingValidator}
+            defaultValues={{
+              returnPickedMaterialTiming:
+                (companySettings.returnPickedMaterialTiming as
+                  | ReturnPickedMaterialTiming
+                  | null
+                  | undefined) ?? "job"
+            }}
+            fetcher={fetcher}
+          >
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Trans>Returning unused picked material</Trans>
+              </CardTitle>
+              <CardDescription>
+                <Trans>
+                  Decide when material picked to a work center but not consumed
+                  flows back to the warehouse.
+                </Trans>
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Hidden name="intent" value="returnPickedMaterialTiming" />
+              <div className="flex flex-col gap-3 max-w-[640px]">
+                <ReturnPickedMaterialTimingChoice />
+              </div>
+            </CardContent>
+            <CardFooter>
+              <Submit>
+                <Trans>Save</Trans>
+              </Submit>
+            </CardFooter>
+          </ValidatedForm>
+        </Card>
+      </SettingsPage>
+    </ScrollArea>
+  );
+}
+
+// Inline section label used inside a Card. Title + helper copy without a
+// border line — keeps the visual hierarchy quiet so the cards underneath
+// carry the weight.
+function ShelfLifeSectionLabel({
+  title,
+  description
+}: {
+  title: string;
+  description: string;
+}) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-sm font-medium">{title}</span>
+      <span className="text-xs text-muted-foreground">{description}</span>
+    </div>
+  );
+}
+
+// Numeric pair (badge threshold + default shelf life). Pulled out so the
+// parent CardContent can compose the form as a sequence of sections.
+function ShelfLifeNumbers() {
+  const { t } = useLingui();
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4 w-full max-w-[640px]">
+      <Number
+        name="nearExpiryWarningDays"
+        label={t`Warn this many days before expiry`}
+        minValue={0}
+        maxValue={365}
+        helperText={t`Items inside this window get a yellow badge.`}
+        termId="shelf-life"
+      />
+      <Number
+        name="defaultShelfLifeDays"
+        label={t`Default shelf-life duration (days)`}
+        minValue={1}
+        maxValue={365}
+        helperText={t`Pre-filled for a new item when expiry is Fixed Duration.`}
+        termId="shelf-life"
+      />
+    </div>
+  );
+}
+
+// ChoiceSelect for the Calculated-mode input scope. Compact trigger plus
+// a rich dropdown — keeps the form scannable while still surfacing the
+// trade-off when the user opens the picker.
+function CalculatedInputScopeChoice() {
+  const { t } = useLingui();
+  const [value, setValue] = useControlField<CalculatedInputScope>(
+    "calculatedInputScope"
+  );
+  const current: CalculatedInputScope = value ?? "AllInputs";
+  return (
+    <>
+      <ChoiceSelect<CalculatedInputScope>
+        value={current}
+        onChange={setValue}
+        options={[
+          {
+            value: "ManagedInputsOnly",
+            title: t`Sub-assembly expiries only`,
+            description: t`Skip raw-material dates set at receipt. Only inputs with their own shelf-life policy count.`,
+            icon: <LuShieldCheck />
+          },
+          {
+            value: "AllInputs",
+            title: t`Calculate from BOM`,
+            description: t`Soonest expiry across every material sets the finished good.`,
+            icon: <LuLayers />
+          }
+        ]}
+      />
+      <input type="hidden" name="calculatedInputScope" value={current} />
+    </>
+  );
+}
+
+// ChoiceSelect for the expired-entity enforcement policy. Three options
+// without flooding the layout — descriptions only show in the open menu.
+function ExpiredEntityPolicyChoice() {
+  const { t } = useLingui();
+  const [value, setValue] = useControlField<ExpiredEntityPolicy>(
+    "expiredEntityPolicy"
+  );
+  const current: ExpiredEntityPolicy = value ?? "Block";
+  return (
+    <>
+      <ChoiceSelect<ExpiredEntityPolicy>
+        value={current}
+        onChange={setValue}
+        options={[
+          {
+            value: "Warn",
+            title: t`Warn but allow`,
+            description: t`Operator gets a warning. Stock still goes through.`,
+            icon: <LuTriangleAlert />
+          },
+          {
+            value: "Block",
+            title: t`Block with an error`,
+            description: t`Operator must pick a different batch/serial.`,
+            icon: <LuShield />
+          },
+          {
+            value: "BlockWithOverride",
+            title: t`Block, allow override`,
+            description: t`Override needs the inventory:update permission and a reason.`,
+            icon: <LuTimerReset />
+          }
+        ]}
+      />
+      <input type="hidden" name="expiredEntityPolicy" value={current} />
+    </>
+  );
+}
+
+// ChoiceSelect for the incomplete-picking-list completion policy. Warn lets the
+// operator acknowledge & finish (list flagged Partial); Error blocks Finish
+// until every line is picked or marked Short.
+function IncompletePickingListPolicyChoice() {
+  const { t } = useLingui();
+  const [value, setValue] = useControlField<IncompletePickingListPolicy>(
+    "incompletePickingListPolicy"
+  );
+  const current: IncompletePickingListPolicy = value ?? "warn";
+  return (
+    <>
+      <ChoiceSelect<IncompletePickingListPolicy>
+        value={current}
+        onChange={setValue}
+        options={[
+          {
+            value: "warn",
+            title: t`Warn but allow`,
+            description: t`Operator sees the missing items, can acknowledge & finish. The list is flagged Partial.`,
+            icon: <LuTriangleAlert />
+          },
+          {
+            value: "error",
+            title: t`Block with an error`,
+            description: t`Finishing is refused until every line is picked or marked Short.`,
+            icon: <LuShield />
+          }
+        ]}
+      />
+      <input type="hidden" name="incompletePickingListPolicy" value={current} />
+    </>
+  );
+}
+
+// ChoiceSelect for when un-consumed picked material returns to the warehouse.
+// 'job' flushes the remainder when the whole job completes; 'operation' flushes
+// each operation's remainder as soon as that operation is Done (holding back
+// what completion-time backflush still needs).
+function ReturnPickedMaterialTimingChoice() {
+  const { t } = useLingui();
+  const [value, setValue] = useControlField<ReturnPickedMaterialTiming>(
+    "returnPickedMaterialTiming"
+  );
+  const current: ReturnPickedMaterialTiming = value ?? "job";
+  return (
+    <>
+      <ChoiceSelect<ReturnPickedMaterialTiming>
+        value={current}
+        onChange={setValue}
+        options={[
+          {
+            value: "job",
+            title: t`At job completion`,
+            description: t`Leftover staged material returns when the whole job completes.`,
+            icon: <LuPackageCheck />
+          },
+          {
+            value: "operation",
+            title: t`At operation completion`,
+            description: t`Each operation's unused material returns as soon as the operation is done.`,
+            icon: <LuUndo2 />
+          }
+        ]}
+      />
+      <input type="hidden" name="returnPickedMaterialTiming" value={current} />
+    </>
+  );
+}

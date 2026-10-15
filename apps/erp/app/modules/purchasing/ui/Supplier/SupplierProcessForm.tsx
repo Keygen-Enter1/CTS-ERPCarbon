@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ValidatedForm } from "@carbon/form";
+import {
+  Button,
+  HStack,
+  ModalDrawer,
+  ModalDrawerBody,
+  ModalDrawerContent,
+  ModalDrawerFooter,
+  ModalDrawerHeader,
+  ModalDrawerProvider,
+  ModalDrawerTitle,
+  toast,
+  useCloseRoute,
+  VStack
+} from "@carbon/react";
+import { INPUT_FORMAT } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { useEffect, useState } from "react";
+import { useFetcher, useParams } from "react-router";
+import type { z } from "zod";
+import {
+  CustomFormFields,
+  Hidden,
+  Number,
+  Process,
+  Submit,
+  Supplier
+} from "~/components/Form";
+import { useCurrencyDecimals, usePermissions, useUser } from "~/hooks";
+import type { SupplierProcess } from "~/modules/purchasing";
+import { supplierProcessValidator } from "~/modules/purchasing";
+import { path } from "~/utils/path";
+
+type SupplierProcessFormProps = {
+  initialValues: z.infer<typeof supplierProcessValidator>;
+  type?: "drawer" | "modal";
+  open?: boolean;
+  onClose: () => void;
+};
+
+const SupplierProcessForm = ({
+  initialValues,
+  type = "drawer",
+  open = true,
+  onClose
+}: SupplierProcessFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const fetcher = useFetcher<PostgrestResponse<SupplierProcess>>();
+  const { supplierId } = useParams();
+  const [supplier, setSupplier] = useState<string | undefined>(supplierId);
+  const closeRoute = useCloseRoute();
+
+  const { company } = useUser();
+  const baseCurrency = company?.baseCurrencyCode ?? "USD";
+  const currencyDecimals = useCurrencyDecimals(baseCurrency);
+
+  useEffect(() => {
+    if (type !== "modal") return;
+
+    if (fetcher.state === "loading" && fetcher.data?.data) {
+      onClose?.();
+      toast.success(`Created supplier process`);
+    } else if (fetcher.state === "idle" && fetcher.data?.error) {
+      toast.error(`Failed to create supplier process`);
+    }
+  }, [fetcher.data, fetcher.state, onClose, type]);
+
+  const isEditing = initialValues.id !== undefined;
+  const isDisabled = isEditing
+    ? !permissions.can("update", "purchasing")
+    : !permissions.can("create", "purchasing");
+
+  return (
+    <ModalDrawerProvider type={type}>
+      <ModalDrawer
+        open={open}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) {
+            if (type === "modal") {
+              onClose?.();
+            } else {
+              closeRoute();
+            }
+          }
+        }}
+      >
+        <ModalDrawerContent>
+          <ValidatedForm
+            validator={supplierProcessValidator}
+            method="post"
+            action={
+              isEditing
+                ? path.to.supplierProcess(supplier!, initialValues.id!)
+                : path.to.newSupplierProcess(supplier!)
+            }
+            defaultValues={initialValues}
+            fetcher={fetcher}
+            className="flex flex-col h-full"
+          >
+            <ModalDrawerHeader>
+              <ModalDrawerTitle>
+                {isEditing ? "Edit" : "New"} Supplier Process
+              </ModalDrawerTitle>
+            </ModalDrawerHeader>
+            <ModalDrawerBody>
+              <Hidden name="id" />
+              <Hidden name="type" value={type} />
+              {supplierId && <Hidden name="supplierId" value={supplierId} />}
+              <VStack spacing={4}>
+                {supplierId === undefined && (
+                  <Supplier
+                    name="supplierId"
+                    label={t`Supplier`}
+                    onChange={(newValue) => setSupplier(newValue?.value)}
+                  />
+                )}
+                <Process name="processId" label={t`Process`} />
+                <Number
+                  name="minimumCost"
+                  label={t`Minimum Cost`}
+                  formatOptions={INPUT_FORMAT.rate(
+                    baseCurrency,
+                    currencyDecimals
+                  )}
+                  minValue={0}
+                  termId="supplier-process-minimum-cost"
+                />
+                <Number
+                  name="leadTime"
+                  label={t`Standard Lead Time`}
+                  termId="supplier-process-lead-time"
+                  minValue={0}
+                />
+
+                <CustomFormFields table="supplierProcess" />
+              </VStack>
+            </ModalDrawerBody>
+            <ModalDrawerFooter>
+              <HStack>
+                <Submit isDisabled={isDisabled}>
+                  <Trans>Save</Trans>
+                </Submit>
+                <Button size="md" variant="solid" onClick={() => onClose?.()}>
+                  <Trans>Cancel</Trans>
+                </Button>
+              </HStack>
+            </ModalDrawerFooter>
+          </ValidatedForm>
+        </ModalDrawerContent>
+      </ModalDrawer>
+    </ModalDrawerProvider>
+  );
+};
+
+export default SupplierProcessForm;

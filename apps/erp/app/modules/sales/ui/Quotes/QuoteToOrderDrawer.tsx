@@ -1,0 +1,1118 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useCarbon } from "@carbon/auth";
+import { useRuleViolations } from "@carbon/ee/rules";
+import { SelectControlled, ValidatedForm } from "@carbon/form";
+import { getLogger } from "@carbon/logger";
+import {
+  Button,
+  cn,
+  Drawer,
+  DrawerBody,
+  DrawerContent,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+  Heading,
+  HStack,
+  Input,
+  Label,
+  NumberField,
+  NumberInput,
+  RadioGroup,
+  RadioGroupItem,
+  ScrollArea,
+  Spinner,
+  Table,
+  Tbody,
+  Td,
+  Th,
+  Thead,
+  Tr,
+  TruncatedTooltipText,
+  toast,
+  VStack
+} from "@carbon/react";
+import { distinctItemText, INPUT_FORMAT, pluralize } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { Dispatch, SetStateAction } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { flushSync } from "react-dom";
+import { useDropzone } from "react-dropzone";
+import {
+  LuBan,
+  LuBell,
+  LuChevronDown,
+  LuCreditCard,
+  LuImage,
+  LuSquareUser,
+  LuTrash,
+  LuTruck,
+  LuUpload
+} from "react-icons/lu";
+import { useParams } from "react-router";
+import type { z } from "zod";
+import { CustomerAvatar, DateTime } from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { CustomerContact, EmailRecipients } from "~/components/Form";
+import { usePaymentTerm } from "~/components/Form/PaymentTerm";
+import { useShippingMethod } from "~/components/Form/ShippingMethod";
+import { useCurrencyDecimals, useRouteData, useUser } from "~/hooks";
+import { useCurrencyFormatter } from "~/hooks/useCurrencyFormatter";
+import { useIntegrations } from "~/hooks/useIntegrations";
+import { getDocumentType } from "~/modules/shared";
+import { getPrivateUrl, path } from "~/utils/path";
+import type { selectedLineSchema } from "../../sales.models";
+import { salesConfirmValidator } from "../../sales.models";
+import type {
+  Quotation,
+  QuotationLine,
+  QuotationPayment,
+  QuotationPrice,
+  QuotationShipment
+} from "../../types";
+import { useOpportunityDocuments } from "../Opportunity/OpportunityDocuments";
+
+const logger = getLogger("erp", "quotetoorderdrawer");
+
+type QuoteToOrderDrawerProps = {
+  isOpen: boolean;
+  quote: Quotation;
+  lines: QuotationLine[];
+  pricing: QuotationPrice[];
+  onClose: () => void;
+};
+
+type SelectedLine = z.infer<typeof selectedLineSchema>;
+
+const QuoteToOrderDrawer = ({
+  isOpen,
+  quote,
+  lines,
+  pricing,
+  onClose
+}: QuoteToOrderDrawerProps) => {
+  const { t } = useLingui();
+  const [step, setStep] = useState(0);
+  const [selectedLines, setSelectedLines] = useState<
+    Record<string, SelectedLine>
+  >({});
+  const [poNumber, setPoNumber] = useState<string>("");
+
+  const { carbon } = useCarbon();
+  const { quoteId } = useParams();
+  if (!quoteId) throw new Error("Could not find quoteId");
+
+  const quoteData = useRouteData<{
+    opportunity: { id: string };
+  }>(path.to.quote(quoteId));
+  const { deleteAttachment, getPath, upload } = useOpportunityDocuments({
+    opportunityId: quoteData?.opportunity.id!,
+    type: "Quote",
+    id: quoteId
+  });
+  const [purchaseOrder, setPurchaseOrder] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+
+  const onDrop = async (acceptedFiles: File[]) => {
+    if (!carbon) {
+      toast.error(t`Carbon client not available`);
+      return;
+    }
+
+    if (purchaseOrder) {
+      await removePurchaseOrder();
+    }
+
+    if (acceptedFiles.length > 0) {
+      flushSync(() => {
+        setUploading(true);
+      });
+      const file = acceptedFiles[0];
+      if (file) {
+        upload([file]);
+
+        // Extract PO number from filename if it's a PDF
+        if (file.name.toLowerCase().endsWith(".pdf") && poNumber === "") {
+          const extractedPoNumber = file.name.replace(/\.pdf$/i, "");
+          setPoNumber(extractedPoNumber);
+        }
+      }
+
+      const purchaseOrderDocumentPath = getPath(file);
+      const { error } = await carbon
+        .from("opportunity")
+        .update({
+          purchaseOrderDocumentPath
+        })
+        .eq("id", quoteData?.opportunity?.id!);
+
+      if (error) {
+        logger.error("Error updating opportunity:", error);
+        toast.error(t`Failed to update opportunity with purchase order`);
+      } else {
+        setTimeout(() => {
+          setPurchaseOrder(file);
+          setUploading(false);
+        }, 2000);
+        setStep(1);
+      }
+    }
+  };
+
+  const removePurchaseOrder = async () => {
+    if (!carbon) {
+      toast.error(t`Failed to initialize Carbon client`);
+      return;
+    }
+
+    setUploading(true);
+
+    const [opportunityDelete] = await Promise.all([
+      carbon
+        .from("opportunity")
+        .update({
+          purchaseOrderDocumentPath: null
+        })
+        .eq("id", quoteData?.opportunity.id!),
+      // @ts-expect-error
+      deleteAttachment(purchaseOrder!)
+    ]);
+
+    if (opportunityDelete.error) {
+      toast.error(t`Failed to remove purchase order`);
+    } else {
+      setPurchaseOrder(null);
+      setPoNumber("");
+      toast.success(t`Purchase order removed successfully`);
+    }
+    setUploading(false);
+  };
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: { "application/pdf": [".pdf"] },
+    maxFiles: 1,
+    disabled: uploading
+  });
+
+  const titles = [
+    "Upload Customer Purchase Order",
+    "Select Quantities",
+    "Confirm Details"
+  ];
+  const hasPdf = purchaseOrder && getDocumentType(purchaseOrder.name) === "PDF";
+  const renderStep = () => {
+    switch (step) {
+      case 0:
+        return (
+          <VStack spacing={4}>
+            <div
+              {...getRootProps()}
+              className={cn(
+                "w-full border-2 border-dashed rounded-lg p-8 text-center cursor-pointer",
+                isDragActive ? "border-primary" : "border-muted"
+              )}
+            >
+              <input {...getInputProps()} />
+              {uploading ? (
+                <Spinner className="w-8 h-8" />
+              ) : purchaseOrder ? (
+                <p>{purchaseOrder.name}</p>
+              ) : (
+                <p>
+                  Drag and drop a Purchase Order PDF here, or click to select a
+                  file
+                </p>
+              )}
+              <LuUpload className="mx-auto mt-4 h-12 w-12 text-muted-foreground" />
+            </div>
+
+            <VStack spacing={2} className="w-full">
+              <Label htmlFor="poNumber">Purchase Order Number</Label>
+              <Input
+                id="poNumber"
+                value={poNumber}
+                onChange={(e) => setPoNumber(e.target.value)}
+                placeholder={t`Enter PO number`}
+              />
+              {purchaseOrder && (
+                <Button
+                  className="w-full"
+                  leftIcon={<LuTrash />}
+                  size="lg"
+                  isDisabled={uploading}
+                  isLoading={uploading}
+                  variant="secondary"
+                  onClick={removePurchaseOrder}
+                >
+                  Remove
+                </Button>
+              )}
+            </VStack>
+
+            {!purchaseOrder && (
+              <Button
+                className="w-full"
+                leftIcon={<LuBan />}
+                size="lg"
+                variant="secondary"
+                onClick={() => setStep(1)}
+              >
+                Skip
+              </Button>
+            )}
+          </VStack>
+        );
+      case 1:
+        return (
+          <HStack className="h-full w-full">
+            {hasPdf ? (
+              <iframe
+                seamless
+                title={getPath(purchaseOrder)}
+                width="100%"
+                height="100%"
+                src={path.to.file.previewFile(
+                  `private/${getPath(purchaseOrder)}`
+                )}
+              />
+            ) : purchaseOrder &&
+              getDocumentType(purchaseOrder.name) === "Image" ? (
+              <iframe
+                seamless
+                title={getPath(purchaseOrder)}
+                width="100%"
+                height="100%"
+                src={path.to.file.previewImage(
+                  "private",
+                  getPath(purchaseOrder)
+                )}
+              />
+            ) : null}
+            <ScrollArea className="h-[calc(100dvh-145px)] flex-grow w-full">
+              <LinePricingForm
+                quote={quote}
+                lines={lines}
+                pricing={pricing}
+                setSelectedLines={setSelectedLines}
+              />
+            </ScrollArea>
+          </HStack>
+        );
+      case 2:
+        return (
+          <VStack spacing={4}>
+            <CustomerDetailsForm poNumber={poNumber} />
+            <PaymentDetailsForm />
+            <ShippingDetailsForm />
+            <NotificationOptionsForm quote={quote} />
+          </VStack>
+        );
+      default:
+        return null;
+    }
+  };
+
+  // Converting re-evaluates sales rules across every quote line (the terminal
+  // gate in the action) before the server function writes sales order lines.
+  // Submitting through the violations hook — rather than a plain navigation —
+  // is what lets a blocked convert surface the shared modal.
+  const ruleViolations = useRuleViolations({
+    action: path.to.convertQuoteToOrder(quote.id!),
+    onSuccess: onClose
+  });
+  const isSubmitting = ruleViolations.fetcher.state !== "idle";
+
+  const isNextButtonDisabled =
+    step === 1 && Object.keys(selectedLines).length === 0;
+
+  return (
+    <Drawer
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) {
+          onClose();
+        }
+      }}
+    >
+      <DrawerContent size={step === 1 ? (hasPdf ? "full" : "xl") : "md"}>
+        <input type="hidden" name="quoteId" value={quote.id!} />
+
+        <DrawerHeader>
+          <DrawerTitle>{titles[step]}</DrawerTitle>
+        </DrawerHeader>
+        {step === 2 ? (
+          <ValidatedForm
+            method="post"
+            action={path.to.convertQuoteToOrder(quote.id!)}
+            validator={salesConfirmValidator}
+            fetcher={ruleViolations.fetcher}
+            defaultValues={{
+              notification: "None",
+              customerContact: quote.customerContactId ?? undefined,
+              cc: []
+            }}
+          >
+            <DrawerBody>{renderStep()}</DrawerBody>
+            <DrawerFooter>
+              <Button variant="secondary" onClick={() => setStep(step - 1)}>
+                Back
+              </Button>
+              <Button
+                type="submit"
+                isDisabled={isSubmitting}
+                isLoading={isSubmitting}
+              >
+                <Trans>Convert</Trans>
+              </Button>
+              <input
+                type="hidden"
+                name="selectedLines"
+                value={JSON.stringify(selectedLines)}
+              />
+              <input type="hidden" name="poNumber" value={poNumber} />
+            </DrawerFooter>
+          </ValidatedForm>
+        ) : (
+          <>
+            <DrawerBody>{renderStep()}</DrawerBody>
+            <DrawerFooter>
+              {step > 0 && (
+                <Button variant="secondary" onClick={() => setStep(step - 1)}>
+                  Back
+                </Button>
+              )}
+              <Button
+                onClick={() => setStep(step + 1)}
+                isDisabled={isNextButtonDisabled}
+              >
+                Next
+              </Button>
+            </DrawerFooter>
+          </>
+        )}
+      </DrawerContent>
+      <ruleViolations.ViolationModal />
+    </Drawer>
+  );
+};
+
+export default QuoteToOrderDrawer;
+
+type LinePricingFormProps = {
+  quote: Quotation;
+  lines: QuotationLine[];
+  pricing: QuotationPrice[];
+  setSelectedLines: Dispatch<SetStateAction<Record<string, SelectedLine>>>;
+};
+
+const LinePricingForm = ({
+  quote,
+  lines,
+  pricing,
+  setSelectedLines
+}: LinePricingFormProps) => {
+  const pricingByLine = useMemo(
+    () =>
+      lines.reduce<Record<string, QuotationPrice[]>>((acc, line) => {
+        // Scope to the breaks the line still offers — an orphaned price row
+        // picked here would convert into a real sales order line.
+        acc[line.id!] = pricing.filter(
+          (p) =>
+            p.quoteLineId === line.id &&
+            Array.isArray(line.quantity) &&
+            line.quantity.includes(p.quantity)
+        );
+        return acc;
+      }, {}),
+    [lines, pricing]
+  );
+
+  const { company } = useUser();
+  const baseCurrency = company?.baseCurrencyCode ?? "USD";
+  const quoteCurrency = quote.currencyCode ?? baseCurrency;
+  const shouldConvertCurrency = quoteCurrency !== baseCurrency;
+  const quoteExchangeRate = quote.exchangeRate ?? 1;
+  const formatter = useCurrencyFormatter({
+    currency: quoteCurrency
+  });
+
+  return (
+    <VStack spacing={8}>
+      {lines.map((line) => (
+        <VStack key={line.id}>
+          <HStack spacing={2} className="items-start">
+            {line.thumbnailPath ? (
+              <img
+                alt={line.itemReadableId!}
+                className="w-24 h-24 shrink-0 bg-gradient-to-bl from-muted to-muted/40 rounded-lg"
+                src={getPrivateUrl(line.thumbnailPath)}
+              />
+            ) : (
+              <div className="w-24 h-24 shrink-0 bg-gradient-to-bl from-muted to-muted/40 rounded-lg p-4">
+                <LuImage className="w-16 h-16 text-muted-foreground" />
+              </div>
+            )}
+
+            {/* flex-1 + min-w-0, not VStack's default w-full: `width: 100%`
+                on a flex item resolves against the row's full width and
+                ignores the thumbnail beside it, pushing the description past
+                the card edge. min-w-0 is what lets truncate bite. */}
+            <VStack spacing={0} className="flex-1 min-w-0">
+              <Heading className="min-w-0">{line.itemReadableId}</Heading>
+              {distinctItemText(line.itemReadableId, line.description) && (
+                <TruncatedTooltipText
+                  className="text-muted-foreground text-base truncate"
+                  tooltip={line.description}
+                >
+                  {line.description}
+                </TruncatedTooltipText>
+              )}
+            </VStack>
+          </HStack>
+          <LinePricingOptions
+            line={line}
+            options={pricingByLine[line.id!]}
+            quoteCurrency={quoteCurrency}
+            shouldConvertCurrency={shouldConvertCurrency}
+            quoteExchangeRate={quoteExchangeRate}
+            formatter={formatter}
+            setSelectedLines={setSelectedLines}
+          />
+        </VStack>
+      ))}
+    </VStack>
+  );
+};
+
+type LinePricingOptionsProps = {
+  line: QuotationLine;
+  options: QuotationPrice[];
+  quoteCurrency: string;
+  shouldConvertCurrency: boolean;
+  quoteExchangeRate: number;
+  formatter: Intl.NumberFormat;
+  setSelectedLines: Dispatch<SetStateAction<Record<string, SelectedLine>>>;
+};
+
+const LinePricingOptions = ({
+  line,
+  options,
+  quoteCurrency,
+  shouldConvertCurrency,
+  quoteExchangeRate,
+  formatter,
+  setSelectedLines
+}: LinePricingOptionsProps) => {
+  const [selectedValue, setSelectedValue] = useState("");
+  const currencyDecimals = useCurrencyDecimals(quoteCurrency);
+  const [showOverride, setShowOverride] = useState(false);
+  const [overridePricing, setOverridePricing] = useState<SelectedLine>({
+    quantity: 1,
+    leadTime: 0,
+    addOn: 0,
+    convertedAddOn: 0,
+    netUnitPrice: 0,
+    convertedNetUnitPrice: 0,
+    shippingCost: 0,
+    convertedShippingCost: 0
+  });
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  useEffect(() => {
+    if (selectedValue === "custom") {
+      setSelectedLines((prev) => ({
+        ...prev,
+        [line.id!]: {
+          quantity: overridePricing.quantity,
+          netUnitPrice: overridePricing.netUnitPrice,
+          convertedNetUnitPrice: overridePricing.convertedNetUnitPrice,
+          addOn: overridePricing.addOn,
+          convertedAddOn: overridePricing.convertedAddOn,
+          shippingCost: overridePricing.shippingCost,
+          convertedShippingCost: overridePricing.convertedShippingCost,
+          leadTime: overridePricing.leadTime
+        }
+      }));
+    }
+  }, [
+    line.id,
+    overridePricing,
+    selectedValue,
+    setSelectedLines,
+    quoteExchangeRate
+  ]);
+
+  const additionalChargesByQuantity =
+    line.quantity?.reduce(
+      (acc, quantity) => {
+        const charges = Object.values(line.additionalCharges ?? {}).reduce(
+          (chargeAcc, charge) => {
+            const amount = charge.amounts?.[quantity];
+            return chargeAcc + amount;
+          },
+          0
+        );
+        acc[quantity] = charges;
+        return acc;
+      },
+      {} as Record<number, number>
+    ) ?? {};
+
+  const convertedAdditionalChargesByQuantity = Object.entries(
+    additionalChargesByQuantity
+  ).reduce<Record<number, number>>((acc, [quantity, amount]) => {
+    acc[Number(quantity)] = amount * quoteExchangeRate;
+    return acc;
+  }, {});
+
+  const taxableAdditionalChargesByQuantity =
+    line.quantity?.reduce(
+      (acc, quantity) => {
+        const charges = Object.values(line.additionalCharges ?? {}).reduce(
+          (chargeAcc, charge) => {
+            if (charge.taxable === false) return chargeAcc;
+            const amount = charge.amounts?.[quantity];
+            return chargeAcc + amount;
+          },
+          0
+        );
+        acc[quantity] = charges;
+        return acc;
+      },
+      {} as Record<number, number>
+    ) ?? {};
+
+  const convertedTaxableAdditionalChargesByQuantity = Object.entries(
+    taxableAdditionalChargesByQuantity
+  ).reduce<Record<number, number>>((acc, [quantity, amount]) => {
+    acc[Number(quantity)] = amount * quoteExchangeRate;
+    return acc;
+  }, {});
+
+  // Sort options by quantity from least to greatest
+  const sortedOptions = [...options].sort((a, b) => a.quantity - b.quantity);
+
+  return (
+    <VStack spacing={2}>
+      <RadioGroup
+        className="w-full"
+        value={selectedValue}
+        onValueChange={(value) => {
+          const selectedOption =
+            value === "custom"
+              ? overridePricing
+              : options.find((opt) => opt.quantity.toString() === value);
+
+          if (selectedOption) {
+            setSelectedLines((prev) => ({
+              ...prev,
+              [line.id!]: {
+                quantity: selectedOption.quantity,
+                netUnitPrice: selectedOption.netUnitPrice ?? 0,
+                convertedNetUnitPrice:
+                  selectedOption.convertedNetUnitPrice ?? 0,
+                addOn:
+                  additionalChargesByQuantity[selectedOption.quantity] || 0,
+                convertedAddOn:
+                  convertedAdditionalChargesByQuantity[
+                    selectedOption.quantity
+                  ] || 0,
+                taxableAddOn:
+                  taxableAdditionalChargesByQuantity[selectedOption.quantity] ||
+                  0,
+                convertedTaxableAddOn:
+                  convertedTaxableAdditionalChargesByQuantity[
+                    selectedOption.quantity
+                  ] || 0,
+                shippingCost: selectedOption.shippingCost ?? 0,
+                convertedShippingCost:
+                  selectedOption.convertedShippingCost ?? 0,
+                leadTime: selectedOption.leadTime
+              }
+            }));
+            setSelectedValue(value);
+          }
+        }}
+      >
+        <Table>
+          <Thead>
+            <Tr>
+              <Th></Th>
+              <Th>
+                <Trans>Quantity</Trans>
+              </Th>
+              <Th>
+                <Trans>Unit Price</Trans>
+              </Th>
+              <Th>
+                <Trans>Shipping</Trans>
+              </Th>
+              <Th>Add-Ons</Th>
+              <Th>
+                <Trans>Lead Time</Trans>
+              </Th>
+              <Th>
+                <Trans>Total Price</Trans>
+              </Th>
+            </Tr>
+          </Thead>
+          <Tbody>
+            {!Array.isArray(options) || options.length === 0 ? (
+              <Tr>
+                <Td colSpan={6} className="text-center py-8">
+                  No pricing options found
+                </Td>
+              </Tr>
+            ) : (
+              sortedOptions.map(
+                (option, index) =>
+                  line?.quantity?.includes(option.quantity) && (
+                    <Tr key={index}>
+                      <Td>
+                        <RadioGroupItem
+                          value={option.quantity.toString()}
+                          id={`${line.id}:${option.quantity.toString()}`}
+                        />
+                        <label
+                          htmlFor={`${line.id}:${option.quantity.toString()}`}
+                          className="sr-only"
+                        >
+                          {option.quantity}
+                        </label>
+                      </Td>
+                      <Td>{option.quantity}</Td>
+                      <Td>
+                        {formatter.format(option.convertedNetUnitPrice ?? 0)}
+                      </Td>
+                      <Td>
+                        {formatter.format(option.convertedShippingCost ?? 0)}
+                      </Td>
+                      <Td>
+                        {formatter.format(
+                          convertedAdditionalChargesByQuantity[option.quantity]
+                        )}
+                      </Td>
+                      <Td>
+                        {option.leadTime} {pluralize(option.leadTime, "day")}
+                      </Td>
+                      <Td>
+                        {formatter.format(
+                          (option.convertedNetExtendedPrice ?? 0) +
+                            (option.convertedShippingCost ?? 0) +
+                            convertedAdditionalChargesByQuantity[
+                              option.quantity
+                            ]
+                        )}
+                      </Td>
+                    </Tr>
+                  )
+              )
+            )}
+            {showOverride && (
+              <Tr>
+                <Td>
+                  <RadioGroupItem value="custom" id={`${line.id}:custom`} />
+                  <label
+                    htmlFor={`${line.id}:custom`}
+                    className="sr-only"
+                  ></label>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    value={overridePricing.quantity}
+                    onChange={(quantity) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        quantity
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    value={
+                      shouldConvertCurrency
+                        ? overridePricing.convertedNetUnitPrice
+                        : overridePricing.netUnitPrice
+                    }
+                    formatOptions={INPUT_FORMAT.rate(
+                      quoteCurrency,
+                      currencyDecimals
+                    )}
+                    onChange={(netUnitPrice) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        netUnitPrice: shouldConvertCurrency
+                          ? netUnitPrice / quoteExchangeRate
+                          : netUnitPrice,
+                        convertedNetUnitPrice: shouldConvertCurrency
+                          ? netUnitPrice
+                          : netUnitPrice * quoteExchangeRate
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    value={
+                      shouldConvertCurrency
+                        ? overridePricing.convertedShippingCost
+                        : overridePricing.shippingCost
+                    }
+                    formatOptions={INPUT_FORMAT.money(
+                      quoteCurrency,
+                      currencyDecimals
+                    )}
+                    onChange={(shippingCost) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        shippingCost: shouldConvertCurrency
+                          ? shippingCost / quoteExchangeRate
+                          : shippingCost,
+                        convertedShippingCost: shouldConvertCurrency
+                          ? shippingCost
+                          : shippingCost * quoteExchangeRate
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    value={
+                      shouldConvertCurrency
+                        ? overridePricing.convertedAddOn
+                        : overridePricing.addOn
+                    }
+                    formatOptions={INPUT_FORMAT.money(
+                      quoteCurrency,
+                      currencyDecimals
+                    )}
+                    onChange={(addOn) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        addOn: shouldConvertCurrency
+                          ? addOn / quoteExchangeRate
+                          : addOn,
+                        convertedAddOn: shouldConvertCurrency
+                          ? addOn
+                          : addOn * quoteExchangeRate
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    formatOptions={{
+                      style: "unit",
+                      unit: "day",
+                      unitDisplay: "long"
+                    }}
+                    value={overridePricing.leadTime}
+                    onChange={(leadTime) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        leadTime
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  {formatter.format(
+                    shouldConvertCurrency
+                      ? overridePricing.convertedNetUnitPrice *
+                          overridePricing.quantity +
+                          (overridePricing.convertedShippingCost ?? 0) +
+                          (overridePricing.convertedAddOn ?? 0)
+                      : overridePricing.netUnitPrice *
+                          overridePricing.quantity +
+                          (overridePricing.shippingCost ?? 0) +
+                          (overridePricing.addOn ?? 0)
+                  )}
+                </Td>
+              </Tr>
+            )}
+          </Tbody>
+        </Table>
+      </RadioGroup>
+      {!showOverride && (
+        <Button
+          variant="secondary"
+          onClick={() => {
+            setShowOverride(true);
+            setSelectedValue("custom");
+          }}
+        >
+          Add Adjustment
+        </Button>
+      )}
+    </VStack>
+  );
+};
+
+function PaymentDetailsForm() {
+  const [isExpanded, setIsExpanded] = useState(true);
+  const { quoteId } = useParams();
+  if (!quoteId) throw new Error("Could not find quoteId");
+
+  const quoteData = useRouteData<{
+    payment: QuotationPayment;
+  }>(path.to.quote(quoteId));
+
+  const paymentTerms = usePaymentTerm();
+  const paymentTerm = paymentTerms?.find(
+    (pt) => pt.value === quoteData?.payment?.paymentTermId
+  );
+
+  return (
+    <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4 w-full">
+      <HStack
+        className="w-full justify-between cursor-pointer"
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        <HStack>
+          <LuCreditCard />
+          <Label>
+            <Trans>Payment Terms</Trans>
+          </Label>
+        </HStack>
+        <LuChevronDown
+          className={`transition-transform ${isExpanded ? "rotate-180" : ""}`}
+        />
+      </HStack>
+      {isExpanded && (
+        <Table className="py-4">
+          <Tbody>
+            <Tr>
+              <Td className="w-1/2">
+                <Trans>Bill To</Trans>
+              </Td>
+              <Td>
+                <CustomerAvatar
+                  customerId={quoteData?.payment.invoiceCustomerId ?? null}
+                />
+              </Td>
+            </Tr>
+            <Tr>
+              <Td className="w-1/2">
+                <Trans>Payment Term</Trans>
+              </Td>
+              <Td>
+                <Enumerable value={paymentTerm?.label ?? null} />
+              </Td>
+            </Tr>
+          </Tbody>
+        </Table>
+      )}
+    </div>
+  );
+}
+
+function CustomerDetailsForm({ poNumber }: { poNumber: string }) {
+  const [isExpanded, setIsExpanded] = useState(true);
+  const { quoteId } = useParams();
+  if (!quoteId) throw new Error("Could not find quoteId");
+
+  const quoteData = useRouteData<{
+    quote: Quotation;
+  }>(path.to.quote(quoteId));
+
+  return (
+    <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4 w-full">
+      <HStack
+        className="w-full justify-between cursor-pointer"
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        <HStack>
+          <LuSquareUser />
+          <Label>
+            <Trans>Customer Details</Trans>
+          </Label>
+        </HStack>
+        <LuChevronDown
+          className={`transition-transform ${isExpanded ? "rotate-180" : ""}`}
+        />
+      </HStack>
+      {isExpanded && (
+        <Table className="py-4">
+          <Tbody>
+            <Tr>
+              <Td className="w-1/2">
+                <Trans>Customer</Trans>
+              </Td>
+              <Td>
+                <CustomerAvatar
+                  customerId={quoteData?.quote.customerId ?? null}
+                />
+              </Td>
+            </Tr>
+            <Tr>
+              <Td className="w-1/2">
+                <Trans>Customer RFQ</Trans>
+              </Td>
+              <Td>{quoteData?.quote.customerReference}</Td>
+            </Tr>
+            {poNumber && (
+              <Tr>
+                <Td className="w-1/2">
+                  <Trans>Customer PO</Trans>
+                </Td>
+                <Td>{poNumber}</Td>
+              </Tr>
+            )}
+          </Tbody>
+        </Table>
+      )}
+    </div>
+  );
+}
+
+function ShippingDetailsForm() {
+  const [isExpanded, setIsExpanded] = useState(true);
+  const { quoteId } = useParams();
+  if (!quoteId) throw new Error("Could not find quoteId");
+
+  const quoteData = useRouteData<{
+    shipment: QuotationShipment;
+  }>(path.to.quote(quoteId));
+
+  const shippingMethods = useShippingMethod();
+  const shippingMethod = shippingMethods?.find(
+    (sm) => sm.value === quoteData?.shipment?.shippingMethodId
+  );
+
+  return (
+    <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4 w-full">
+      <HStack
+        className="w-full justify-between cursor-pointer"
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        <HStack>
+          <LuTruck />
+          <Label>
+            <Trans>Shipping</Trans>
+          </Label>
+        </HStack>
+        <LuChevronDown
+          className={`transition-transform ${isExpanded ? "rotate-180" : ""}`}
+        />
+      </HStack>
+      {isExpanded && (
+        <Table className="py-4">
+          <Tbody>
+            <Tr>
+              <Td className="w-1/2">
+                <Trans>Shipping Method</Trans>
+              </Td>
+              <Td className="w-1/2">
+                <Enumerable value={shippingMethod?.label ?? null} />
+              </Td>
+            </Tr>
+            <Tr>
+              <Td>
+                <Trans>Requested Date</Trans>
+              </Td>
+              <Td>
+                {quoteData?.shipment.receiptRequestedDate ? (
+                  <DateTime
+                    value={quoteData?.shipment?.receiptRequestedDate!}
+                    variant="date"
+                  />
+                ) : null}
+              </Td>
+            </Tr>
+          </Tbody>
+        </Table>
+      )}
+    </div>
+  );
+}
+
+function NotificationOptionsForm({ quote }: { quote: Quotation }) {
+  const { t } = useLingui();
+  const [isExpanded, setIsExpanded] = useState(true);
+  const integrations = useIntegrations();
+  const canEmail = integrations.has("email");
+  const [notificationType, setNotificationType] = useState(
+    canEmail ? "Email" : "None"
+  );
+
+  if (!canEmail) return null;
+
+  return (
+    <div className="border border-border rounded-md shadow-sm p-4 flex flex-col gap-4 w-full">
+      <HStack
+        className="w-full justify-between cursor-pointer"
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        <HStack>
+          <LuBell />
+          <Label>
+            <Trans>Notification</Trans>
+          </Label>
+        </HStack>
+        <LuChevronDown
+          className={`transition-transform ${isExpanded ? "rotate-180" : ""}`}
+        />
+      </HStack>
+      {isExpanded && (
+        <VStack spacing={4}>
+          <SelectControlled
+            label={t`Send Via`}
+            name="notification"
+            options={[
+              { label: "None", value: "None" },
+              { label: "Email", value: "Email" }
+            ]}
+            value={notificationType}
+            onChange={(t) => {
+              if (t) setNotificationType(t.value);
+            }}
+          />
+          {notificationType === "Email" && (
+            <>
+              <CustomerContact
+                name="customerContact"
+                customer={quote.customerId ?? undefined}
+              />
+              <EmailRecipients name="cc" label={t`CC`} type="employee" />
+            </>
+          )}
+        </VStack>
+      )}
+    </div>
+  );
+}

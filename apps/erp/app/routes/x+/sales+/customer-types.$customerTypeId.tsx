@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { useCloseRoute } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { data, useLoaderData } from "react-router";
+import {
+  customerTypeValidator,
+  getCustomerType,
+  upsertCustomerType
+} from "~/modules/sales";
+import { CustomerTypeForm } from "~/modules/sales/ui/CustomerTypes";
+import { getCustomFields, setCustomFields } from "~/utils/form";
+import { getParams, path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    view: "sales",
+    role: "employee"
+  });
+
+  const { customerTypeId } = params;
+  if (!customerTypeId) throw notFound("customerTypeId not found");
+
+  const customerType = await getCustomerType(client, customerTypeId);
+
+  if (customerType?.data?.protected) {
+    throw redirect(
+      `${path.to.customerTypes}?${getParams(request)}`,
+      await flash(request, error(null, "Cannot edit a protected customer type"))
+    );
+  }
+
+  return {
+    customerType: customerType?.data ?? null
+  };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, userId } = await requirePermissions(request, {
+    update: "sales"
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(customerTypeValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const { id, ...d } = validation.data;
+  if (!id) throw new Error("id not found");
+
+  const updateCustomerType = await upsertCustomerType(client, {
+    id,
+    ...d,
+    updatedBy: userId,
+    customFields: setCustomFields(formData)
+  });
+
+  if (updateCustomerType.error) {
+    return data(
+      {},
+      await flash(
+        request,
+        error(updateCustomerType.error, "Failed to update customer type")
+      )
+    );
+  }
+
+  throw redirect(
+    `${path.to.customerTypes}?${getParams(request)}`,
+    await flash(request, success("Updated customer type"))
+  );
+}
+
+export default function EditCustomerTypesRoute() {
+  const { customerType } = useLoaderData<typeof loader>();
+  const closeRoute = useCloseRoute();
+
+  const initialValues = {
+    id: customerType?.id ?? undefined,
+    name: customerType?.name ?? "",
+    ...getCustomFields(customerType?.customFields)
+  };
+
+  return (
+    <CustomerTypeForm
+      key={initialValues.id}
+      initialValues={initialValues}
+      onClose={() => closeRoute()}
+    />
+  );
+}

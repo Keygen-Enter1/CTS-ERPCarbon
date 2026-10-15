@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { ActionFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { NewRecordPage } from "~/components/NewRecordPage";
+import { toolValidator, upsertTool } from "~/modules/items";
+import { ToolForm } from "~/modules/items/ui/Tools";
+import { setCustomFields } from "~/utils/form";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: msg`Tools`,
+  to: path.to.tools,
+  module: "items"
+};
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    create: "parts"
+  });
+
+  const formData = await request.formData();
+  const modal = formData.get("type") === "modal";
+
+  const validation = await validator(toolValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const createTool = await upsertTool(client, {
+    ...validation.data,
+    companyId,
+    customFields: setCustomFields(formData),
+    createdBy: userId
+  });
+  if (createTool.error) {
+    return modal
+      ? data(
+          createTool,
+          await flash(request, error(createTool.error, "Failed to insert tool"))
+        )
+      : redirect(
+          path.to.tools,
+          await flash(request, error(createTool.error, "Failed to insert tool"))
+        );
+  }
+
+  const itemId = createTool.data?.id;
+  if (!itemId) throw new Error("Tool ID not found");
+
+  return modal
+    ? data(createTool, { status: 201 })
+    : redirect(path.to.tool(itemId));
+}
+
+export default function ToolsNewRoute() {
+  const initialValues = {
+    id: "",
+    revision: "0",
+    name: "",
+    description: "",
+    replenishmentSystem: "Buy" as const,
+    defaultMethodType: "Purchase to Order" as const,
+    itemTrackingType: "Inventory" as "Inventory",
+    unitOfMeasureCode: "EA",
+    unitCost: 0,
+    active: true,
+    shelfLifeCalculateFromBom: false,
+    tags: []
+  };
+
+  return (
+    <NewRecordPage>
+      <ToolForm initialValues={initialValues} />
+    </NewRecordPage>
+  );
+}

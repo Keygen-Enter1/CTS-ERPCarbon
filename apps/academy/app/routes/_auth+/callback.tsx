@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  assertIsPost,
+  callbackValidator,
+  carbonClient,
+  error
+} from "@carbon/auth";
+import { refreshAccessToken } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { setCompanyId } from "@carbon/auth/company.server";
+import {
+  destroyAuthSession,
+  flash,
+  getAuthSession,
+  setAuthSession
+} from "@carbon/auth/session.server";
+import { getUserByEmail } from "@carbon/auth/users.server";
+import { validator } from "@carbon/form";
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Button,
+  CarbonPulse,
+  VStack
+} from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { useEffect, useRef, useState } from "react";
+import { LuTriangleAlert } from "react-icons/lu";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import {
+  data,
+  Link,
+  useFetcher,
+  useLocation,
+  useSearchParams
+} from "react-router";
+import { path } from "~/utils/path";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const authSession = await getAuthSession(request);
+
+  if (authSession) await destroyAuthSession(request);
+
+  return {};
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+
+  const validation = await validator(callbackValidator).validate(
+    await request.formData()
+  );
+
+  if (validation.error) {
+    return data(error(validation.error, "Invalid callback form"), {
+      status: 400
+    });
+  }
+
+  const { refreshToken, userId, redirectTo } = validation.data;
+  const serviceRole = getCarbonServiceRole();
+  const companies = await serviceRole
+    .from("userToCompany")
+    .select("companyId, ...company(companyGroupId)")
+    .eq("userId", userId);
+
+  const firstCompany = companies.data?.[0] as
+    | { companyId: string; companyGroupId: string | null }
+    | undefined;
+  const companyId = firstCompany?.companyId;
+  const companyGroupId = firstCompany?.companyGroupId ?? "";
+
+  const authSession = await refreshAccessToken(
+    refreshToken,
+    companyId,
+    companyGroupId
+  );
+
+  if (!authSession) {
+    return redirect(
+      path.to.root,
+      await flash(request, error(authSession, "Invalid refresh token"))
+    );
+  }
+
+  const user = await getUserByEmail(authSession.email);
+
+  if (user?.data) {
+    const sessionCookie = await setAuthSession(request, {
+      authSession
+    });
+    const companyIdCookie = setCompanyId(authSession.companyId);
+    return redirect(redirectTo || path.to.root, {
+      headers: [
+        ["Set-Cookie", sessionCookie],
+        ["Set-Cookie", companyIdCookie]
+      ]
+    });
+  } else {
+    return redirect(
+      path.to.root,
+      await flash(request, error(user.error, "User not found"))
+    );
+  }
+}
+
+export default function AuthCallback() {
+  const fetcher = useFetcher<{}>();
+  const isAuthenticating = useRef(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const { hash } = useLocation();
+  const [searchParams] = useSearchParams();
+  const redirectTo = searchParams.get("redirectTo") ?? undefined;
+
+  useEffect(() => {
+    const hashParams = new URLSearchParams(hash.slice(1));
+    const errorDescription = hashParams.get("error_description");
+    if (errorDescription) {
+      setError(decodeURIComponent(errorDescription.replace(/\+/g, " ")));
+    }
+  }, [hash]);
+
+  useEffect(() => {
+    const {
+      data: { subscription }
+    } = carbonClient.auth.onAuthStateChange((event, session) => {
+      if (
+        ["SIGNED_IN", "INITIAL_SESSION"].includes(event) &&
+        !isAuthenticating.current
+      ) {
+        isAuthenticating.current = true;
+
+        const refreshToken = session?.refresh_token;
+        const userId = session?.user.id;
+
+        if (!refreshToken || !userId) return;
+
+        const formData = new FormData();
+        formData.append("refreshToken", refreshToken);
+        formData.append("userId", userId);
+        if (redirectTo) formData.append("redirectTo", redirectTo);
+
+        fetcher.submit(formData, { method: "post" });
+      }
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [fetcher, redirectTo]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-background">
+      {error ? (
+        <>
+          <div className="flex justify-center mb-8">
+            <img
+              src="/carbon-mark-light.svg"
+              alt="Carbon Logo"
+              className="w-24"
+            />
+          </div>
+          <div className="rounded-lg p-8 mt-8 w-[380px]">
+            <VStack spacing={4}>
+              <Alert variant="destructive">
+                <LuTriangleAlert className="h-4 w-4" />
+                <AlertTitle>Error</AlertTitle>
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+              {error.includes("expired") && (
+                <>
+                  <p className="text-sm text-muted-foreground">
+                    But don't worry. You can use the forgot password flow to
+                    request a new magic link.
+                  </p>
+                  <Button size="lg" asChild className="w-full">
+                    <Link to={path.to.login}>Login</Link>
+                  </Button>
+                </>
+              )}
+            </VStack>
+          </div>
+        </>
+      ) : (
+        <CarbonPulse />
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,679 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Json } from "@carbon/database";
+import {
+  DatePicker,
+  InputControlled,
+  NumberControlled,
+  Select,
+  ValidatedForm
+} from "@carbon/form";
+import { useAction } from "@carbon/query";
+import {
+  Badge,
+  Button,
+  Copy,
+  HStack,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  ModalOverlay,
+  ModalTitle,
+  Subheading,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  toast,
+  useDisclosure,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { Suspense, useCallback, useState } from "react";
+import { LuCopy, LuKeySquare, LuLink, LuUnlink2 } from "react-icons/lu";
+import { RiProgress8Line } from "react-icons/ri";
+import { Await, useParams } from "react-router";
+import { z } from "zod";
+import { zfd } from "zod-form-data";
+import {
+  Assignee,
+  EmployeeAvatar,
+  Hyperlink,
+  useOptimisticAssignment
+} from "~/components";
+import {
+  Customer,
+  Item,
+  JobSalesOrderLine,
+  Location,
+  StorageUnit,
+  Tags,
+  UnitOfMeasure
+} from "~/components/Form";
+import CustomFormInlineFields from "~/components/Form/CustomFormInlineFields";
+import { usePermissions, useRouteData } from "~/hooks";
+import type { TrackedEntity } from "~/modules/inventory/types";
+import type { MethodItemType } from "~/modules/shared";
+import type { action } from "~/routes/x+/items+/update";
+import { path } from "~/utils/path";
+import { copyToClipboard } from "~/utils/string";
+import {
+  deadlineRequiresDueDate,
+  deadlineTypes,
+  isJobLocked
+} from "../../production.models";
+import type { Job } from "../../types";
+import { getDeadlineIcon } from "./Deadline";
+
+const JobProperties = () => {
+  const { jobId } = useParams();
+  const { t } = useLingui();
+  if (!jobId) throw new Error("jobId not found");
+
+  const routeData = useRouteData<{
+    job: Job;
+    tags: { name: string }[];
+    trackedEntities: Promise<PostgrestResponse<TrackedEntity>>;
+  }>(path.to.job(jobId));
+
+  const unlinkDisclosure = useDisclosure();
+
+  const fetcher = useAction<typeof action>({
+    onError: (data) => {
+      if (data?.error) {
+        toast.error(data.error.message);
+      }
+    }
+  });
+  const [type, setType] = useState<MethodItemType>(
+    (routeData?.job?.itemType ?? "Part") as MethodItemType
+  );
+  const [deadlineType, setDeadlineType] = useState<string>(
+    routeData?.job?.deadlineType ?? ""
+  );
+  const showDueDate = deadlineRequiresDueDate(deadlineType);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  const onUpdate = useCallback(
+    (field: keyof Job, value: string | number | null) => {
+      if (value === routeData?.job[field]) {
+        return;
+      }
+      const formData = new FormData();
+
+      formData.append("ids", jobId);
+      formData.append("field", field);
+      formData.append("value", value?.toString() ?? "");
+      fetcher.submit(formData, {
+        method: "post",
+        action: path.to.bulkUpdateJob
+      });
+    },
+
+    [jobId, routeData?.job]
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  const onUpdateCustomFields = useCallback(
+    (value: string) => {
+      const formData = new FormData();
+
+      formData.append("ids", jobId);
+      formData.append("table", "job");
+      formData.append("value", value);
+
+      fetcher.submit(formData, {
+        method: "post",
+        action: path.to.customFields
+      });
+    },
+
+    [jobId]
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  const onUpdateTags = useCallback(
+    (value: string[]) => {
+      const formData = new FormData();
+
+      formData.append("ids", jobId);
+      formData.append("table", "job");
+      value.forEach((v) => {
+        formData.append("value", v);
+      });
+
+      fetcher.submit(formData, {
+        method: "post",
+        action: path.to.tags
+      });
+    },
+
+    [jobId]
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  const onUpdateBatchNumber = useCallback(
+    (trackedEntityId: string, value: string) => {
+      const formData = new FormData();
+
+      if (!trackedEntityId) {
+        toast.error(t`Tracked entity ID is required but none was found`);
+        return;
+      }
+
+      formData.append("id", trackedEntityId);
+      formData.append("value", value);
+      fetcher.submit(formData, {
+        method: "post",
+        action: path.to.jobBatchNumber(jobId)
+      });
+    },
+
+    []
+  );
+
+  const permissions = usePermissions();
+  const optimisticAssignment = useOptimisticAssignment({
+    id: jobId,
+    table: "job"
+  });
+  const assignee =
+    optimisticAssignment !== undefined
+      ? optimisticAssignment
+      : routeData?.job?.assignee;
+
+  const canUpdate = permissions.can("update", "production");
+  const isLocked = isJobLocked(routeData?.job?.status);
+  const isDisabled = !canUpdate || isLocked;
+
+  return (
+    <VStack
+      spacing={4}
+      className="w-96 bg-background/30 h-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent border-l border-border px-4 py-2 text-sm"
+    >
+      <VStack spacing={4}>
+        <HStack className="w-full justify-between">
+          <Subheading as="h3" variant="light">
+            <Trans>Properties</Trans>
+          </Subheading>
+          <HStack spacing={1}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  aria-label={t`Link`}
+                  size="sm"
+                  className="p-1"
+                  onClick={() =>
+                    copyToClipboard(
+                      window.location.origin + path.to.jobDetails(jobId)
+                    )
+                  }
+                >
+                  <LuLink className="w-3 h-3" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span>
+                  <Trans>Copy link to Job</Trans>
+                </span>
+              </TooltipContent>
+            </Tooltip>
+            <Copy
+              text={jobId}
+              label={t`Copy job unique identifier`}
+              icon={<LuKeySquare className="size-3" />}
+              variant="ghost"
+              className="w-auto"
+            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  aria-label={t`Copy`}
+                  size="sm"
+                  className="p-1"
+                  onClick={() => copyToClipboard(routeData?.job?.jobId ?? "")}
+                >
+                  <LuCopy className="w-3 h-3" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span>
+                  <Trans>Copy Job number</Trans>
+                </span>
+              </TooltipContent>
+            </Tooltip>
+          </HStack>
+        </HStack>
+        <span className="text-sm">{routeData?.job?.jobId}</span>
+      </VStack>
+
+      <VStack spacing={2}>
+        <Suspense fallback={null}>
+          <Await resolve={routeData?.trackedEntities}>
+            {(entities) => {
+              const trackingType = routeData?.job?.itemTrackingType ?? "";
+
+              if (!["Batch", "Serial"].includes(trackingType)) {
+                return null;
+              }
+
+              const trackedEntities = entities?.data ?? [];
+
+              return (
+                <>
+                  {trackedEntities.map((entity, index) => {
+                    const trackingNumber: string = entity?.readableId ?? "";
+
+                    const label =
+                      trackedEntities.length > 1
+                        ? `${trackingType} ${index + 1}`
+                        : `${trackingType} Number`;
+
+                    return (
+                      <ValidatedForm
+                        key={entity.id}
+                        defaultValues={{
+                          trackingNumber
+                        }}
+                        validator={z.object({
+                          trackingNumber: zfd.text(z.string().optional())
+                        })}
+                        className="w-full"
+                      >
+                        <InputControlled
+                          name="trackingNumber"
+                          label={label}
+                          value={trackingNumber}
+                          size="sm"
+                          inline
+                          onBlur={(e) => {
+                            const next = e.target.value.trim();
+                            if (next === (trackingNumber ?? "").trim()) return;
+                            onUpdateBatchNumber(entity.id, next);
+                          }}
+                        />
+                      </ValidatedForm>
+                    );
+                  })}
+                </>
+              );
+            }}
+          </Await>
+        </Suspense>
+      </VStack>
+
+      {routeData?.job?.customerId &&
+      routeData?.job?.salesOrderId &&
+      routeData?.job?.salesOrderLineId ? (
+        <VStack spacing={0}>
+          <span className="text-xs text-muted-foreground">
+            <Trans>Target</Trans>
+          </span>
+          <HStack className="group w-full justify-between" spacing={0}>
+            <Hyperlink
+              to={path.to.salesOrderLine(
+                routeData.job.salesOrderId,
+                routeData?.job.salesOrderLineId
+              )}
+            >
+              <Badge variant="secondary">
+                <RiProgress8Line className="w-3 h-3 mr-1" />
+                {routeData?.job.salesOrderReadableId ?? "Make to Order"}
+              </Badge>
+            </Hyperlink>
+            <Button
+              className="group-hover:opacity-100 md:opacity-0 transition-opacity duration-200"
+              variant="ghost"
+              size="sm"
+              leftIcon={<LuUnlink2 className="w-3 h-3" />}
+              onClick={unlinkDisclosure.onOpen}
+            >
+              Unlink
+            </Button>
+          </HStack>
+        </VStack>
+      ) : (
+        <>
+          <ValidatedForm
+            defaultValues={{ salesOrderLineId: undefined }}
+            validator={z.object({
+              salesOrderLineId: zfd.text(z.string().optional())
+            })}
+            className="w-full"
+          >
+            <JobSalesOrderLine
+              jobId={jobId}
+              name="salesOrderLineId"
+              label={t`Target`}
+              inline
+              isReadOnly={isDisabled}
+              onChange={(line) => {
+                onUpdate("salesOrderLineId", line?.id ?? null);
+              }}
+            />
+          </ValidatedForm>
+          <ValidatedForm
+            defaultValues={{
+              storageUnitId: routeData?.job?.storageUnitId ?? undefined
+            }}
+            validator={z.object({
+              storageUnitId: zfd.text(z.string().optional())
+            })}
+            className="w-full"
+          >
+            <StorageUnit
+              label={t`Storage Unit`}
+              name="storageUnitId"
+              inline
+              locationId={routeData?.job?.locationId ?? undefined}
+              isReadOnly={isDisabled}
+              onChange={(value) => {
+                onUpdate("storageUnitId", value?.id ?? null);
+              }}
+            />
+          </ValidatedForm>
+        </>
+      )}
+
+      <Assignee
+        id={jobId}
+        table="job"
+        value={assignee ?? ""}
+        variant="inline"
+        isReadOnly={!canUpdate}
+      />
+
+      <ValidatedForm
+        defaultValues={{ itemId: routeData?.job?.itemId ?? undefined }}
+        validator={z.object({
+          itemId: z.string().min(1, { message: "Item is required" })
+        })}
+        className="w-full"
+      >
+        <Item
+          name="itemId"
+          inline
+          isReadOnly={isDisabled}
+          type={type}
+          locationId={routeData?.job?.locationId ?? undefined}
+          validItemTypes={["Part", "Tool"]}
+          onChange={(value) => {
+            onUpdate("itemId", value?.value ?? null);
+          }}
+          onTypeChange={(value) => {
+            setType(value as MethodItemType);
+          }}
+        />
+      </ValidatedForm>
+      <ValidatedForm
+        defaultValues={{ quantity: routeData?.job?.quantity ?? undefined }}
+        validator={z.object({
+          quantity: zfd.numeric(
+            z.number().min(0, { message: "Quantity is required" })
+          )
+        })}
+        className="w-full"
+      >
+        <NumberControlled
+          label={t`Quantity`}
+          name="quantity"
+          inline
+          isReadOnly={isDisabled}
+          value={routeData?.job?.quantity ?? 0}
+          onChange={(value) => {
+            onUpdate("quantity", value);
+          }}
+        />
+      </ValidatedForm>
+      <ValidatedForm
+        defaultValues={{
+          scrapQuantity: routeData?.job?.scrapQuantity ?? undefined
+        }}
+        validator={z.object({
+          scrapQuantity: zfd.numeric(
+            z.number().min(0, { message: "Quantity is required" })
+          )
+        })}
+        className="w-full"
+      >
+        <NumberControlled
+          label={t`Estimated Scrap Quantity`}
+          name="scrapQuantity"
+          inline
+          isReadOnly={isDisabled}
+          value={routeData?.job?.scrapQuantity ?? 0}
+          onChange={(value) => {
+            onUpdate("scrapQuantity", value);
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          startDate: routeData?.job?.startDate ?? ""
+        }}
+        validator={z.object({
+          startDate: zfd.text(z.string().optional())
+        })}
+        className="w-full"
+      >
+        <DatePicker
+          name="startDate"
+          label={t`Start Date`}
+          inline
+          isDisabled={isDisabled}
+          onChange={(date) => {
+            onUpdate("startDate", date);
+          }}
+        />
+      </ValidatedForm>
+
+      {showDueDate && (
+        <ValidatedForm
+          defaultValues={{
+            dueDate: routeData?.job?.dueDate ?? ""
+          }}
+          validator={z.object({
+            dueDate: zfd.text(z.string().optional())
+          })}
+          className="w-full"
+        >
+          <DatePicker
+            name="dueDate"
+            label={t`Due Date`}
+            inline
+            isDisabled={isDisabled}
+            onChange={(date) => {
+              onUpdate("dueDate", date);
+            }}
+          />
+        </ValidatedForm>
+      )}
+
+      <ValidatedForm
+        defaultValues={{
+          deadlineType: routeData?.job?.deadlineType ?? ""
+        }}
+        validator={z.object({
+          deadlineType: z
+            .string()
+            .min(1, { message: "Deadline Type is required" })
+        })}
+        className="w-full"
+      >
+        <Select
+          name="deadlineType"
+          label={t`Deadline Type`}
+          termId="job-deadline-type"
+          inline={(value, options) => {
+            const deadlineType = value as (typeof deadlineTypes)[number];
+            return (
+              <div className="flex gap-1 items-center">
+                {getDeadlineIcon(deadlineType)}
+                <span>{deadlineType}</span>
+              </div>
+            );
+          }}
+          isReadOnly={isDisabled}
+          options={deadlineTypes.map((d) => ({
+            value: d,
+            label: d
+          }))}
+          onChange={(value) => {
+            const next = value?.value ?? "";
+            setDeadlineType(next);
+            onUpdate("deadlineType", next || null);
+            if (!deadlineRequiresDueDate(next)) {
+              onUpdate("dueDate", null);
+            }
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{ customerId: routeData?.job?.customerId ?? undefined }}
+        validator={z.object({
+          customerId: zfd.text(z.string().optional())
+        })}
+        className="w-full"
+      >
+        <Customer
+          name="customerId"
+          inline
+          isOptional
+          isReadOnly={isDisabled || !!routeData?.job?.salesOrderId}
+          onChange={(value) => {
+            onUpdate("customerId", value?.value ?? null);
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          unitOfMeasureCode: routeData?.job?.unitOfMeasureCode ?? undefined
+        }}
+        validator={z.object({
+          unitOfMeasureCode: z
+            .string()
+            .min(1, { message: "Unit of Measure is required" })
+        })}
+        className="w-full"
+      >
+        <UnitOfMeasure
+          label={t`Unit of Measure`}
+          name="unitOfMeasureCode"
+          inline
+          isReadOnly={isDisabled}
+          onChange={(value) => {
+            onUpdate("unitOfMeasureCode", value?.value ?? null);
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{ locationId: routeData?.job?.locationId ?? undefined }}
+        validator={z.object({
+          locationId: z.string().min(1, { message: "Location is required" })
+        })}
+        className="w-full"
+      >
+        <Location
+          label={t`Job Location`}
+          name="locationId"
+          inline
+          isReadOnly={isDisabled}
+          onChange={(value) => {
+            if (value?.value) {
+              onUpdate("locationId", value.value);
+            }
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          tags: routeData?.job.tags ?? []
+        }}
+        validator={z.object({
+          tags: z.array(z.string()).optional()
+        })}
+        className="w-full"
+      >
+        <Tags
+          availableTags={routeData?.tags ?? []}
+          label={t`Tags`}
+          name="tags"
+          table="job"
+          inline
+          onChange={onUpdateTags}
+        />
+      </ValidatedForm>
+
+      <VStack spacing={2}>
+        <span className="text-xs font-medium text-muted-foreground">
+          Created By
+        </span>
+        <EmployeeAvatar employeeId={routeData?.job?.createdBy ?? null} />
+      </VStack>
+
+      <CustomFormInlineFields
+        customFields={
+          (routeData?.job?.customFields ?? {}) as Record<string, Json>
+        }
+        table="job"
+        tags={routeData?.job.tags ?? []}
+        onUpdate={onUpdateCustomFields}
+      />
+
+      {unlinkDisclosure.isOpen && (
+        <Modal
+          open={unlinkDisclosure.isOpen}
+          onOpenChange={(open) => {
+            if (!open) unlinkDisclosure.onClose();
+          }}
+        >
+          <ModalOverlay />
+          <ModalContent>
+            <ModalHeader>
+              <ModalTitle>
+                <Trans>Unlink job from sales order?</Trans>
+              </ModalTitle>
+            </ModalHeader>
+            <ModalBody>
+              <p className="text-sm text-muted-foreground">
+                <Trans>
+                  This will remove {routeData?.job?.jobId}'s link to{" "}
+                  {routeData?.job?.salesOrderReadableId}. The job will no longer
+                  appear under the sales order and shipments won't find it.
+                </Trans>
+              </p>
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="secondary" onClick={unlinkDisclosure.onClose}>
+                <Trans>Cancel</Trans>
+              </Button>
+              <Button
+                variant="destructive"
+                leftIcon={<LuUnlink2 className="w-3 h-3" />}
+                onClick={() => {
+                  onUpdate("salesOrderLineId", null);
+                  unlinkDisclosure.onClose();
+                }}
+              >
+                <Trans>Unlink</Trans>
+              </Button>
+            </ModalFooter>
+          </ModalContent>
+        </Modal>
+      )}
+    </VStack>
+  );
+};
+
+export default JobProperties;

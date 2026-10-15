@@ -1,0 +1,66 @@
+---
+title: Quality, trace & ship
+description: Prove it's right, ship it, close the books.
+label: "(V)"
+index: 4
+---
+
+After production, verify quality, preserve traceability, ship the finished units, and invoice the customer.
+
+## Raise an issue
+
+When an operator finds a defect, such as a short in the EPS wiring harness, create an Issue to record the <Term id="nonconformance">non-conformance</Term>. The issue moves from **Registered** to **In Progress** to **Closed** and links to the affected part and job operation.
+
+<Figure illustration="eight-d" caption="An issue moves through its workflow (contain, correct, verify) until the fix is proven." />
+
+<Screenshot src="/screens/ship-quality-issue.png" label="Quality issue" caption="NCR000001, 'EPS wiring harness short detected', opened against J000001's clean room assembly operation." ratio="wide" />
+
+## Workflows & actions
+
+Each issue follows a configured workflow, such as <Term>8D</Term> or a containment-only response. The workflow creates required actions as independently tracked tasks:
+
+<Figure illustration="issue-workflow" caption="An issue moves Registered → In Progress → Closed, spinning up its required-action tasks along the way." />
+
+- <Term id="containment-action">Containment</Term>: prevent affected parts from proceeding. When applied to a process, it appears on the shop floor.
+- <Term id="corrective-action">Corrective</Term>: identify and correct the root cause.
+- <Term id="preventive-action">Preventive</Term>: prevent recurrence.
+- Verification: confirm that the correction worked.
+- Communication: update the customer.
+
+<Callout tone="amber" badge="DISPOSITION" title="Held material doesn't move until someone signs off.">
+A review determines the disposition of non-conforming assemblies: use as is, <Term>rework</Term>, <Term>scrap</Term>, or return to supplier. Carbon records the decision and related actions on the issue.
+</Callout>
+
+## Versioned procedures
+
+Work instructions come from versioned procedures with **Draft**, **Active**, and **Archived** states, like <Term id="method">methods</Term>. Publishing a corrective revision applies it to future jobs while in-progress jobs retain their original revision.
+
+<Callout tone="green" badge="REVISIONS" title="Change the procedure once; the floor follows everywhere.">
+New jobs use the latest published version. In-progress jobs retain their assigned version, and each finished unit records the procedure revision used to build it.
+</Callout>
+
+<Screenshot src="/screens/ship-procedure-versions.png" label="Procedure version history" caption="V2 of the Structural Frame Assembly procedure, active, with V1 archived behind it." ratio="wide" />
+
+## Traceability
+
+Carbon stores the finished unit's <Term>genealogy</Term> as a graph of <Term id="tracked-entity">tracked entities</Term> and their activities. From one serial, you can trace backward to its components and material lots or forward from a lot to every unit that consumed it.
+
+<Figure illustration="traceability-graph" caption="The genealogy of one finished robot, from serial number down to material lots." />
+
+Open the record or scan its QR label to identify the material in the unit and every other use of the same lots.
+
+<Screenshot src="/screens/ship-traceability-graph.png" label="Traceability graph" caption="The full as-built genealogy for SAT-1000 serial SAT1000-SN-0001, down to the aluminium plate and reaction wheels it consumed." ratio="wide" />
+
+## Ship & invoice
+
+Create a [shipment](/guides/order-to-cash) against the <Term id="sales-order">sales order</Term>. Carbon drafts lines from the outstanding quantity. If SHP000001 ships 2 of 3 ordered units, 1 remains outstanding. Post the shipment, then <Term id="invoice">invoice</Term> the 2 shipped units. Because shipping and invoicing both remain, the sales order stays **"To Ship and Invoice"**.
+
+After the final unit ships, the sales order moves to **"To Invoice"** until that unit is invoiced; it then becomes **"Completed"**.
+
+Posting submits the invoice. When the invoice produces journal lines, Carbon also creates a sales-invoice journal: Provisional before the company sets up accounting, Posted after. Payment remains separate: applying a posted payment or credit creates settlements and moves the invoice to **"Partially Paid"** or **"Paid"**.
+
+<Screenshot src="/screens/ship-partial-shipment.png" label="Partial shipment" caption="Shipping part of the order — SHP000001 sends 2 of the 3 ordered, leaving 1 outstanding, so the order stays open." ratio="wide" />
+
+<Divider />
+
+The complete flow converts demand into planned production, traceable floor execution, quality control, shipment, and invoicing. See the Reference for details about methods, kits, policies, operations, and issues.

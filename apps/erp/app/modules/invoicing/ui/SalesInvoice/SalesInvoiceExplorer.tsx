@@ -1,0 +1,354 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Button,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  MENU_ITEM_SHORTCUTS,
+  PrefetchLink,
+  useDisclosure,
+  VStack
+} from "@carbon/react";
+import { distinctItemText, getItemReadableId } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useState } from "react";
+import {
+  LuCirclePlus,
+  LuEllipsisVertical,
+  LuKeyRound,
+  LuSettings2,
+  LuTrash
+} from "react-icons/lu";
+import { Link, useParams } from "react-router";
+import { Empty, ItemThumbnail, MethodItemTypeIcon } from "~/components";
+import type { DragHandleBindings } from "~/components/LineReorder";
+import {
+  ReorderableLineList,
+  ReorderableRow,
+  ReorderEditBar,
+  useLineOrderEditMode
+} from "~/components/LineReorder";
+import {
+  useOptimisticLocation,
+  usePermissions,
+  useRouteData,
+  useUser
+} from "~/hooks";
+import { getLinkToItemDetails } from "~/modules/items/ui/Item/ItemForm";
+import type { Supplier } from "~/modules/purchasing/types";
+import type { ItemType } from "~/modules/shared";
+import { itemType } from "~/modules/shared";
+import { EXPLORER_SHORTCUTS } from "~/shortcuts";
+import { useItems } from "~/stores";
+import { path } from "~/utils/path";
+import { isSalesInvoiceLocked } from "../../invoicing.models";
+import type { SalesInvoice, SalesInvoiceLine } from "../../types";
+import DeleteSalesInvoiceLine from "./DeleteSalesInvoiceLine";
+import SalesInvoiceLineForm from "./SalesInvoiceLineForm";
+import { useRentalLineTypeLabel } from "./useRentalLineTypeLabel";
+
+export default function SalesInvoiceExplorer() {
+  const { defaults } = useUser();
+  const { invoiceId } = useParams();
+  if (!invoiceId) throw new Error("Could not find invoiceId");
+  const salesInvoiceData = useRouteData<{
+    salesInvoice: SalesInvoice;
+    salesInvoiceLines: SalesInvoiceLine[];
+    supplier: Supplier;
+  }>(path.to.salesInvoice(invoiceId));
+  const permissions = usePermissions();
+
+  const salesInvoiceLineInitialValues = {
+    invoiceId: invoiceId,
+    // "Item" is the picker's generic mode, not a member of the line-type
+    // enum; posting it failed validation with "Type is required".
+    invoiceLineType: "Part" as ItemType,
+    quantity: 1,
+    locationId:
+      salesInvoiceData?.salesInvoice?.locationId ?? defaults.locationId ?? "",
+    unitOfMeasureCode: "",
+    taxPercent: 0,
+    unitPrice: 0,
+    discountPercent: 0,
+    shippingCost: 0,
+    addOnCost: 0,
+    nonTaxableAddOnCost: 0,
+    taxAmount: 0,
+    exchangeRate: salesInvoiceData?.salesInvoice?.exchangeRate ?? 1
+  };
+
+  const newSalesInvoiceLineDisclosure = useDisclosure();
+  const deleteLineDisclosure = useDisclosure();
+  const [deleteLine, setDeleteLine] = useState<SalesInvoiceLine | null>(null);
+  const isLocked = isSalesInvoiceLocked(salesInvoiceData?.salesInvoice?.status);
+  const isDisabled = isLocked
+    ? true
+    : salesInvoiceData?.salesInvoice?.status !== "Draft";
+
+  const onDeleteLine = (line: SalesInvoiceLine) => {
+    setDeleteLine(line);
+    deleteLineDisclosure.onOpen();
+  };
+
+  const onDeleteCancel = () => {
+    setDeleteLine(null);
+    deleteLineDisclosure.onClose();
+  };
+
+  const lines = salesInvoiceData?.salesInvoiceLines ?? [];
+  const canReorder =
+    !isDisabled && permissions.can("update", "invoicing") && lines.length > 1;
+
+  const editMode = useLineOrderEditMode<SalesInvoiceLine>({
+    actionPath: path.to.salesInvoiceLineOrder(invoiceId),
+    lines
+  });
+
+  return (
+    <>
+      <VStack className="w-full h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] justify-between">
+        <VStack
+          className="flex-1 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent"
+          spacing={0}
+        >
+          {lines.length > 0 ? (
+            editMode.isEditing ? (
+              <ReorderableLineList<SalesInvoiceLine>
+                lines={editMode.draft}
+                activeLine={editMode.activeLine}
+                onDragStart={editMode.handleDragStart}
+                onDragEnd={editMode.handleDragEnd}
+                renderRow={(line, dragHandle) => (
+                  <SalesInvoiceLineBody line={line} dragHandle={dragHandle} />
+                )}
+                renderOverlay={(line) => (
+                  <SalesInvoiceLineBody line={line} isOverlay />
+                )}
+              />
+            ) : (
+              lines.map((line) => (
+                <SalesInvoiceLineItem
+                  key={line.id}
+                  isDisabled={isDisabled}
+                  line={line}
+                  onDelete={onDeleteLine}
+                />
+              ))
+            )
+          ) : (
+            <Empty>
+              {permissions.can("update", "sales") && (
+                <Button
+                  isDisabled={isDisabled}
+                  leftIcon={<LuCirclePlus />}
+                  variant="secondary"
+                  onClick={newSalesInvoiceLineDisclosure.onOpen}
+                >
+                  <Trans>Add Line Item</Trans>
+                </Button>
+              )}
+            </Empty>
+          )}
+        </VStack>
+        <div className="w-full flex border-t border-border p-4 gap-2">
+          {editMode.isEditing ? (
+            <ReorderEditBar
+              isSaving={editMode.isSaving}
+              isDirty={editMode.isDirty}
+              onSave={editMode.save}
+              onCancel={editMode.cancelEditMode}
+            />
+          ) : (
+            <>
+              <Button
+                className="flex-1"
+                shortcut={EXPLORER_SHORTCUTS.addLine}
+                isDisabled={isDisabled || !permissions.can("update", "sales")}
+                leftIcon={<LuCirclePlus />}
+                variant="secondary"
+                onClick={newSalesInvoiceLineDisclosure.onOpen}
+              >
+                <Trans>Add Line Item</Trans>
+              </Button>
+              {canReorder && lines.length > 0 && (
+                <IconButton
+                  aria-label="Reorder lines"
+                  icon={<LuSettings2 />}
+                  variant="ghost"
+                  className="text-muted-foreground"
+                  onClick={editMode.enterEditMode}
+                />
+              )}
+            </>
+          )}
+        </div>
+      </VStack>
+      {newSalesInvoiceLineDisclosure.isOpen && (
+        <SalesInvoiceLineForm
+          initialValues={salesInvoiceLineInitialValues}
+          type="modal"
+          onClose={newSalesInvoiceLineDisclosure.onClose}
+        />
+      )}
+      {deleteLineDisclosure.isOpen && (
+        <DeleteSalesInvoiceLine line={deleteLine!} onCancel={onDeleteCancel} />
+      )}
+    </>
+  );
+}
+
+function SalesInvoiceLineBody({
+  line,
+  dragHandle,
+  isOverlay
+}: {
+  line: SalesInvoiceLine;
+  dragHandle?: DragHandleBindings;
+  isOverlay?: boolean;
+}) {
+  const [items] = useItems();
+  const readableId = getItemReadableId(items, line.itemId) ?? "";
+  const description = distinctItemText(readableId, line.description);
+  return (
+    <ReorderableRow dragHandle={dragHandle} isOverlay={isOverlay}>
+      <HStack spacing={2} className="flex-grow min-w-0 p-2 pr-10">
+        <ItemThumbnail thumbnailPath={line.thumbnailPath} type="Part" />
+        <VStack spacing={0} className="min-w-0">
+          <span className="font-semibold line-clamp-1">{readableId}</span>
+          {description && (
+            <span className="text-muted-foreground text-xs truncate line-clamp-1">
+              {description}
+            </span>
+          )}
+        </VStack>
+      </HStack>
+    </ReorderableRow>
+  );
+}
+
+type SalesInvoiceLineItemProps = {
+  line: SalesInvoiceLine;
+  isDisabled: boolean;
+  onDelete: (line: SalesInvoiceLine) => void;
+};
+
+function SalesInvoiceLineItem({
+  line,
+  isDisabled,
+  onDelete
+}: SalesInvoiceLineItemProps) {
+  const { t } = useLingui();
+  const [items] = useItems();
+  const { invoiceId } = useParams();
+  if (!invoiceId) throw new Error("Could not find invoiceId");
+  const permissions = usePermissions();
+  const location = useOptimisticLocation();
+  const rentalLineTypeLabel = useRentalLineTypeLabel();
+  const isRental = line.invoiceLineType === "Rental";
+
+  const isSelected =
+    location.pathname === path.to.salesInvoiceLine(invoiceId, line.id!);
+
+  const secondaryText =
+    line.invoiceLineType === "Fixed Asset"
+      ? (line as any).assetName || line.description
+      : distinctItemText(
+          getItemReadableId(items, line.itemId),
+          line.description
+        );
+
+  return (
+    <VStack spacing={0} className="border-b">
+      <PrefetchLink
+        to={path.to.salesInvoiceLine(invoiceId, line.id!)}
+        className="w-full"
+      >
+        <HStack
+          className={cn(
+            "group w-full p-2 items-center hover:bg-accent/30 cursor-pointer relative",
+            isSelected && "bg-accent/60 hover:bg-accent/50"
+          )}
+        >
+          <HStack spacing={2} className="flex-grow min-w-0 pr-10">
+            {isRental ? (
+              <div className="bg-muted rounded-lg flex items-center justify-center flex-shrink-0 w-10 h-10 p-1.5">
+                <LuKeyRound className="w-5 h-5 text-muted-foreground" />
+              </div>
+            ) : (
+              <ItemThumbnail thumbnailPath={line.thumbnailPath} type="Part" />
+            )}
+            <VStack spacing={0} className="min-w-0">
+              <span className="font-semibold line-clamp-1">
+                {isRental
+                  ? rentalLineTypeLabel(line.rentalLineType)
+                  : line.invoiceLineType === "Fixed Asset"
+                    ? (line as any).assetReadableId || "Fixed Asset"
+                    : (getItemReadableId(items, line.itemId) ?? "")}
+              </span>
+              {secondaryText && (
+                <span className="text-muted-foreground text-xs truncate line-clamp-1">
+                  {secondaryText}
+                </span>
+              )}
+            </VStack>
+          </HStack>
+          <div className="absolute right-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  aria-label={t`More`}
+                  className="md:opacity-0 group-hover:opacity-100 group-active:opacity-100 data-[state=open]:opacity-100"
+                  icon={<LuEllipsisVertical />}
+                  variant="solid"
+                  onClick={(e) => e.stopPropagation()}
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.delete}
+                  destructive
+                  disabled={isDisabled || !permissions.can("update", "sales")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(line);
+                  }}
+                >
+                  <DropdownMenuIcon icon={<LuTrash />} />
+                  <Trans>Delete Line</Trans>
+                </DropdownMenuItem>
+                {/* @ts-expect-error */}
+                {itemType.includes(line.invoiceLineType ?? "") && (
+                  <DropdownMenuItem
+                    shortcut={MENU_ITEM_SHORTCUTS.view}
+                    asChild
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Link
+                      to={getLinkToItemDetails(
+                        line.invoiceLineType as ItemType,
+                        line.itemId!
+                      )}
+                    >
+                      <DropdownMenuIcon
+                        icon={<MethodItemTypeIcon type={"Part"} />}
+                      />
+                      <Trans>View Item Master</Trans>
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </HStack>
+      </PrefetchLink>
+    </VStack>
+  );
+}

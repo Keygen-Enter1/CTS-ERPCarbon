@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { redirect } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useNavigate, useParams } from "react-router";
+import { Confirm } from "~/components/Modals";
+import { deleteProcess, getProcess } from "~/modules/resources";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    view: "resources",
+    role: "employee"
+  });
+
+  const { processId } = params;
+  if (!processId) throw notFound("processId not found");
+
+  const process = await getProcess(client, processId);
+  if (process.error) {
+    throw redirect(
+      path.to.processes,
+      await flash(request, error(process.error, "Failed to get process"))
+    );
+  }
+
+  return {
+    process: process.data
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    delete: "resources"
+  });
+
+  const { processId } = params;
+  if (!processId) {
+    throw redirect(
+      path.to.processes,
+      await flash(request, error(params, "Failed to get process id"))
+    );
+  }
+
+  const { error: deleteProcessError } = await deleteProcess(client, processId);
+  if (deleteProcessError) {
+    throw redirect(
+      path.to.processes,
+      await flash(
+        request,
+        error(deleteProcessError, deleteProcessError.details)
+      )
+    );
+  }
+
+  throw redirect(
+    path.to.processes,
+    await flash(request, success("Successfully deactivated process"))
+  );
+}
+
+export default function DeleteProcessRoute() {
+  const { processId } = useParams();
+  const { process } = useLoaderData<typeof loader>();
+  const navigate = useNavigate();
+  const { t } = useLingui();
+
+  if (!process) return null;
+  if (!processId) throw new Error("processId is not found");
+
+  const onCancel = () => navigate(path.to.processes);
+  const name = process.name;
+  return (
+    <Confirm
+      action={path.to.deleteProcess(processId)}
+      title={t`Deactivate ${name}`}
+      text={t`Are you sure you want to deactivate the process: ${name}? It will no longer appear in dropdowns.`}
+      confirmText={t`Deactivate`}
+      isOpen={true}
+      onCancel={onCancel}
+      onSubmit={onCancel}
+    />
+  );
+}

@@ -1,0 +1,260 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+import { ValidatedForm } from "@carbon/form";
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  MENU_ITEM_SHORTCUTS
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useState } from "react";
+import { LuEllipsisVertical } from "react-icons/lu";
+import { Link, useFetcher } from "react-router";
+import type { z } from "zod";
+import { TrackingTypeIcon } from "~/components";
+import {
+  Boolean,
+  DefaultMethodType,
+  Hidden,
+  Input,
+  Select,
+  Submit,
+  TextArea,
+  UnitOfMeasure
+} from "~/components/Form";
+import { itemTypeIdLabel } from "~/components/Form/itemTypeLabel";
+import { ReplenishmentSystemIcon } from "~/components/Icons";
+import { usePermissions } from "~/hooks";
+import type { ItemType } from "~/modules/shared";
+import { path } from "~/utils/path";
+import {
+  itemReplenishmentSystems,
+  itemTrackingTypes,
+  itemValidator
+} from "../../items.models";
+
+type ItemFormProps = {
+  initialValues: z.infer<typeof itemValidator>;
+  type: Database["public"]["Enums"]["itemType"];
+};
+
+const ItemForm = ({ initialValues, type }: ItemFormProps) => {
+  const permissions = usePermissions();
+  const { t, i18n } = useLingui();
+  const fetcher = useFetcher<{}>();
+
+  const translateItemTrackingType = (v: string) =>
+    v === "Inventory"
+      ? t`Inventory`
+      : v === "Non-Inventory"
+        ? t`Non-Inventory`
+        : v === "Serial"
+          ? t`Serial`
+          : t`Batch`;
+
+  const itemTrackingTypeOptions = itemTrackingTypes.map((itemTrackingType) => ({
+    label: (
+      <span className="flex items-center gap-2">
+        <TrackingTypeIcon type={itemTrackingType} />
+        {translateItemTrackingType(itemTrackingType)}
+      </span>
+    ),
+    value: itemTrackingType
+  }));
+
+  const [replenishmentSystem, setReplenishmentSystem] = useState<string>(
+    initialValues.replenishmentSystem ?? "Buy"
+  );
+  const [defaultMethodType, setDefaultMethodType] = useState<string>(
+    initialValues.defaultMethodType ?? "Purchase to Order"
+  );
+  const readableIdLabel = i18n._(itemTypeIdLabel(type));
+
+  const itemReplenishmentSystemOptions =
+    itemReplenishmentSystems.map((itemReplenishmentSystem) => ({
+      label: (
+        <span className="flex items-center gap-2">
+          <ReplenishmentSystemIcon type={itemReplenishmentSystem} />
+          {itemReplenishmentSystem === "Buy"
+            ? t`Buy`
+            : itemReplenishmentSystem === "Make"
+              ? t`Make`
+              : t`Buy and Make`}
+        </span>
+      ),
+      value: itemReplenishmentSystem
+    })) ?? [];
+
+  return (
+    <Card>
+      <ValidatedForm
+        action={path.to.api.item(type)}
+        method="post"
+        validator={itemValidator}
+        defaultValues={initialValues}
+        fetcher={fetcher}
+      >
+        <HStack className="w-full justify-between">
+          <CardHeader>
+            <CardTitle className="line-clamp-2">{initialValues.name}</CardTitle>
+          </CardHeader>
+          <CardAction>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  variant="secondary"
+                  icon={<LuEllipsisVertical />}
+                  aria-label={t`Open menu`}
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem shortcut={MENU_ITEM_SHORTCUTS.view} asChild>
+                  {/* @ts-expect-error */}
+                  <Link to={getLinkToItemDetails(type, initialValues.id)}>
+                    <Trans>View Item Master</Trans>
+                  </Link>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </CardAction>
+        </HStack>
+        <CardContent>
+          <Hidden name="id" />
+          <Hidden name="type" />
+          <div className="grid w-full gap-x-8 gap-y-4 grid-cols-1 md:grid-cols-3">
+            <Input isReadOnly name="readableId" label={readableIdLabel} />
+
+            <Input
+              name="name"
+              label={t`Short Description`}
+              characterLimit={40}
+            />
+            <Select
+              name="itemTrackingType"
+              label={t`Tracking Type`}
+              termId="item-tracking-type"
+              options={itemTrackingTypeOptions}
+            />
+
+            <Select
+              name="replenishmentSystem"
+              label={t`Replenishment System`}
+              termId="replenishment-system"
+              options={itemReplenishmentSystemOptions}
+              onChange={(newValue) => {
+                setReplenishmentSystem(newValue?.value ?? "Buy");
+                if (newValue?.value === "Buy") {
+                  setDefaultMethodType("Buy");
+                } else {
+                  setDefaultMethodType("Make");
+                }
+              }}
+            />
+            <DefaultMethodType
+              name="defaultMethodType"
+              label={t`Default Method Type`}
+              termId="item-default-method-type"
+              replenishmentSystem={replenishmentSystem}
+              value={defaultMethodType}
+              onChange={(newValue) =>
+                setDefaultMethodType(newValue?.value ?? "Buy")
+              }
+            />
+            <UnitOfMeasure
+              name="unitOfMeasureCode"
+              label={t`Unit of Measure`}
+            />
+
+            <Boolean name="active" label={t`Active`} />
+          </div>
+          <div className="mt-4 w-full">
+            <TextArea name="description" label={t`Long Description`} />
+          </div>
+        </CardContent>
+        <CardFooter>
+          <Submit isDisabled={!permissions.can("update", "parts")}>
+            <Trans>Save</Trans>
+          </Submit>
+        </CardFooter>
+      </ValidatedForm>
+    </Card>
+  );
+};
+
+export default ItemForm;
+
+export function getLinkToItemDetails(type: ItemType, id: string) {
+  switch (type) {
+    case "Part":
+      return path.to.partDetails(id);
+    case "Material":
+      return path.to.materialDetails(id);
+    case "Tool":
+      return path.to.toolDetails(id);
+    case "Consumable":
+      return path.to.consumableDetails(id);
+    case "Service":
+      return path.to.serviceDetails(id);
+    default:
+      throw new Error("Invalid type");
+  }
+}
+
+export function getLinkToItemPurchasing(type: ItemType, id: string) {
+  switch (type) {
+    case "Part":
+      return path.to.partPurchasing(id);
+    case "Material":
+      return path.to.materialPurchasing(id);
+    case "Tool":
+      return path.to.toolPurchasing(id);
+    case "Consumable":
+      return path.to.consumablePurchasing(id);
+    case "Service":
+      return path.to.servicePurchasing(id);
+    default:
+      throw new Error("Invalid type");
+  }
+}
+
+export function getLinkToItemManufacturing(type: ItemType, id: string) {
+  switch (type) {
+    case "Part":
+      return path.to.partDetails(id);
+    case "Tool":
+      return path.to.toolDetails(id);
+    case "Service":
+      return path.to.serviceDetails(id);
+    default:
+      return getLinkToItemDetails(type, id);
+  }
+}
+
+export function getLinkToItemPlanning(type: ItemType, id: string) {
+  switch (type) {
+    case "Part":
+      return path.to.partPlanning(id);
+    case "Material":
+      return path.to.materialPlanning(id);
+    case "Tool":
+      return path.to.toolPlanning(id);
+    case "Consumable":
+      return path.to.consumablePlanning(id);
+    // Services are Non-Inventory and never planned — no planning page.
+    default:
+      throw new Error("Invalid type");
+  }
+}

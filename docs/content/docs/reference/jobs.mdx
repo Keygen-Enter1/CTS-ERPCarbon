@@ -1,0 +1,134 @@
+---
+title: Jobs
+description: One run of production, covering a single item, a quantity to make, and its own copy of the method.
+---
+
+A **job** is a production order for one item, quantity, location, and due date. It contains a job-specific copy of the <Term id="method">manufacturing method</Term>, including materials and operations, so later changes to the item master do not alter released work.
+
+The schedule places a job's <Term id="job-operation">operations</Term>; operators <Term id="material-issue">issue</Term> material and record time against it; and costs accumulate in <Term id="wip">work-in-process</Term>. Make-to-order <Term id="sales-order">sales order</Term> lines and planning shortages can create jobs.
+
+## Fields
+
+<FieldTable>
+  <Field name="Job number" type="text">A readable `WO`-prefixed id (e.g. *WO000001*), assigned from a per-company sequence.</Field>
+  <Field name="Item" type="reference">What's being made. The job copies this item's method on release.</Field>
+  <Field name="Quantity" type="number">Good units to produce.</Field>
+  <Field name="Scrap quantity" type="number">Units expected lost; `production quantity` = quantity + scrap.</Field>
+  <Field name="Quantity complete" type="number">Good units finished so far.</Field>
+  <Field name="Location" type="reference">The site the job runs at and receives into.</Field>
+  <Field name="Storage unit" type="reference">The bin or shelf finished goods land in when the job completes.</Field>
+  <Field name="Due date" type="date">When it's needed, paired with the deadline type below.</Field>
+  <Field name="Deadline type" type="enum">How hard the due date is: `ASAP`, `Hard Deadline`, `Soft Deadline`, or `No Deadline`. The scheduler treats each differently.</Field>
+  <Field name="Source" type="reference">The sales order line or quote line it was raised for, if any.</Field>
+  <Field name="Assignee" type="reference">The person responsible for the job.</Field>
+  <Field name="Released / Completed date" type="date">Stamped when the job moves to **Ready** and to **Completed**. The span between them is its actual production time.</Field>
+</FieldTable>
+
+## Status lifecycle
+
+A job's status drives what you can do with it and what the floor sees.
+
+<StatusFlow entity="job">
+  <Status name="Draft">Created and editable; not yet planned or scheduled.</Status>
+  <Status name="Planned">Demand is visible to planning, but no work is on the board yet.</Status>
+  <Status name="Ready" accent>Released: operations are scheduled and material requirements raised.</Status>
+  <Status name="In Progress">The first production event has been logged against it.</Status>
+  <Status name="Paused" branch>Work is temporarily halted.</Status>
+  <Status name="Completed">Every operation is done; finished goods have been received into inventory.</Status>
+  <Status name="Closed">The books are settled. Any residual work-in-process is swept to variance.</Status>
+  <Status name="Cancelled" terminal>Abandoned before completion.</Status>
+</StatusFlow>
+
+<Callout type="info">
+A **Completed**, **Closed**, or **Cancelled** job is locked. Its method, quantity, and dates can no longer be edited. Closing is what makes a job's work-in-process provably zero.
+</Callout>
+
+<Callout type="note">
+In the Jobs list, the **Ready** status is labelled **"Released"** — the underlying value is still `Ready`. Note also the spelling: a job is **Cancelled** (two L's), but a job *operation* is **Canceled** (one L). Different enums, different spelling.
+</Callout>
+
+To release several jobs at once, select them in the Jobs list and choose **"Release Jobs"** from the actions menu. Only **Draft** and **Planned** jobs in the selection are released. There is no dialog here: a job that needs fixing, or whose outside operations go to a supplier that already has a draft purchase order to choose from, is skipped and named in the summary. Release those from the job itself.
+
+## Operations
+
+The job's <Term id="routing">routing</Term> is copied into job-specific **operations** on release, each a process on a <Term id="work-center">work center</Term>, carrying its own setup, labor, and machine time. The floor runs the job by running its operations, and each carries its own status. A job reads **"In Progress"** the moment any single operation does.
+
+<StatusFlow entity="jobOperation">
+  <Status name="Todo">Not yet worked, and not necessarily unblocked.</Status>
+  <Status name="Ready">Every operation it depends on is **Done**; this one can start.</Status>
+  <Status name="Waiting" branch>An upstream dependency isn't finished, so it's blocked. It flips to **Ready** on its own once the last one completes.</Status>
+  <Status name="In Progress">A production event is open while someone runs it.</Status>
+  <Status name="Paused" branch>Halted; time isn't accruing, but it isn't finished.</Status>
+  <Status name="Done" accent>Finished. Completing it closes any open events and promotes downstream operations whose dependencies are now all done.</Status>
+  <Status name="Canceled" terminal>Won't run.</Status>
+</StatusFlow>
+
+### Operation type
+
+Each operation carries an <Term id="operation-type">operation type</Term>: **Process**, **Assembly**, **Inspection**, or **Outside Processing**. The first three run in-house on one of your work centers and price against its rates, and the type decides which execution view the operator sees on the shop floor. A plain **Process** operation runs the standard operation view. An **Assembly** operation opens a guided, step-by-step build view: 3D animated work instructions play each step's insertion motion, with the parts, tools, and reference images scoped to the step in front of the operator. An **Inspection** operation runs a quality check, recording measured features against a ballooned drawing (the same execution screen the quality module uses for received goods). An **<Term id="outside-operation">Outside Processing</Term>** operation is subcontracted: instead of a work center it points at a supplier process, copies that supplier's cost and lead time, and drives an outside-processing <Term id="purchase-order">purchase order</Term>. The process you pick carries the same type and defaults it on new operations.
+
+<Callout type="warn">
+An Outside Processing operation's cost and lead time are copied when you set the supplier process, not linked live. If the supplier's pricing changes, re-select the supplier process to refresh it.
+</Callout>
+
+### Sequencing
+
+The **order** field sets each operation's position, and operation order (*After Previous* or *With Previous*) says whether it waits for the prior step or runs alongside it. Explicit **dependencies** are what gate a start: an operation can't reach **Ready** until every operation it depends on is **Done**, and finishing one re-checks everything downstream. Two operations with no dependency between them can be **Ready** at once and run in parallel.
+
+### Time and output
+
+The floor records time and output separately. A <Term id="production-event">production event</Term> records **Setup**, **Labor**, or **Machine** time with start, end, and employee. A production quantity records **Production**, [**Scrap**](/docs/reference/scrap), or **Rework** units and updates operation totals. Scrap does not satisfy the target quantity. Untracked materials are <Term id="backflush">backflushed</Term> when output is reported; tracked materials are issued explicitly.
+
+### Procedures
+
+Each operation can attach a <Term id="procedure">procedure</Term>: a reusable set of work instructions keyed to a process. A procedure carries an ordered list of typed **steps** the operator completes (a value, a measurement with a min/max range, a checkbox, a list choice, a timestamp, a person, or a file), any of which can be marked required. It also carries **parameters**, the process settings the work runs at, such as a temperature or speed. Separately, the operation lists the **tools** it requires. A material or tool can be assigned to a single step, or left to apply across the whole operation — so an assembly view shows the operator exactly the parts and tools each step needs as they advance.
+
+Because a procedure is keyed by process, you author it once and every operation running that process can attach it. It's versioned, moving through **Draft** while it's written, **Active** once ready for live work, and **Archived** when retired.
+
+<Callout type="note">
+Revising a procedure bumps its version. A job already released keeps the version it was built with, so a change to the master never rewrites instructions on work in flight. Each step is captured as the operator fills it in, giving the finished job a recorded answer for every one it was built with.
+</Callout>
+
+## Make to order vs. make to stock
+
+A job is identical whichever way it's raised. Only its source differs. A **<Term id="make-to-order">make-to-order</Term>** job links back to a sales order line; a **make-to-stock** job comes from <Term id="mrp">planning</Term> with no order behind it. Either way the job completes into inventory first, and the sale (if any) ships from stock — the job never ships directly to a customer.
+
+<Callout type="note">
+Releasing a job copies the part's method into a job-specific copy. Editing that copy never touches the part master, and updating the part never disturbs a job already in flight.
+</Callout>
+
+## Related
+
+<Cards>
+  <Card title="Start with the order" href="/guides/order">
+    Watch a sales order become batched jobs, each with its own method.
+  </Card>
+  <Card title="Manufacturing accounting" href="/guides/job-costing">
+    How a job accumulates cost in work-in-process and settles at close.
+  </Card>
+  <Card title="Routings" href="/docs/reference/routings">
+    The operations a job schedules onto the floor, before it copies them.
+  </Card>
+  <Card title="Work centers" href="/docs/reference/work-centers">
+    The stations and rates that cost and schedule its operations.
+  </Card>
+</Cards>
+
+<AgentContext>
+## Troubleshooting
+
+### "Manufacturing is blocked"
+Releasing the job was stopped because the item's planning settings have manufacturing blocked. Open the item, clear the manufacturing-blocked flag under its planning settings, then release the job again.
+
+### "Cannot modify a locked job. Reopen it first."
+The job is **Completed**, **Closed**, or **Cancelled** — locked, as the status callout above describes. A Completed job can be reopened if books haven't been settled; a Closed job's costs are final.
+
+### "No location found"
+Creating the job needs a location and the company has none (or no default). Add a location in settings, or set the user's default location.
+
+### "Tracked entity not found"
+Completing the job to inventory referenced a serial or batch that no longer exists — usually consumed or deleted since the job's output was recorded. Re-check the job's tracked outputs and materials before completing again.
+
+### "Failed to schedule job"
+The scheduling engine errored while placing the job's operations. Check that every operation has a work center (in-house Process, Assembly, and Inspection operations) or a supplier process (Outside Processing operations) and that the job has a due date, then retry from the job's status menu.
+</AgentContext>

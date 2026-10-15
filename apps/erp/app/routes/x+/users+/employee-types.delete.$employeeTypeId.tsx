@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { deleteEmployeeType } from "@carbon/ee/permissions.server";
+import { requireFeature } from "@carbon/ee/plan.server";
+import { redirect } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useNavigate, useParams } from "react-router";
+import { ConfirmDelete } from "~/components/Modals";
+import { getEmployeeType } from "~/modules/users";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "users",
+    role: "employee"
+  });
+
+  await requireFeature({
+    request,
+    client,
+    companyId,
+    redirectTo: path.to.employeeAccounts,
+    feature: "PERMISSIONS"
+  });
+
+  const { employeeTypeId } = params;
+  if (!employeeTypeId) throw notFound("EmployeeTypeId not found");
+
+  const employeeType = await getEmployeeType(client, employeeTypeId);
+  if (employeeType.error) {
+    throw redirect(
+      path.to.employeeTypes,
+      await flash(
+        request,
+        error(employeeType.error, "Failed to get employee type")
+      )
+    );
+  }
+
+  return {
+    employeeType: employeeType.data
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    delete: "users"
+  });
+
+  await requireFeature({
+    request,
+    client,
+    companyId,
+    redirectTo: path.to.employeeAccounts,
+    feature: "PERMISSIONS"
+  });
+
+  const { employeeTypeId } = params;
+  if (!employeeTypeId) {
+    throw redirect(
+      path.to.employeeTypes,
+      await flash(request, error(params, "Failed to get an employee type id"))
+    );
+  }
+
+  const { error: deleteTypeError } = await deleteEmployeeType(
+    client,
+    employeeTypeId,
+    companyId
+  );
+  if (deleteTypeError) {
+    throw redirect(
+      path.to.employeeTypes,
+      await flash(
+        request,
+        error(deleteTypeError, "Failed to delete employee type")
+      )
+    );
+  }
+
+  // TODO - delete employeeType group
+
+  throw redirect(
+    path.to.employeeTypes,
+    await flash(request, success("Successfully deleted employee type"))
+  );
+}
+
+export default function DeleteEmployeeTypeRoute() {
+  const { employeeTypeId } = useParams();
+  const { employeeType } = useLoaderData<typeof loader>();
+  const navigate = useNavigate();
+  const { t } = useLingui();
+
+  if (!employeeType) return null;
+  if (!employeeTypeId) throw new Error("employeeTypeId is not found");
+
+  const onCancel = () => navigate(path.to.employeeTypes);
+
+  return (
+    <ConfirmDelete
+      action={path.to.deleteEmployeeType(employeeTypeId)}
+      name={employeeType.name}
+      text={t`Are you sure you want to delete the employee type: ${employeeType.name}? This cannot be undone.`}
+      onCancel={onCancel}
+    />
+  );
+}

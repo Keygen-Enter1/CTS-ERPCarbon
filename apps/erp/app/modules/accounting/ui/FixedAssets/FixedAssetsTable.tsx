@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem,
+  useDisclosure
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import type { ReactNode } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
+import {
+  LuBookMarked,
+  LuBuilding2,
+  LuCircleDollarSign,
+  LuHash,
+  LuLayers,
+  LuMapPin,
+  LuPencil,
+  LuStar,
+  LuTrash
+} from "react-icons/lu";
+import { useNavigate } from "react-router";
+import { Hyperlink, Table } from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { useLocations } from "~/components/Form/Location";
+import { ConfirmDelete } from "~/components/Modals";
+import { usePermissions, useUser } from "~/hooks";
+import { useCurrencyFormatter } from "~/hooks/useCurrencyFormatter";
+import { path } from "~/utils/path";
+import {
+  type fixedAssetStatuses,
+  visibleFixedAssetStatuses
+} from "../../accounting.models";
+import type { FixedAssetListItem } from "../../types";
+import FixedAssetStatus from "./FixedAssetStatus";
+
+type FixedAssetsTableProps = {
+  data: FixedAssetListItem[];
+  count: number;
+  assetClasses: { id: string; name: string }[];
+  primaryAction?: ReactNode;
+};
+
+const FixedAssetsTable = memo(
+  ({ data, count, assetClasses, primaryAction }: FixedAssetsTableProps) => {
+    const { t } = useLingui();
+    const navigate = useNavigate();
+    const permissions = usePermissions();
+    const { company } = useUser();
+    const currencyFormatter = useCurrencyFormatter({
+      currency: company.baseCurrencyCode
+    });
+    const locations = useLocations();
+    const [selectedAsset, setSelectedAsset] =
+      useState<FixedAssetListItem | null>(null);
+    const deleteModal = useDisclosure();
+
+    const columns = useMemo<ColumnDef<FixedAssetListItem>[]>(
+      () => [
+        {
+          accessorKey: "fixedAssetId",
+          header: t`Asset ID`,
+          cell: ({ row }) => (
+            <Hyperlink to={path.to.fixedAsset(row.original.id)}>
+              {row.original.fixedAssetId}
+            </Hyperlink>
+          ),
+          meta: {
+            mobile: "P1",
+            icon: <LuBookMarked />
+          }
+        },
+        {
+          accessorKey: "name",
+          header: t`Name`,
+          meta: {
+            mobile: "P3",
+            icon: <LuBuilding2 />
+          }
+        },
+        {
+          accessorKey: "serialNumber",
+          header: t`Serial Number`,
+          meta: {
+            icon: <LuHash />
+          }
+        },
+        {
+          accessorKey: "status",
+          header: t`Status`,
+          cell: ({ row }) => (
+            <FixedAssetStatus
+              status={
+                row.original.status as (typeof fixedAssetStatuses)[number]
+              }
+            />
+          ),
+          meta: {
+            mobile: "P2",
+            filter: {
+              type: "static",
+              options: visibleFixedAssetStatuses.map((v) => ({
+                label: <FixedAssetStatus status={v} />,
+                value: v
+              }))
+            },
+            icon: <LuStar />
+          }
+        },
+        {
+          accessorKey: "fixedAssetClassId",
+          header: t`Asset Class`,
+          cell: ({ row }) => {
+            const cls = row.original.fixedAssetClass as {
+              id: string;
+              name: string;
+            } | null;
+            return <Enumerable value={cls?.name ?? null} />;
+          },
+          meta: {
+            filter: {
+              type: "static",
+              options: assetClasses.map((c) => ({
+                label: <Enumerable value={c.name} />,
+                value: c.id
+              }))
+            },
+            icon: <LuLayers />
+          }
+        },
+        {
+          accessorKey: "location.name",
+          header: t`Location`,
+          cell: ({ row }) => {
+            const loc = (row.original as any).location as {
+              id: string;
+              name: string;
+            } | null;
+            return <Enumerable value={loc?.name ?? null} />;
+          },
+          meta: {
+            filter: {
+              type: "static",
+              options: locations.map((l) => ({
+                label: <Enumerable value={l.label} />,
+                value: l.label
+              }))
+            },
+            icon: <LuMapPin />
+          }
+        },
+        {
+          accessorKey: "acquisitionCost",
+          header: t`Acquisition Cost`,
+          cell: ({ row }) =>
+            currencyFormatter.format(Number(row.original.acquisitionCost)),
+          meta: {
+            icon: <LuCircleDollarSign />
+          }
+        },
+        {
+          id: "netBookValue",
+          header: t`Net Book Value`,
+          cell: ({ row }) => {
+            const nbv =
+              Number(row.original.acquisitionCost) -
+              Number(row.original.accumulatedDepreciation);
+            return currencyFormatter.format(nbv);
+          },
+          meta: {
+            mobile: "P2",
+            icon: <LuCircleDollarSign />
+          }
+        }
+      ],
+      [assetClasses, currencyFormatter, locations, t]
+    );
+
+    const renderContextMenu = useCallback(
+      (row: FixedAssetListItem) => {
+        const isDraft = row.status === "Draft";
+        return (
+          <>
+            <MenuItem
+              shortcut={
+                isDraft ? MENU_ITEM_SHORTCUTS.edit : MENU_ITEM_SHORTCUTS.view
+              }
+              disabled={!permissions.can("view", "accounting")}
+              onClick={() => navigate(path.to.fixedAsset(row.id))}
+            >
+              <MenuIcon icon={<LuPencil />} />
+              {isDraft ? <Trans>Edit Asset</Trans> : <Trans>View Asset</Trans>}
+            </MenuItem>
+            {isDraft && (
+              <MenuItem
+                shortcut={MENU_ITEM_SHORTCUTS.delete}
+                disabled={!permissions.can("delete", "accounting")}
+                destructive
+                onClick={() => {
+                  setSelectedAsset(row);
+                  deleteModal.onOpen();
+                }}
+              >
+                <MenuIcon icon={<LuTrash />} />
+                <Trans>Delete Asset</Trans>
+              </MenuItem>
+            )}
+          </>
+        );
+      },
+      [deleteModal, navigate, permissions]
+    );
+
+    return (
+      <>
+        <Table<FixedAssetListItem>
+          data={data}
+          columns={columns}
+          count={count}
+          primaryAction={primaryAction}
+          renderContextMenu={renderContextMenu}
+          title={t`Fixed Assets`}
+          table="fixedAsset"
+          withSavedView
+        />
+        {selectedAsset && (
+          <ConfirmDelete
+            action={path.to.deleteFixedAsset(selectedAsset.id)}
+            isOpen={deleteModal.isOpen}
+            name={selectedAsset.fixedAssetId}
+            text={t`Are you sure you want to delete ${selectedAsset.fixedAssetId}? This cannot be undone.`}
+            onCancel={() => {
+              deleteModal.onClose();
+              setSelectedAsset(null);
+            }}
+            onSubmit={() => {
+              deleteModal.onClose();
+              setSelectedAsset(null);
+            }}
+          />
+        )}
+      </>
+    );
+  }
+);
+
+FixedAssetsTable.displayName = "FixedAssetsTable";
+export default FixedAssetsTable;

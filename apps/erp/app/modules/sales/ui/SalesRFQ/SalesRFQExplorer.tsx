@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Button,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  MENU_ITEM_SHORTCUTS,
+  PrefetchLink,
+  Spinner,
+  useDisclosure,
+  VStack
+} from "@carbon/react";
+import { useDroppable } from "@dnd-kit/core";
+import { Trans } from "@lingui/react/macro";
+import { useState } from "react";
+import {
+  LuCirclePlus,
+  LuEllipsisVertical,
+  LuSettings2,
+  LuTrash
+} from "react-icons/lu";
+import { useFetchers, useParams } from "react-router";
+import type { z } from "zod";
+import { Empty, ItemThumbnail } from "~/components";
+import type { DragHandleBindings } from "~/components/LineReorder";
+import {
+  ReorderableLineList,
+  ReorderableRow,
+  ReorderEditBar,
+  useLineOrderEditMode
+} from "~/components/LineReorder";
+import { usePermissions, useRealtime, useRouteData } from "~/hooks";
+import type { MethodItemType } from "~/modules/shared";
+import { EXPLORER_SHORTCUTS } from "~/shortcuts";
+import { path } from "~/utils/path";
+import { isSalesRfqLocked, salesRfqDragValidator } from "../../sales.models";
+import type { SalesRFQ, SalesRFQLine } from "../../types";
+import DeleteSalesRFQLine from "./DeleteSalesRFQLine";
+import MapExtractedLinesModal from "./MapExtractedLinesModal";
+import SalesRFQLineForm from "./SalesRFQLineForm";
+import { useOptimisticDocumentDrag } from "./useOptimiticDocumentDrag";
+export default function SalesRFQExplorer() {
+  const { rfqId } = useParams();
+  if (!rfqId) throw new Error("Could not find rfqId");
+  const salesRfqData = useRouteData<{
+    rfqSummary: SalesRFQ;
+    lines: SalesRFQLine[];
+  }>(path.to.salesRfq(rfqId));
+  const permissions = usePermissions();
+
+  const modelPaths = (salesRfqData?.lines ?? [])
+    .map((d) => d.modelPath)
+    .filter(Boolean);
+  useRealtime(
+    "modelUpload",
+    modelPaths.length ? `modelPath=in.(${modelPaths.join(",")})` : undefined
+  );
+
+  const newSalesRFQLineDisclosure = useDisclosure();
+  const deleteLineDisclosure = useDisclosure();
+  const mapLinesDisclosure = useDisclosure();
+  const [deleteLine, setDeleteLine] = useState<SalesRFQLine | null>(null);
+
+  const realLines = (salesRfqData?.lines ?? []) as SalesRFQLine[];
+  const unmappedLines = realLines.filter((line) => !line.itemId);
+
+  const onDeleteLine = (line: SalesRFQLine) => {
+    setDeleteLine(line);
+    deleteLineDisclosure.onOpen();
+  };
+
+  const onDeleteCancel = () => {
+    setDeleteLine(null);
+    deleteLineDisclosure.onClose();
+  };
+
+  const salesRfqLineInitialValues = {
+    salesRfqId: rfqId,
+    customerPartId: "",
+    customerPartRevision: "",
+    description: "",
+    itemId: "",
+    quantity: [1],
+    order: 1,
+    unitOfMeasureCode: "EA"
+  };
+
+  const isDisabled = isSalesRfqLocked(salesRfqData?.rfqSummary?.status);
+
+  const { setNodeRef: setExplorerRef, isOver: isOverExplorer } = useDroppable({
+    id: "sales-rfq-explorer"
+  });
+
+  const linesByCustomerPartId = new Map<
+    string,
+    SalesRFQLine | z.infer<typeof salesRfqDragValidator>
+  >(salesRfqData?.lines.map((line) => [line.customerPartId!, line]));
+  const pendingItems = useOptimisticDocumentDrag();
+
+  // merge pending items and existing items
+  for (let pendingItem of pendingItems) {
+    let item = linesByCustomerPartId.get(pendingItem.customerPartId!);
+    let merged = item
+      ? { ...item, ...pendingItem }
+      : { ...pendingItem, salesRfqId: rfqId };
+    linesByCustomerPartId.set(pendingItem.customerPartId!, merged);
+  }
+
+  const lines = Array.from(linesByCustomerPartId.values());
+
+  const canReorder =
+    !isDisabled && permissions.can("update", "sales") && realLines.length > 1;
+
+  const editMode = useLineOrderEditMode<SalesRFQLine>({
+    actionPath: path.to.salesRfqLineOrder(rfqId),
+    lines: realLines,
+    getSortOrder: (line) => line.order ?? 0
+  });
+
+  return (
+    <div
+      ref={setExplorerRef}
+      data-sales-rfq-explorer
+      className={cn(
+        "transition-colors duration-200",
+        isOverExplorer && "bg-primary/10 border-2 border-dashed border-primary"
+      )}
+    >
+      <VStack className="w-full h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] justify-between">
+        <VStack
+          className="flex-1 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent"
+          spacing={0}
+        >
+          {unmappedLines.length > 0 && !editMode.isEditing && (
+            <div className="p-2 border-b">
+              <Alert variant="warning">
+                <AlertTitle>
+                  <Trans>Unmapped Extracted Lines</Trans>
+                </AlertTitle>
+                <AlertDescription className="mt-1">
+                  <Trans>
+                    You have {unmappedLines.length} lines extracted from a PDF
+                    that are not mapped to any inventory items.
+                  </Trans>
+                  <div className="mt-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={mapLinesDisclosure.onOpen}
+                    >
+                      <Trans>Map Lines Now</Trans>
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
+            </div>
+          )}
+          {(salesRfqData?.lines && salesRfqData?.lines?.length > 0) ||
+          lines.length > 0 ? (
+            editMode.isEditing ? (
+              <ReorderableLineList<SalesRFQLine>
+                lines={editMode.draft}
+                activeLine={editMode.activeLine}
+                onDragStart={editMode.handleDragStart}
+                onDragEnd={editMode.handleDragEnd}
+                renderRow={(line, dragHandle) => (
+                  <SalesRFQLineBody line={line} dragHandle={dragHandle} />
+                )}
+                renderOverlay={(line) => (
+                  <SalesRFQLineBody line={line} isOverlay />
+                )}
+              />
+            ) : (
+              lines.map((line) =>
+                !isSalesRFQLine(line) ? (
+                  <OptimisticSalesRFQLineItem
+                    key={line.id}
+                    line={line as z.infer<typeof salesRfqDragValidator>}
+                  />
+                ) : (
+                  <DroppableSalesRFQLineItem
+                    key={line.id}
+                    line={line as SalesRFQLine}
+                    isDisabled={isDisabled}
+                    onDelete={onDeleteLine}
+                  />
+                )
+              )
+            )
+          ) : (
+            <Empty>
+              {permissions.can("update", "sales") && (
+                <Button
+                  leftIcon={<LuCirclePlus />}
+                  isDisabled={isDisabled}
+                  variant="secondary"
+                  onClick={newSalesRFQLineDisclosure.onOpen}
+                >
+                  <Trans>Add Line Item</Trans>
+                </Button>
+              )}
+            </Empty>
+          )}
+        </VStack>
+        <div className="w-full flex border-t border-border p-4 gap-2">
+          {editMode.isEditing ? (
+            <ReorderEditBar
+              isSaving={editMode.isSaving}
+              isDirty={editMode.isDirty}
+              onSave={editMode.save}
+              onCancel={editMode.cancelEditMode}
+            />
+          ) : (
+            <>
+              <Button
+                className="flex-1"
+                shortcut={EXPLORER_SHORTCUTS.addLine}
+                isDisabled={isDisabled || !permissions.can("update", "sales")}
+                leftIcon={<LuCirclePlus />}
+                variant="secondary"
+                onClick={newSalesRFQLineDisclosure.onOpen}
+              >
+                <Trans>Add Line Item</Trans>
+              </Button>
+              {canReorder && realLines.length > 0 && (
+                <IconButton
+                  aria-label="Reorder lines"
+                  icon={<LuSettings2 />}
+                  variant="ghost"
+                  className="text-muted-foreground"
+                  onClick={editMode.enterEditMode}
+                />
+              )}
+            </>
+          )}
+        </div>
+      </VStack>
+      {newSalesRFQLineDisclosure.isOpen && (
+        <SalesRFQLineForm
+          initialValues={salesRfqLineInitialValues}
+          type="modal"
+          onClose={newSalesRFQLineDisclosure.onClose}
+        />
+      )}
+      {deleteLineDisclosure.isOpen && (
+        <DeleteSalesRFQLine line={deleteLine!} onCancel={onDeleteCancel} />
+      )}
+      {mapLinesDisclosure.isOpen && (
+        <MapExtractedLinesModal
+          rfqId={rfqId}
+          customerId={salesRfqData?.rfqSummary?.customerId ?? undefined}
+          onClose={mapLinesDisclosure.onClose}
+        />
+      )}
+    </div>
+  );
+}
+
+function isSalesRFQLine(
+  line: SalesRFQLine | z.infer<typeof salesRfqDragValidator>
+) {
+  return "id" in line && "order" in line && "unitOfMeasureCode" in line;
+}
+
+function SalesRFQLineBody({
+  line,
+  dragHandle,
+  isOverlay
+}: {
+  line: SalesRFQLine;
+  dragHandle?: DragHandleBindings;
+  isOverlay?: boolean;
+}) {
+  return (
+    <ReorderableRow dragHandle={dragHandle} isOverlay={isOverlay}>
+      <HStack spacing={2} className="flex-grow min-w-0 p-2 pr-10">
+        <ItemThumbnail
+          thumbnailPath={line.thumbnailPath}
+          type={line.itemType as MethodItemType}
+        />
+        <VStack spacing={0} className="min-w-0">
+          <span className="font-semibold line-clamp-1">
+            {line.customerPartId}
+            {line.customerPartRevision && `-${line.customerPartRevision}`}
+          </span>
+          <span className="font-medium text-muted-foreground text-xs line-clamp-1">
+            {line.itemReadableId}
+          </span>
+        </VStack>
+      </HStack>
+    </ReorderableRow>
+  );
+}
+
+type DroppableSalesRFQLineItemProps = {
+  line: SalesRFQLine;
+  isDisabled: boolean;
+  onDelete: (line: SalesRFQLine) => void;
+};
+
+function OptimisticSalesRFQLineItem({
+  line
+}: {
+  line: z.infer<typeof salesRfqDragValidator>;
+}) {
+  return (
+    <VStack spacing={0} className="border-b">
+      <HStack className="w-full p-2 items-center justify-between hover:bg-accent/30 cursor-pointer">
+        <HStack spacing={2}>
+          <div className="w-10 h-10 bg-gradient-to-bl from-muted to-muted/40 rounded-lg p-2">
+            <Spinner className="w-6 h-6 text-muted-foreground" />
+          </div>
+
+          <VStack spacing={0}>
+            <span className="font-semibold line-clamp-1">
+              {line.customerPartId}
+            </span>
+          </VStack>
+        </HStack>
+        <HStack spacing={0}></HStack>
+      </HStack>
+    </VStack>
+  );
+}
+
+function DroppableSalesRFQLineItem({
+  line,
+  isDisabled,
+  onDelete
+}: DroppableSalesRFQLineItemProps) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: `sales-rfq-line-${line.id}`,
+    data: { lineId: line.id }
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={cn(
+        "transition-colors duration-200 w-full",
+        isOver && "bg-primary/20 border-2 border-dashed border-primary"
+      )}
+    >
+      <SalesRFQLineItem
+        line={line}
+        isDisabled={isDisabled}
+        onDelete={onDelete}
+      />
+    </div>
+  );
+}
+
+type SalesRFQLineItemProps = {
+  line: SalesRFQLine;
+  isDisabled: boolean;
+  onDelete: (line: SalesRFQLine) => void;
+};
+
+function SalesRFQLineItem({
+  line,
+  isDisabled,
+  onDelete
+}: SalesRFQLineItemProps) {
+  const { rfqId, lineId } = useParams();
+  if (!rfqId) throw new Error("Could not find rfqId");
+  const permissions = usePermissions();
+
+  const isSelected = lineId === line.id;
+
+  return (
+    <VStack spacing={0} className="border-b">
+      <PrefetchLink
+        className="w-full"
+        to={path.to.salesRfqLine(rfqId, line.id!)}
+      >
+        <HStack
+          className={cn(
+            "group w-full p-2 items-center hover:bg-accent/30 cursor-pointer relative",
+            isSelected && "bg-accent/60 hover:bg-accent/50"
+          )}
+        >
+          <HStack spacing={2} className="flex-grow min-w-0 pr-10">
+            <ItemThumbnail
+              thumbnailPath={line.thumbnailPath}
+              type={line.itemType as MethodItemType}
+            />
+
+            <VStack spacing={0} className="min-w-0">
+              <span className="font-semibold line-clamp-1">
+                {line.customerPartId}
+                {line.customerPartRevision && `-${line.customerPartRevision}`}
+              </span>
+              <span className="font-medium text-muted-foreground text-xs line-clamp-1">
+                {line.itemReadableId}
+              </span>
+            </VStack>
+          </HStack>
+          <div className="absolute right-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  aria-label="More"
+                  className="md:opacity-0 group-hover:opacity-100 group-active:opacity-100 data-[state=open]:opacity-100"
+                  icon={<LuEllipsisVertical />}
+                  variant="solid"
+                  onClick={(e) => e.stopPropagation()}
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.delete}
+                  destructive
+                  disabled={isDisabled || !permissions.can("update", "sales")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(line);
+                  }}
+                >
+                  <DropdownMenuIcon icon={<LuTrash />} />
+                  <Trans>Delete Line</Trans>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </HStack>
+      </PrefetchLink>
+    </VStack>
+  );
+}
+
+export function useOptimisticSalesRFQLineDrag() {
+  type PendingItem = ReturnType<typeof useFetchers>[number] & {
+    formData: FormData;
+  };
+  const { rfqId } = useParams();
+  return useFetchers()
+    .filter((fetcher): fetcher is PendingItem => {
+      return fetcher.formAction === path.to.salesRfqDrag(rfqId!);
+    })
+    .reduce<z.infer<typeof salesRfqDragValidator>[]>((acc, fetcher) => {
+      const payload = fetcher?.formData?.get("payload");
+      if (payload) {
+        try {
+          const parsedPayload = salesRfqDragValidator.parse(
+            JSON.parse(payload as string)
+          );
+          return [...acc, parsedPayload];
+        } catch {
+          // nothing
+        }
+      }
+      return acc;
+    }, []);
+}

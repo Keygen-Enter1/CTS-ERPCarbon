@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { useCloseRoute } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import {
+  departmentValidator,
+  getDepartment,
+  upsertDepartment
+} from "~/modules/people";
+import { DepartmentForm } from "~/modules/people/ui/Departments";
+import { getCustomFields, setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    view: "people"
+  });
+
+  const { departmentId } = params;
+  if (!departmentId) throw notFound("Department ID was not found");
+
+  const department = await getDepartment(client, departmentId);
+
+  if (department.error) {
+    throw redirect(
+      path.to.departments,
+      await flash(request, error(department.error, "Failed to get department"))
+    );
+  }
+
+  return {
+    department: department.data
+  };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, userId } = await requirePermissions(request, {
+    create: "people"
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(departmentValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const { id, ...d } = validation.data;
+  if (!id) throw notFound("Department ID was not found");
+
+  const updateDepartment = await upsertDepartment(client, {
+    id,
+    ...d,
+    updatedBy: userId,
+    customFields: setCustomFields(formData)
+  });
+
+  if (updateDepartment.error) {
+    throw redirect(
+      path.to.departments,
+      await flash(
+        request,
+        error(updateDepartment.error, "Failed to create department.")
+      )
+    );
+  }
+
+  throw redirect(
+    path.to.departments,
+    await flash(request, success("Department updated"))
+  );
+}
+
+export default function DepartmentRoute() {
+  const { department } = useLoaderData<typeof loader>();
+  const closeRoute = useCloseRoute();
+
+  const initialValues = {
+    id: department.id,
+    name: department.name,
+    parentDepartmentId: department.parentDepartmentId ?? undefined,
+    ...getCustomFields(department.customFields)
+  };
+
+  return (
+    <DepartmentForm
+      onClose={() => closeRoute()}
+      key={initialValues.id}
+      initialValues={initialValues}
+    />
+  );
+}

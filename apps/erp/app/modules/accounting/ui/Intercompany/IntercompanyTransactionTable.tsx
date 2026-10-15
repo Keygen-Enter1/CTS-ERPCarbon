@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { formatMoney } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import { useLocale } from "@react-aria/i18n";
+import type { ColumnDef } from "@tanstack/react-table";
+import type { ReactNode } from "react";
+import { memo, useMemo } from "react";
+import {
+  LuBuilding2,
+  LuCircleDollarSign,
+  LuFileText,
+  LuStar
+} from "react-icons/lu";
+import { DateTime, Table } from "~/components";
+import { useCurrencyDecimalsLookup } from "~/hooks";
+import { intercompanyTransactionStatuses } from "../../accounting.models";
+import IntercompanyTransactionStatus from "./IntercompanyTransactionStatus";
+
+type IntercompanyTransaction = {
+  id: string;
+  sourceCompanyId: string;
+  targetCompanyId: string;
+  amount: number;
+  currencyCode: string;
+  description: string | null;
+  status: string;
+  documentType: string | null;
+  createdAt: string;
+  sourceCompany: { name: string } | null;
+  targetCompany: { name: string } | null;
+};
+
+type IntercompanyTransactionTableProps = {
+  data: IntercompanyTransaction[];
+  count: number;
+  primaryAction?: ReactNode;
+};
+
+const IntercompanyTransactionTable = memo(
+  ({ data, count, primaryAction }: IntercompanyTransactionTableProps) => {
+    const { t } = useLingui();
+    // Currency varies per row, so the formatter is built per cell from the
+    // app locale rather than a single-currency hook instance.
+    const { locale } = useLocale();
+    const currencyDecimals = useCurrencyDecimalsLookup();
+    const columns = useMemo<ColumnDef<IntercompanyTransaction>[]>(() => {
+      const defaultColumns: ColumnDef<IntercompanyTransaction>[] = [
+        {
+          accessorKey: "sourceCompany",
+          header: t`Source`,
+          cell: ({ row }) => row.original.sourceCompany?.name ?? "—",
+          meta: {
+            icon: <LuBuilding2 />
+          }
+        },
+        {
+          accessorKey: "targetCompany",
+          header: t`Target`,
+          cell: ({ row }) => row.original.targetCompany?.name ?? "—",
+          meta: {
+            mobile: "P3",
+            icon: <LuBuilding2 />
+          }
+        },
+        {
+          accessorKey: "amount",
+          header: t`Amount`,
+          cell: ({ row }) => {
+            // The currency varies per row, so the decimals are looked up from
+            // the cached list rather than by a hook (which cannot run per row).
+            const code = row.original.currencyCode || "USD";
+            return formatMoney(
+              row.original.amount,
+              locale,
+              code,
+              currencyDecimals(code)
+            );
+          },
+          meta: {
+            mobile: "P2",
+            icon: <LuCircleDollarSign />
+          }
+        },
+        {
+          accessorKey: "description",
+          header: t`Description`,
+          cell: ({ row }) => (
+            <div className="max-w-[240px] truncate">
+              {row.original.description || row.original.documentType || "—"}
+            </div>
+          ),
+          meta: {
+            mobile: "P1",
+            icon: <LuFileText />
+          }
+        },
+        {
+          accessorKey: "status",
+          header: t`Status`,
+          cell: ({ row }) => (
+            <IntercompanyTransactionStatus
+              status={
+                row.original
+                  .status as (typeof intercompanyTransactionStatuses)[number]
+              }
+            />
+          ),
+          meta: {
+            mobile: "P2",
+            filter: {
+              type: "static",
+              options: intercompanyTransactionStatuses.map((v) => ({
+                label: v,
+                value: v
+              }))
+            },
+            icon: <LuStar />
+          }
+        },
+        {
+          accessorKey: "createdAt",
+          header: t`Created`,
+          cell: ({ row }) => (
+            <DateTime value={row.original.createdAt} variant="date" />
+          )
+        }
+      ];
+      return defaultColumns;
+    }, [t, locale, currencyDecimals]);
+
+    return (
+      <Table<IntercompanyTransaction>
+        data={data}
+        columns={columns}
+        count={count}
+        primaryAction={primaryAction}
+        title={t`Intercompany Transactions`}
+      />
+    );
+  }
+);
+
+IntercompanyTransactionTable.displayName = "IntercompanyTransactionTable";
+export default IntercompanyTransactionTable;

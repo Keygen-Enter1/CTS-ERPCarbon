@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { getAppUrl, SUPABASE_URL } from "@carbon/auth";
+import { requestReferrer } from "@carbon/utils";
+import { generatePath } from "react-router";
+
+const x = "/x"; // from ~/routes/x+ folder
+
+const ERP_URL = getAppUrl();
+
+export const path = {
+  to: {
+    authenticatedRoot: x,
+    callback: "/callback",
+    companySwitch: (companyId: string) =>
+      generatePath(`${x}/company/switch/${companyId}`),
+    dashboard: `${ERP_URL}/x`,
+    // The ERP's API routes, through the proxy (`x+/proxy.$.tsx`).
+    erpApi: `${x}/proxy/api`,
+    health: "/health",
+    login: "/login",
+    logout: "/logout",
+    mfa: "/mfa",
+    onboarding: `${ERP_URL}/onboarding`,
+    refreshSession: "/refresh-session",
+    requestAccess: "/request-access",
+    root: "/"
+  }
+} as const;
+
+export const removeSubdomain = (url?: string): string => {
+  if (!url) return "localhost:3000";
+  const parts = url.split("/")[0].split(".");
+
+  const domain = parts.slice(-2).join(".");
+
+  return domain;
+};
+
+export const getStoragePath = (bucket: string, path: string) => {
+  return `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${path}`;
+};
+
+export { requestReferrer };
+
+export const getParams = (request: Request) => {
+  const url = new URL(requestReferrer(request) ?? "/", "http://relative.local");
+  const searchParams = new URLSearchParams(url.search);
+  return searchParams.toString();
+};

@@ -1,0 +1,520 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ValidatedForm } from "@carbon/form";
+import {
+  Badge,
+  BarProgress,
+  Card,
+  CardContent,
+  CardFooter,
+  CardHeader,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  MENU_ITEM_SHORTCUTS,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger
+} from "@carbon/react";
+import { formatDate } from "@carbon/utils";
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { parseDate } from "@internationalized/date";
+import { useLingui } from "@lingui/react/macro";
+import { cva } from "class-variance-authority";
+import { memo } from "react";
+import {
+  LuCircleCheck,
+  LuCirclePlay,
+  LuClipboardCheck,
+  LuEllipsisVertical,
+  LuFlashlight,
+  LuFlashlightOff,
+  LuGripVertical,
+  LuPencil,
+  LuPlay,
+  LuSquareChartGantt,
+  LuSquareUser,
+  LuTimer,
+  LuTrash,
+  LuTriangleAlert,
+  LuUsers
+} from "react-icons/lu";
+import { RiProgress8Line } from "react-icons/ri";
+import { Link } from "react-router";
+import { z } from "zod";
+import { Assignee, CustomerAvatar, EmployeeAvatarGroup } from "~/components";
+import { Tags } from "~/components/Form";
+import { MoveToSubmenu } from "~/components/MoveToSubmenu";
+import { useDateFormatter } from "~/hooks";
+import { useTags } from "~/hooks/useTags";
+import { JobOperationStatus } from "~/modules/production/ui/Jobs/JobOperationStatus";
+import { getPrivateUrl, path } from "~/utils/path";
+import { KANBAN_CARD_SHELL } from "../cardShell";
+import { useKanban } from "../context/KanbanContext";
+import { DUE_URGENCY_BORDER, getDueUrgency } from "../dueUrgency";
+import type { Item, OperationItem } from "../types";
+import { isBatchItem } from "../types";
+import { CardMaterialChips, CardSummaryRows } from "./CardSummaryRows";
+
+interface Progress {
+  totalDuration: number;
+  progress: number;
+  active: boolean;
+  employees?: Set<string>;
+}
+
+const cardVariants = cva(KANBAN_CARD_SHELL, {
+  variants: {
+    highlighted: {
+      true: "ring-2 ring-primary opacity-100",
+      false: ""
+    },
+    dragging: {
+      over: "ring-2 ring-primary opacity-30",
+      overlay: "ring-2 ring-primary hover:bg-muted"
+    },
+    status: {
+      "In Progress": "border-emerald-600/30",
+      Ready: "",
+      Done: "",
+      Paused: "",
+      Canceled: "border-red-500/30",
+      Cancelled: "border-red-500/30",
+      Waiting: "opacity-50",
+      Todo: "border-border"
+    }
+  },
+  defaultVariants: {
+    status: "Todo"
+  }
+});
+
+type ItemCardProps = {
+  item: Item;
+  isOverlay?: boolean;
+  progressByItemId: Record<string, Progress>;
+};
+
+// Batch items render via BatchItemCard (an explicit variant); this guard keeps
+// the union out of the hook-bearing body so field access stays narrowed.
+export function ItemCard({ item, ...rest }: ItemCardProps) {
+  if (isBatchItem(item)) return null;
+  return <OperationCard item={item} {...rest} />;
+}
+
+function OperationCard({
+  item,
+  isOverlay,
+  progressByItemId
+}: {
+  item: Exclude<Item, { batchId: string }>;
+  isOverlay?: boolean;
+  progressByItemId: Record<string, Progress>;
+}) {
+  const { selectedGroup, scheduleToday } = useKanban();
+  const {
+    setNodeRef,
+    attributes,
+    listeners,
+    transform,
+    transition,
+    isDragging
+  } = useSortable({
+    id: item.id,
+    data: {
+      type: "item",
+      item
+    },
+    attributes: {
+      roleDescription: "item"
+    }
+  });
+
+  const isHighlighted = selectedGroup === item.jobReadableId;
+  const itemProgress = progressByItemId[item.id];
+  const status = itemProgress?.active ? "In Progress" : item.status;
+
+  const style = {
+    transition,
+    transform: CSS.Translate.toString(transform)
+  };
+  const urgency = getDueUrgency({ ...item, status }, scheduleToday);
+
+  // This shell re-renders whenever the drop target changes; the body does
+  // not. It is the expensive part (a form, avatars and menus per card), and
+  // rendering every card's body on each change made a drag stutter.
+  return (
+    <Card
+      ref={setNodeRef}
+      style={style}
+      className={cn(
+        "group/card max-w-[330px]",
+        cardVariants({
+          dragging: isOverlay ? "overlay" : isDragging ? "over" : undefined,
+          // @ts-expect-error TS2322 - TODO: fix type
+          status: status,
+          highlighted: isHighlighted
+        }),
+        urgency && DUE_URGENCY_BORDER[urgency]
+      )}
+    >
+      <OperationCardBody
+        item={item}
+        itemProgress={itemProgress}
+        isHighlighted={isHighlighted}
+        attributes={attributes}
+        listeners={listeners}
+      />
+    </Card>
+  );
+}
+
+const OperationCardBody = memo(function OperationCardBody({
+  item,
+  itemProgress,
+  isHighlighted,
+  attributes,
+  listeners
+}: {
+  item: Exclude<Item, { batchId: string }>;
+  itemProgress: Progress | undefined;
+  isHighlighted: boolean;
+  attributes: ReturnType<typeof useSortable>["attributes"];
+  listeners: ReturnType<typeof useSortable>["listeners"];
+}) {
+  const { t } = useLingui();
+  const { formatRelativeTime } = useDateFormatter();
+  const { displaySettings, setSelectedGroup, tags, scheduleToday, moveTo } =
+    useKanban();
+
+  const isOverdue =
+    item.deadlineType !== "ASAP" &&
+    item.deadlineType !== "No Deadline" &&
+    !!item.dueDate &&
+    item.dueDate < scheduleToday;
+
+  const projectedCompletionDate = item.projectedCompletionAt
+    ? item.projectedCompletionAt.slice(0, 10)
+    : null;
+  const daysBehindTarget =
+    projectedCompletionDate && item.dueDate
+      ? parseDate(projectedCompletionDate).compare(
+          parseDate(item.dueDate.slice(0, 10))
+        )
+      : 0;
+  const isBehindTarget = daysBehindTarget > 0;
+
+  const progress = itemProgress?.progress ?? 0;
+  const status = itemProgress?.active ? "In Progress" : item.status;
+  const employeeIds = itemProgress?.employees
+    ? Array.from(itemProgress.employees)
+    : undefined;
+
+  return (
+    <>
+      <CardHeader className="flex flex-col justify-between relative gap-2">
+        <div className="flex w-full max-w-full justify-between items-start gap-0">
+          <div className="flex flex-col space-y-0 min-w-0">
+            {item.itemReadableId && (
+              <span className="text-xs text-muted-foreground line-clamp-1">
+                {item.itemReadableId}
+              </span>
+            )}
+            <Link
+              to={`${item.link}?selectedOperation=${item.id}`}
+              className="mr-auto font-semibold line-clamp-2 leading-tight"
+            >
+              {item.itemDescription || item.itemReadableId}
+            </Link>
+          </div>
+          <HStack spacing={1} className="flex-shrink-0 -mr-2">
+            {item.hasConflict && (
+              <Tooltip>
+                <TooltipTrigger>
+                  <LuTriangleAlert className="h-4 w-4 text-red-500 flex-shrink-0" />
+                </TooltipTrigger>
+                <TooltipContent>
+                  {item.conflictReason ?? t`Scheduling conflict`}
+                </TooltipContent>
+              </Tooltip>
+            )}
+            <IconButton
+              aria-label={t`Move item`}
+              icon={<LuGripVertical />}
+              variant={"ghost"}
+              {...attributes}
+              {...listeners}
+              className="cursor-grab"
+            />
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  aria-label={t`More options`}
+                  icon={<LuEllipsisVertical />}
+                  variant="secondary"
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                {item.link && (
+                  <DropdownMenuItem shortcut={MENU_ITEM_SHORTCUTS.edit} asChild>
+                    <Link to={`${item.link}?selectedOperation=${item.id}`}>
+                      <DropdownMenuIcon icon={<LuPencil />} />
+                      Edit Operation
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem
+                  onClick={() =>
+                    setSelectedGroup?.(
+                      isHighlighted ? null : item.jobReadableId
+                    )
+                  }
+                  destructive={isHighlighted}
+                >
+                  <DropdownMenuIcon
+                    icon={
+                      isHighlighted ? <LuFlashlightOff /> : <LuFlashlight />
+                    }
+                  />
+                  {isHighlighted ? "Remove Highlight" : "Highlight Job"}
+                </DropdownMenuItem>
+                <DropdownMenuItem shortcut={MENU_ITEM_SHORTCUTS.open} asChild>
+                  <a href={path.to.external.mesJobOperation(item.id)}>
+                    <DropdownMenuIcon icon={<LuPlay />} />
+                    Open in MES
+                  </a>
+                </DropdownMenuItem>
+                {moveTo && (
+                  <MoveToSubmenu
+                    getTargets={() => moveTo.targetsFor(item.id)}
+                    onMove={(columnId) => moveTo.onMove(item.id, columnId)}
+                  />
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </HStack>
+        </div>
+
+        {displaySettings.showProgress &&
+          Number.isFinite(progress) &&
+          // @ts-expect-error TS2339 - TODO: fix type
+          Number.isFinite(item?.duration) &&
+          Number(progress) >= 0 &&
+          // @ts-expect-error TS2339 - TODO: fix type
+          Number(item?.duration) >= 0 && (
+            <HStack>
+              <BarProgress
+                gradient
+                invertGradient
+                progress={Math.min(
+                  // @ts-expect-error TS2339 - TODO: fix type
+                  progress && item.duration
+                    ? // @ts-expect-error TS2339 - TODO: fix type
+                      (progress / item.duration) * 100
+                    : 0,
+                  100
+                )}
+              />
+              <LuTimer className="text-muted-foreground w-4 h-4" />
+            </HStack>
+          )}
+        {displaySettings.showProgress &&
+          Number.isFinite(item.targetQuantity ?? item.quantity) &&
+          Number(item.targetQuantity ?? item.quantity) > 0 && (
+            <HStack>
+              <BarProgress
+                segments={[
+                  {
+                    value: item.quantityCompleted ?? 0,
+                    className: "bg-emerald-500"
+                  },
+                  {
+                    value: item.quantityReworked ?? 0,
+                    className: "bg-yellow-500"
+                  },
+                  { value: item.quantityScrapped ?? 0, className: "bg-red-500" }
+                ]}
+                max={(item.targetQuantity ?? item.quantity) || 1}
+                progress={
+                  item.quantityCompleted &&
+                  (item.targetQuantity ?? item.quantity)
+                    ? (item.quantityCompleted /
+                        // @ts-expect-error TS2532 - TODO: fix type
+                        (item.targetQuantity ?? item.quantity)) *
+                      100
+                    : 0
+                }
+              />
+              <LuCircleCheck className="text-muted-foreground w-4 h-4" />
+            </HStack>
+          )}
+      </CardHeader>
+      <CardContent className="gap-2 text-left whitespace-pre-wrap text-sm">
+        {displaySettings.showThumbnail && item.thumbnailPath && (
+          <div className="flex justify-center">
+            <img
+              src={getPrivateUrl(item.thumbnailPath)}
+              alt={item.itemDescription}
+              className="w-full h-auto rounded-lg"
+            />
+          </div>
+        )}
+        <HStack className="justify-start space-x-2">
+          <LuCirclePlay className="text-muted-foreground" />
+          <span className="text-sm line-clamp-1">{item.title}</span>
+          {item.reworkId && <Badge variant="red">Rework</Badge>}
+        </HStack>
+        {displaySettings.showMaterial &&
+          "materialChips" in item &&
+          (item.materialChips?.length ?? 0) > 0 && (
+            <CardMaterialChips chips={item.materialChips ?? []} />
+          )}
+        {displaySettings.showDescription && item.description && (
+          <HStack className="justify-start space-x-2">
+            <LuClipboardCheck className="text-muted-foreground" />
+            <span className="text-sm line-clamp-1">{item.description}</span>
+          </HStack>
+        )}
+        {displaySettings.showStatus && status && (
+          <HStack className="justify-start space-x-1.5">
+            <JobOperationStatus
+              operation={{
+                id: item.id,
+                // @ts-expect-error TS2322 - TODO: fix type
+                status: status ?? "Todo",
+                jobId: item.jobId
+              }}
+              className="size-4 p-0 hover:bg-transparent"
+            />
+            <span className="text-sm">{status}</span>
+          </HStack>
+        )}
+        <CardSummaryRows
+          showDuration={
+            displaySettings.showDuration &&
+            typeof (item as OperationItem).duration === "number"
+          }
+          duration={(item as OperationItem).duration ?? 0}
+          showDueDate={displaySettings.showDueDate}
+          deadlineType={item.deadlineType}
+          dueDate={item.dueDate}
+          isOverdue={isOverdue}
+          formatRelativeTime={formatRelativeTime}
+        />
+        {displaySettings.showDueDate && projectedCompletionDate && (
+          <HStack className="justify-start space-x-2">
+            <LuSquareChartGantt className="text-muted-foreground" />
+            {isBehindTarget ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Badge variant="red">
+                    {formatDate(projectedCompletionDate)}
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent side="right">
+                  {t`Behind target by ${daysBehindTarget} day(s)`}
+                </TooltipContent>
+              </Tooltip>
+            ) : (
+              <span className="text-sm text-muted-foreground">
+                {formatDate(projectedCompletionDate)}
+              </span>
+            )}
+          </HStack>
+        )}
+
+        {displaySettings.showSalesOrder &&
+          item.salesOrderReadableId &&
+          item.salesOrderId &&
+          item.salesOrderLineId && (
+            <HStack className="justify-start space-x-2">
+              <RiProgress8Line className="text-muted-foreground" />
+              <Link
+                to={path.to.salesOrderLine(
+                  item.salesOrderId,
+                  item.salesOrderLineId
+                )}
+                className="text-sm"
+              >
+                {item.salesOrderReadableId}
+              </Link>
+            </HStack>
+          )}
+
+        {displaySettings.showCustomer && item.customerId && (
+          <HStack className="justify-start space-x-2">
+            <LuSquareUser className="text-muted-foreground" />
+            <CustomerAvatar customerId={item.customerId} />
+          </HStack>
+        )}
+
+        {displaySettings.showEmployee &&
+          Array.isArray(employeeIds) &&
+          employeeIds.length > 0 && (
+            <HStack className="justify-start space-x-2">
+              <LuUsers className="text-muted-foreground" />
+              <EmployeeAvatarGroup employeeIds={employeeIds} />
+            </HStack>
+          )}
+
+        {displaySettings.showQuantity && Number(item.quantityScrapped) > 0 && (
+          <HStack className="justify-start space-x-2 text-red-500">
+            <LuTrash className="w-4 h-4" />
+            <span className="text-sm">{item.quantityScrapped} Scrapped</span>
+          </HStack>
+        )}
+      </CardContent>
+      <CardFooter className="items-center justify-between text-xs flex-wrap">
+        <HStack>
+          <Assignee
+            table="jobOperation"
+            id={item.id!}
+            size="sm"
+            value={item.assignee ?? undefined}
+          />
+          <JobOperationTags operation={item} availableTags={tags} />
+        </HStack>
+      </CardFooter>
+    </>
+  );
+});
+
+function JobOperationTags({
+  operation,
+  availableTags
+}: {
+  operation: Exclude<Item, { batchId: string }>;
+  availableTags: { name: string }[];
+}) {
+  const { onUpdateTags } = useTags({ id: operation.id, table: "jobOperation" });
+
+  return (
+    <ValidatedForm
+      defaultValues={{
+        tags: operation.tags ?? []
+      }}
+      validator={z.object({
+        tags: z.array(z.string()).optional()
+      })}
+      className="w-full"
+    >
+      <Tags
+        availableTags={availableTags}
+        label=""
+        name="tags"
+        table="operation"
+        inline
+        maxPreview={1}
+        onChange={onUpdateTags}
+      />
+    </ValidatedForm>
+  );
+}

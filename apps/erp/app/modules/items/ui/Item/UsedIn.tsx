@@ -1,0 +1,707 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database, Json } from "@carbon/database";
+import {
+  Badge,
+  Count,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  Input,
+  InputGroup,
+  InputLeftElement,
+  MENU_ITEM_SHORTCUTS,
+  Skeleton,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  useDisclosure,
+  VStack
+} from "@carbon/react";
+import { getReadableIdWithRevision } from "@carbon/utils";
+import type { MessageDescriptor } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
+import { useLingui } from "@lingui/react/macro";
+import type { ReactElement } from "react";
+import { useState } from "react";
+import { flushSync } from "react-dom";
+import {
+  LuChevronRight,
+  LuEllipsisVertical,
+  LuPencil,
+  LuPlus,
+  LuSearch,
+  LuShieldX,
+  LuStar,
+  LuTruck
+} from "react-icons/lu";
+import { Link, useParams } from "react-router";
+import { z } from "zod";
+import { Hyperlink, MethodIcon } from "~/components";
+import { Confirm } from "~/components/Modals";
+import { LevelLine } from "~/components/TreeView";
+import { usePermissions } from "~/hooks";
+import { getNextRevision } from "~/modules/items";
+import type { ItemType } from "~/modules/shared";
+import { path } from "~/utils/path";
+import type { ChangeNoticeStatus as ChangeNoticeStatusType } from "../../types";
+import ChangeNoticeStatus from "../ChangeNotice/ChangeNoticeStatus";
+import {
+  ItemChangeNoticeLock,
+  useItemOpenChangeNotices
+} from "../ChangeNotice/ItemChangeNoticeLock";
+import { getPathToMakeMethod } from "../Methods/utils";
+import RevisionForm from "./RevisionForm";
+
+export function UsedInSkeleton() {
+  return (
+    <div className="flex flex-col gap-1 w-full">
+      <Skeleton className="h-7 w-full" />
+      <Skeleton className="h-7 w-full" />
+      <Skeleton className="h-7 w-3/4" />
+      <Skeleton className="h-7 w-1/2" />
+    </div>
+  );
+}
+
+export type UsedInKey =
+  | Database["public"]["Enums"]["itemType"]
+  | "assemblyInstructions"
+  | "changeNotices"
+  | "inspections"
+  | "issues"
+  | "jobMaterials"
+  | "jobs"
+  | "maintenanceDispatchItems"
+  | "methodMaterials"
+  | "purchaseOrderLines"
+  | "receiptLines"
+  | "quoteLines"
+  | "quoteMaterials"
+  | "salesOrderLines"
+  | "shipmentLines"
+  | "supplierQuotes";
+
+/**
+ * Tooltip identity for a group row. Every group is identified by its
+ * `UsedInKey` except the revisions row, which `UsedInTree` builds inline with
+ * the item's *type* as its key (`Part`, `Material`, …) and labels either
+ * "Revisions" or "Sizes" — so it looks itself up under `revisions` / `sizes`.
+ */
+type UsedInTooltipKey = UsedInKey | "revisions" | "sizes";
+
+/**
+ * Optional one-line explanation of what a "Used In" group means, shown on hover.
+ *
+ * This is the only place a group tooltip is declared. Every surface builds its
+ * tree from these same keys, so one entry here reaches the part, tool, material,
+ * consumable and service detail pages *and* the change-notice impact panel at
+ * once — no route file changes. Resolution deliberately happens in the row
+ * component rather than in `UsedInTree`, because `ImpactPanel` renders
+ * `UsedInItem` directly and would silently miss anything injected there.
+ *
+ * Sparse on purpose: most group names explain themselves, and a tooltip on every
+ * row is noise. A key with no entry renders exactly as it does without one.
+ *
+ * The itemType members of `UsedInKey` are never a group's identity, so an entry
+ * under one of them would type-check but never render — use `revisions` /
+ * `sizes` for that row instead.
+ */
+const USED_IN_TOOLTIPS: Partial<Record<UsedInTooltipKey, MessageDescriptor>> = {
+  jobMaterials: msg`Jobs that have this item on their bill of materials`,
+  methodMaterials: msg`Parent items. (If you click into one of the parent parts below, you'll see this item included as a component on the bill of material.)`,
+  quoteMaterials: msg`Quote lines whose bill of materials includes this item`
+};
+
+export type UsedInNode = {
+  key: UsedInKey;
+  name: string;
+  module: string;
+  children: {
+    id: string;
+    documentReadableId: string;
+    documentId?: string;
+    documentParentId?: string;
+    itemType?: ItemType;
+    methodType?: string;
+    revision?: string;
+    version?: number;
+    status?: ChangeNoticeStatusType;
+  }[];
+};
+
+const revisionValidator = z.array(
+  z.object({
+    id: z.string(),
+    revision: z.string(),
+    methodType: z.string(),
+    type: z.string()
+  })
+);
+
+export type JobMaterialUsage = {
+  byMaterialId: Record<string, number>;
+  byJobId: Record<string, number>;
+};
+
+export function UsedInTree({
+  tree,
+  revisions: revisionsJson,
+  itemReadableId,
+  itemReadableIdWithRevision,
+  jobMaterialUsage,
+  hasSizesInsteadOfRevisions = false,
+  filterText: filterTextProp,
+  hideSearch
+}: {
+  tree: UsedInNode[];
+  revisions?: Json;
+  itemReadableId: string;
+  itemReadableIdWithRevision: string;
+  jobMaterialUsage?: JobMaterialUsage;
+  hasSizesInsteadOfRevisions?: boolean;
+  filterText?: string;
+  hideSearch?: boolean;
+}) {
+  const { t } = useLingui();
+  const [filterTextInternal, setFilterTextInternal] = useState("");
+  const filterText = filterTextProp ?? filterTextInternal;
+
+  const jobMaterialQuantities = jobMaterialUsage?.byMaterialId ?? {};
+  const jobQuantities = jobMaterialUsage?.byJobId ?? {};
+
+  const revisions = (
+    revisionValidator.safeParse(revisionsJson)?.data ?? []
+  )?.map((r) => ({
+    id: r.id,
+    documentReadableId: getReadableIdWithRevision(itemReadableId, r.revision),
+    methodType: r.methodType,
+    type: r.type,
+    revision: r.revision
+  }));
+
+  return (
+    <VStack className="w-full p-2">
+      {!hideSearch && (
+        <HStack className="w-full py-1 sticky top-0 z-10 bg-card -mt-2 pt-2 -mx-2 px-2">
+          <InputGroup size="sm" className="flex grow">
+            <InputLeftElement>
+              <LuSearch className="h-4 w-4" />
+            </InputLeftElement>
+            <Input
+              placeholder={t`Search...`}
+              value={filterText}
+              onChange={(e) => setFilterTextInternal(e.target.value)}
+            />
+          </InputGroup>
+        </HStack>
+      )}
+      <VStack spacing={0}>
+        <RevisionsItem
+          filterText={filterText}
+          node={{
+            key: (revisions?.[0]?.type as UsedInKey) ?? "Part",
+            name: hasSizesInsteadOfRevisions ? "Sizes" : "Revisions",
+            module: "parts",
+            children: revisions
+          }}
+          maxRevision={revisions?.[0]?.revision ?? ""}
+          hasSizesInsteadOfRevisions={hasSizesInsteadOfRevisions}
+        />
+        {[...tree]
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map((node) => (
+            <UsedInItem
+              key={node.key}
+              filterText={filterText}
+              node={node}
+              itemReadableIdWithRevision={itemReadableIdWithRevision}
+              jobMaterialQuantities={jobMaterialQuantities}
+              jobQuantities={jobQuantities}
+            />
+          ))}
+      </VStack>
+    </VStack>
+  );
+}
+
+/**
+ * Wraps a group row in a tooltip when its key has one, and returns the row
+ * untouched when it doesn't.
+ *
+ * The trigger is the row button itself, not the label: `asChild` clones the
+ * child instead of emitting its own element, so there is no nested button and no
+ * extra tab stop, and the natively focusable button makes the tooltip reachable
+ * by keyboard rather than hover-only.
+ *
+ * The lookup lives here rather than in the callers so that neither `UsedInItem`
+ * nor `RevisionsItem` gains a hook — `UsedInItem` has a conditional early
+ * return, so any hook added after it trips `useHookAtTopLevel`.
+ */
+function UsedInGroupTooltip({
+  tooltipKey,
+  children
+}: {
+  tooltipKey: UsedInTooltipKey;
+  children: ReactElement;
+}) {
+  const { i18n } = useLingui();
+  const tooltip = USED_IN_TOOLTIPS[tooltipKey];
+
+  if (!tooltip) return children;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{children}</TooltipTrigger>
+      <TooltipContent>{i18n._(tooltip)}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+export function RevisionsItem({
+  node,
+  filterText,
+  maxRevision,
+  hasSizesInsteadOfRevisions = false
+}: {
+  node: UsedInNode;
+  filterText: string;
+  maxRevision: string;
+  hasSizesInsteadOfRevisions?: boolean;
+}) {
+  const { itemId } = useParams();
+  const permissions = usePermissions();
+  const { t } = useLingui();
+  const revisionDisclosure = useDisclosure();
+  const defaultDisclosure = useDisclosure();
+
+  // Block manual revision creation while an open change notice owns this item —
+  // the CO authors revisions. The button stays visible but disabled, with a
+  // tooltip pointing at the change notice(s).
+  const { changeNotices: openChangeNotices, isLocked: isChangeNoticeLocked } =
+    useItemOpenChangeNotices(node.key, itemId);
+
+  const [selectedRevision, setSelectedRevision] = useState<{
+    id?: string;
+    copyFromId?: string;
+    type: "Part" | "Material" | "Tool" | "Service" | "Consumable";
+    revision: string;
+  } | null>();
+  const [isExpanded, setIsExpanded] = useState(
+    node.children.length > 0 && node.children.length < 10
+  );
+
+  const filteredChildren = node.children.filter((child) =>
+    child.documentReadableId.toLowerCase().includes(filterText.toLowerCase())
+  );
+
+  return (
+    <>
+      <div className="relative w-full">
+        <UsedInGroupTooltip
+          tooltipKey={hasSizesInsteadOfRevisions ? "sizes" : "revisions"}
+        >
+          <button
+            className="flex h-8 cursor-pointer items-center overflow-hidden rounded-sm px-2 gap-2 text-sm hover:bg-accent w-full font-medium"
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsExpanded(!isExpanded);
+            }}
+          >
+            <div className="h-8 w-4 flex items-center justify-center">
+              <LuChevronRight
+                className={cn("size-4", isExpanded && "rotate-90")}
+              />
+            </div>
+            <div className="flex flex-grow items-center justify-between gap-2 pr-6">
+              <span>{node.name}</span>
+
+              {filteredChildren.length > 0 && (
+                <Count count={filteredChildren.length} />
+              )}
+            </div>
+          </button>
+        </UsedInGroupTooltip>
+        {permissions.can("create", "parts") &&
+          (isChangeNoticeLocked ? (
+            <ItemChangeNoticeLock
+              changeNotices={openChangeNotices}
+              isLocked={isChangeNoticeLocked}
+              className="absolute right-2 top-1.5"
+            >
+              <IconButton
+                size="sm"
+                variant="secondary"
+                icon={<LuPlus />}
+                aria-label={t`Create`}
+                className="size-5"
+                isDisabled
+              />
+            </ItemChangeNoticeLock>
+          ) : (
+            <IconButton
+              size="sm"
+              variant="secondary"
+              icon={<LuPlus />}
+              aria-label={t`Create`}
+              className="size-5 absolute right-2 top-1.5"
+              onClick={() => {
+                flushSync(() => {
+                  setSelectedRevision({
+                    copyFromId: itemId,
+                    type: node.key as "Part",
+                    revision: hasSizesInsteadOfRevisions
+                      ? ""
+                      : getNextRevision(maxRevision)
+                  });
+                  revisionDisclosure.onOpen();
+                });
+              }}
+            />
+          ))}
+      </div>
+      {isExpanded && (
+        <div className="flex flex-col w-full relative ">
+          {node.children.length === 0 ? (
+            <div className="flex h-8 items-center overflow-hidden rounded-sm px-2 gap-4">
+              <LevelLine isSelected={false} />
+              <div className="text-xs text-muted-foreground">
+                {t`No ${node.name.toLowerCase()} found`}
+              </div>
+            </div>
+          ) : (
+            filteredChildren.map((child, index) => {
+              const isActive = child.id === itemId;
+              return (
+                <div className="relative group/used-in" key={index}>
+                  <Hyperlink
+                    to={getUseInLink(child, node.key, "")}
+                    className={cn(
+                      "pr-6 flex h-8 cursor-pointer items-center overflow-hidden rounded-sm px-1 gap-4 text-sm hover:bg-accent w-full font-medium whitespace-nowrap",
+                      isActive && "bg-accent"
+                    )}
+                  >
+                    <LevelLine isSelected={isActive} className="mr-2" />
+                    <MethodIcon
+                      type={child.methodType ?? "Method"}
+                      className="mr-2"
+                    />
+                    <span className="truncate">{child.documentReadableId}</span>
+                  </Hyperlink>
+                  {permissions.can("update", "parts") && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <IconButton
+                          size="sm"
+                          variant="secondary"
+                          icon={<LuEllipsisVertical />}
+                          aria-label={t`Edit`}
+                          className="absolute right-2 top-1 flex-shrink-0 md:opacity-0 group-hover/used-in:opacity-100 data-[state=open]:opacity-100"
+                        />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          shortcut={MENU_ITEM_SHORTCUTS.edit}
+                          onSelect={() => {
+                            flushSync(() => {
+                              setSelectedRevision({
+                                id: child.id,
+                                type: node.key as "Part",
+                                revision: child.revision ?? ""
+                              });
+                              revisionDisclosure.onOpen();
+                            });
+                          }}
+                        >
+                          <DropdownMenuIcon icon={<LuPencil />} />
+                          Edit
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            flushSync(() => {
+                              setSelectedRevision({
+                                id: child.id,
+                                type: node.key as "Part",
+                                revision: child.revision ?? ""
+                              });
+                              defaultDisclosure.onOpen();
+                            });
+                          }}
+                        >
+                          <DropdownMenuIcon icon={<LuStar />} />
+                          Set as Default{" "}
+                          {hasSizesInsteadOfRevisions ? "Size" : "Revision"}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
+
+      {revisionDisclosure.isOpen && selectedRevision && (
+        <RevisionForm
+          initialValues={selectedRevision!}
+          onClose={revisionDisclosure.onClose}
+          hasSizesInsteadOfRevisions={hasSizesInsteadOfRevisions}
+        />
+      )}
+      {defaultDisclosure.isOpen && selectedRevision && (
+        <Confirm
+          action={path.to.defaultRevision(selectedRevision.id!)}
+          confirmText={t`Make Default`}
+          title={
+            hasSizesInsteadOfRevisions
+              ? t`Make size ${selectedRevision.revision} default?`
+              : t`Make revision ${selectedRevision.revision} default?`
+          }
+          text={
+            hasSizesInsteadOfRevisions
+              ? t`This will replace all method materials of other sizes with this size.`
+              : t`This will replace all method materials of other revisions with this revision.`
+          }
+          isOpen
+          onSubmit={() => {
+            defaultDisclosure.onClose();
+            setSelectedRevision(null);
+          }}
+          onCancel={defaultDisclosure.onClose}
+        />
+      )}
+    </>
+  );
+}
+
+export function UsedInItem({
+  node,
+  itemReadableIdWithRevision,
+  filterText,
+  jobMaterialQuantities,
+  jobQuantities
+}: {
+  node: UsedInNode;
+  filterText: string;
+  itemReadableIdWithRevision: string;
+  jobMaterialQuantities?: Record<string, number>;
+  jobQuantities?: Record<string, number>;
+}) {
+  const { t } = useLingui();
+  const [isExpanded, setIsExpanded] = useState(
+    node.children.length > 0 && node.children.length < 10
+  );
+  const permissions = usePermissions();
+
+  if (!permissions.can("view", node.module)) {
+    return null;
+  }
+
+  const filteredChildren = node.children.filter((child) =>
+    child.documentReadableId.toLowerCase().includes(filterText.toLowerCase())
+  );
+
+  return (
+    <>
+      <UsedInGroupTooltip tooltipKey={node.key}>
+        <button
+          className="flex h-8 cursor-pointer items-center overflow-hidden rounded-sm px-2 gap-2 text-sm hover:bg-accent w-full font-medium"
+          onClick={(e) => {
+            e.stopPropagation();
+            setIsExpanded(!isExpanded);
+          }}
+        >
+          <div className="h-8 w-4 flex items-center justify-center">
+            <LuChevronRight
+              className={cn("size-4", isExpanded && "rotate-90")}
+            />
+          </div>
+          <div className="flex flex-grow items-center justify-between gap-2">
+            <span>{node.name}</span>
+            {filteredChildren.length > 0 && (
+              <Count count={filteredChildren.length} />
+            )}
+          </div>
+        </button>
+      </UsedInGroupTooltip>
+      {isExpanded && (
+        <div className="flex flex-col w-full">
+          {node.children.length === 0 ? (
+            <div className="flex h-8 items-center overflow-hidden rounded-sm px-2 gap-4">
+              <LevelLine isSelected={false} />
+              <div className="text-xs text-muted-foreground">
+                {t`No ${node.name.toLowerCase()} found`}
+              </div>
+            </div>
+          ) : (
+            filteredChildren.map((child, index) => {
+              // Change notices skip Hyperlink's hover "Open" button — the status
+              // badge needs that room and the whole row already navigates.
+              const RowLink = node.key === "changeNotices" ? Link : Hyperlink;
+              return (
+                <RowLink
+                  key={index}
+                  to={getUseInLink(child, node.key, itemReadableIdWithRevision)}
+                  // Hyperlink wraps its children in a span; min-w-0 lets that span
+                  // shrink so the id truncates instead of pushing "Open" out of view.
+                  className="flex h-8 cursor-pointer items-center overflow-hidden rounded-sm px-1 gap-4 text-sm hover:bg-accent w-full font-medium whitespace-nowrap [&>span]:min-w-0"
+                >
+                  <LevelLine isSelected={false} className="mr-2 shrink-0" />
+                  {child.methodType === "Shipment" ? (
+                    <LuTruck className="mr-2 shrink-0 text-indigo-600" />
+                  ) : node.module === "quality" ? (
+                    <LuShieldX className="mr-2 shrink-0 text-red-600" />
+                  ) : (
+                    <MethodIcon
+                      type={child.methodType ?? "Method"}
+                      className="mr-2 shrink-0"
+                    />
+                  )}
+                  <span className="truncate min-w-0">
+                    {child.documentReadableId}
+                  </span>
+                  {node.key === "jobMaterials" &&
+                    jobMaterialQuantities &&
+                    child.id in jobMaterialQuantities && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Badge variant="outline" className="ml-2 shrink-0">
+                            {jobMaterialQuantities[child.id]}
+                          </Badge>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          Estimated quantity required for this job material
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
+                  {node.key === "jobs" &&
+                    jobQuantities &&
+                    child.id in jobQuantities && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Badge variant="outline" className="ml-2 shrink-0">
+                            {jobQuantities[child.id]}
+                          </Badge>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          Production quantity for this job
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
+                  {node.key === "changeNotices" && child.status && (
+                    <div className="ml-2 shrink-0">
+                      <ChangeNoticeStatus status={child.status} />
+                    </div>
+                  )}
+                  {child.version && (
+                    <Badge variant="outline" className="ml-2 shrink-0">
+                      V{child.version}
+                    </Badge>
+                  )}
+                </RowLink>
+              );
+            })
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+function getUseInLink(
+  child: UsedInNode["children"][number],
+  key: UsedInKey,
+  itemReadableIdWithRevision: string
+) {
+  switch (key) {
+    case "assemblyInstructions":
+      return path.to.assemblyInstruction(child.id);
+    case "changeNotices":
+      return path.to.changeNotice(child.documentId ?? child.id);
+    case "Part":
+      return path.to.partDetails(child.id);
+    case "Material":
+      return path.to.materialDetails(child.id);
+    case "Tool":
+      return path.to.toolDetails(child.id);
+    case "Consumable":
+      return path.to.consumableDetails(child.id);
+    case "Service":
+      return path.to.serviceDetails(child.id);
+    case "inspections":
+      return path.to.inspection(child.id);
+    case "issues":
+      if (!child.documentId) return "#";
+      return path.to.issue(child.documentId);
+    case "jobs":
+      return path.to.job(child.id);
+    case "jobMaterials":
+      if (!child.documentId) return "#";
+      return `${path.to.jobMaterials(
+        child.documentId
+      )}?filter=readableIdWithRevision:eq:${itemReadableIdWithRevision}`;
+    case "maintenanceDispatchItems":
+      if (!child.documentId) return "#";
+      return path.to.maintenanceDispatch(child.documentId);
+    case "methodMaterials":
+      if (!child.documentId || !child.itemType) return "#";
+      return getPathToMakeMethod(
+        child.itemType,
+        child.documentParentId!,
+        child.documentId
+      );
+    case "purchaseOrderLines":
+      if (!child.documentId) return "#";
+      return path.to.purchaseOrder(child.documentId);
+    case "receiptLines":
+      if (!child.documentId) return "#";
+      return path.to.receipt(child.documentId);
+    case "quoteLines":
+      if (!child.documentId) return "#";
+      return path.to.quote(child.documentId);
+    case "quoteMaterials":
+      if (!child.documentId || !child.documentParentId) return "#";
+      return path.to.quoteLine(child.documentParentId, child.documentId);
+    case "salesOrderLines":
+      if (!child.documentId) return "#";
+      return path.to.salesOrder(child.documentId);
+    case "shipmentLines":
+      if (!child.documentId) return "#";
+      return path.to.shipment(child.documentId);
+    case "supplierQuotes":
+      if (!child.documentId) return "#";
+      return path.to.supplierQuote(child.documentId);
+    default:
+      return "#";
+  }
+}
+
+// Shared by four call sites (part/tool × tabbed/Buy branch) so the node shape can't drift.
+export function changeNoticesUsedInNode(
+  changeNotices: {
+    id: string;
+    changeOrderId: string;
+    status: ChangeNoticeStatusType;
+  }[],
+  name: string
+): UsedInNode {
+  return {
+    key: "changeNotices",
+    name,
+    module: "parts",
+    children: changeNotices.map((cn) => ({
+      id: cn.id,
+      documentId: cn.id,
+      documentReadableId: cn.changeOrderId,
+      status: cn.status
+    }))
+  };
+}

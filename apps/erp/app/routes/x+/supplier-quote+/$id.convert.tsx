@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { flash } from "@carbon/auth/session.server";
+import { isApprovalRequired } from "@carbon/ee/approvals.server";
+import { getLogger } from "@carbon/logger";
+import { getErrorMessage, redirect } from "@carbon/utils";
+import type { ActionFunctionArgs } from "react-router";
+import {
+  convertSupplierQuoteToOrder,
+  getSupplier,
+  getSupplierQuote,
+  selectedLinesValidator
+} from "~/modules/purchasing";
+import { getDatabaseClient } from "~/services/database.server";
+import { path } from "~/utils/path";
+
+const logger = getLogger("erp", "id-convert");
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { companyId, userId } = await requirePermissions(request, {
+    create: "purchasing"
+  });
+
+  const { id } = params;
+  if (!id) throw new Error("Could not find id");
+
+  const formData = await request.formData();
+  const selectedLinesRaw = formData.get("selectedLines") ?? "{}";
+
+  if (typeof selectedLinesRaw !== "string") {
+    throw redirect(
+      path.to.supplierQuoteDetails(id),
+      await flash(request, error("Invalid selected lines data"))
+    );
+  }
+
+  const parseResult = selectedLinesValidator.safeParse(
+    JSON.parse(selectedLinesRaw)
+  );
+
+  if (!parseResult.success) {
+    logger.error("Validation error:", parseResult.error);
+    throw redirect(
+      path.to.supplierQuoteDetails(id),
+      await flash(request, error("Invalid selected lines data"))
+    );
+  }
+
+  const selectedLines = parseResult.data;
+
+  const serviceRole = getCarbonServiceRole();
+
+  // Check supplier approval status
+  const [quote, supplierApprovalRequired] = await Promise.all([
+    getSupplierQuote(serviceRole, id),
+    isApprovalRequired(serviceRole, "supplier", companyId)
+  ]);
+
+  // The service role bypasses RLS and id comes from the URL.
+  if (!quote.data || quote.data.companyId !== companyId) {
+    logger.error("Supplier quote not found for company", {
+      companyId,
+      supplierQuoteId: id,
+      error: quote.error
+    });
+    throw redirect(
+      path.to.supplierQuotes,
+      await flash(request, error(null, "Supplier quote not found"))
+    );
+  }
+
+  if (supplierApprovalRequired && quote.data?.supplierId) {
+    const supplier = await getSupplier(serviceRole, quote.data.supplierId);
+    if (supplier.data?.status !== "Active") {
+      throw redirect(
+        path.to.supplierQuoteDetails(id),
+        await flash(
+          request,
+          error("Cannot convert to order: supplier is not approved (Active)")
+        )
+      );
+    }
+  }
+
+  const convert = await convertSupplierQuoteToOrder(
+    serviceRole,
+    getDatabaseClient(),
+    {
+      id: id,
+      companyId,
+      userId,
+      selectedLines
+    }
+  );
+
+  if (convert.error) {
+    throw redirect(
+      path.to.supplierQuoteDetails(id),
+      await flash(
+        request,
+        error(
+          convert.error,
+          getErrorMessage(convert.error, "Failed to convert quote to order")
+        )
+      )
+    );
+  }
+
+  throw redirect(
+    path.to.purchaseOrder(convert.data?.convertedId!),
+    await flash(request, success("Successfully converted quote to order"))
+  );
+}

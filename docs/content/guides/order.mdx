@@ -1,0 +1,74 @@
+---
+title: Create production jobs from an order
+description: Convert a 90-unit solar-array order into scheduled production jobs.
+label: "(I)"
+index: 0
+---
+
+This guide follows Nebula Aerospace, an <Term>OEM</Term>, as it fulfills an order for 90 solar array wings. The example connects sales, production planning, and shop-floor execution.
+
+Carbon ERP manages orders, purchasing, and planning. Carbon MES executes the resulting production work. The sales order connects both systems.
+
+<Figure illustration="flow-overview" caption="The path one order travels through Carbon, and the shape of this guide." />
+
+## The sales order
+
+Open sales order SO000009. It contains three lines of 30 SAW-001 Solar Array Wings at $35,000 each, due over three weeks. Each line can be produced and shipped independently.
+
+A partial shipment does not close the order. Carbon displays **"In Progress"** while make-to-order lines still require production. The stored status remains **"To Ship and Invoice"** while units remain to ship. After all units ship, an uninvoiced order moves to **"To Invoice"**. The order closes only after all units are shipped and invoiced.
+
+<Screenshot src="/screens/order-dashboard.png" label="Sales order dashboard" caption="SO000009 for NovaSat Networks: three lines of 30 Solar Array Wings, an 'In Progress' badge, and a 'Jobs Required' banner waiting on you to create the jobs." ratio="wide" />
+
+<Callout tone="neutral" badge="UPSTREAM" title="The order often starts as a quote.">
+The order may originate from a <Term>quote</Term> with quantity-break pricing. This guide starts with the confirmed sales order. See [quote to cash](/guides/quote-to-cash) for the preceding workflow.
+</Callout>
+
+## Batch it into jobs
+
+Create three <Term id="job">jobs</Term> of 30 to match the delivery schedule. Each job can be scheduled, released, completed, and shipped independently.
+
+Create jobs from the sales order in either of two ways:
+
+- Select **Create Jobs** in the **Jobs Required** banner to process the full order.
+- On a line's **Jobs** card, select **Make to Order**. The **Convert Line to Job** dialog defaults **Quantity** to the unallocated line quantity. Reduce it to create a partial job and convert the remainder later.
+
+Carbon decreases the quantity that still requires a job after each conversion.
+
+<Figure illustration="order-split" caption="One 90-unit order, batched into three 30-unit jobs across three weeks." />
+
+<Screenshot src="/screens/order-convert-line-to-job.png" label="Sales order line: Jobs card and the Convert Line to Job dialog" caption="Where you batch: the line's Jobs card. 'Make to Order' opens 'Convert Line to Job' with the Quantity prefilled at the line's 30. Create each batch, repeating until the order is fully covered." ratio="wide" />
+
+<Callout tone="blue" badge="WHY BATCH" title="Batching matches your build to the delivery promise.">
+Separate jobs let you release the first delivery while later deliveries remain in planning. Completed batches can ship without waiting for all 90 units.
+</Callout>
+
+## Create the job
+
+When you create a job from the sales order, Carbon copies the part, quantity, and due date to the job.
+
+Carbon also copies the part's <Term id="method">manufacturing method</Term>, including its materials and operations. The job owns this copy; it does not reference the editable master method.
+
+<Screenshot src="/screens/order-job-overview.png" label="Job overview with its copied method" caption="A job created this way — here J000001 for the SAT-1000 satellite bus — carries its own copy of the part's method, with part, quantity, and due date inherited from the sales order line." ratio="wide" />
+
+## Get the method
+
+<Term>Get Method</Term> clones the part's materials and operations into a job-specific method.
+
+Edit the job method for batch-specific substitutions or operations without changing the part master. If the change should become standard, push it to the part method for future jobs.
+
+<Figure illustration="get-method" caption="Get Method copies the part's recipe into the job. Edits stay local until you push a proven change back up." />
+
+<Callout tone="blue" badge="GET METHOD" title="The part holds the master recipe; the job holds a working copy.">
+Editing a job does not update the part library. Updating a part does not alter an existing job. Changes move between them only through explicit copy and push actions.
+</Callout>
+
+## Release or plan
+
+Release the first job and plan the other two. The actions have different effects:
+
+- **Release** generates shortage alerts and adds job tasks to the shop-floor schedule.
+- **Plan** generates the same shortage alerts without scheduling work or notifying the shop floor.
+
+<Callout tone="amber" badge="RELEASE ≠ PLAN" title="Plan = See demand early | Release = Put work in motion">
+Plan future jobs to identify long-lead material demand without adding those jobs to the current shop-floor schedule.
+</Callout>

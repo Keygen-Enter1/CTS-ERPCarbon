@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { PropsWithChildren } from "react";
+import useUserSelectContext from "../provider";
+
+const Combobox = ({ children }: PropsWithChildren) => {
+  const { onKeyDown } = useUserSelectContext();
+  return <div onKeyDown={onKeyDown}>{children}</div>;
+};
+
+export default Combobox;

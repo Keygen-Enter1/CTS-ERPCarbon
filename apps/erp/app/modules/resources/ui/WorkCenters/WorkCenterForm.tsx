@@ -1,0 +1,407 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Hidden,
+  Input,
+  Number,
+  Submit,
+  TextArea,
+  useControlField,
+  ValidatedForm
+} from "@carbon/form";
+import {
+  Button,
+  FormControl,
+  FormHelperText,
+  FormLabel,
+  HStack,
+  ModalDrawer,
+  ModalDrawerBody,
+  ModalDrawerContent,
+  ModalDrawerFooter,
+  ModalDrawerHeader,
+  ModalDrawerProvider,
+  ModalDrawerTitle,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Subheading,
+  Table,
+  Tbody,
+  Td,
+  Tfoot,
+  Th,
+  Thead,
+  Tr,
+  toast,
+  VStack
+} from "@carbon/react";
+import { INPUT_FORMAT, INPUT_STEP } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { useEffect, useState } from "react";
+import { useFetcher } from "react-router";
+import type { z } from "zod";
+import { Hyperlink } from "~/components";
+import CustomFormFields from "~/components/Form/CustomFormFields";
+import Department from "~/components/Form/Department";
+import Location from "~/components/Form/Location";
+import Processes from "~/components/Form/Processes";
+import Shifts from "~/components/Form/Shifts";
+import StandardFactor from "~/components/Form/StandardFactor";
+import {
+  useCurrencyDecimals,
+  useCurrencyFormatter,
+  usePermissions,
+  useUser
+} from "~/hooks";
+import type { getWorkCenterCapitalCost } from "~/modules/accounting";
+import { workCenterValidator } from "~/modules/resources";
+import { path } from "~/utils/path";
+
+type ScheduleMode = "all" | "some" | "lightsOut";
+
+type WorkCenterCapitalCost = NonNullable<
+  Awaited<ReturnType<typeof getWorkCenterCapitalCost>>["data"]
+>;
+
+type WorkCenterFormProps = {
+  initialValues: z.infer<typeof workCenterValidator>;
+  type?: "modal" | "drawer";
+  open?: boolean;
+  showProcesses?: boolean;
+  /** The fixed assets that serve this work center (edit route only). */
+  capitalCost?: WorkCenterCapitalCost;
+  onClose: () => void;
+};
+
+const WorkCenterForm = ({
+  initialValues,
+  open = true,
+  type = "drawer",
+  showProcesses = true,
+  capitalCost,
+  onClose
+}: WorkCenterFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const fetcher = useFetcher<PostgrestResponse<{ id: string }>>();
+
+  const { company } = useUser();
+  const baseCurrency = company?.baseCurrencyCode ?? "USD";
+  const currencyDecimals = useCurrencyDecimals(baseCurrency);
+  const currencyFormatter = useCurrencyFormatter({ currency: baseCurrency });
+
+  // Book depreciation is only derivable for Straight Line assets, so the
+  // monthly total covers the assets that have one and is absent when none do.
+  const totalNetBookValue = (capitalCost ?? []).reduce(
+    (sum, asset) => sum + asset.netBookValue,
+    0
+  );
+  const monthlyDepreciations = (capitalCost ?? []).flatMap((asset) =>
+    asset.monthlyDepreciation === null ? [] : [asset.monthlyDepreciation]
+  );
+  const totalMonthlyDepreciation =
+    monthlyDepreciations.length > 0
+      ? monthlyDepreciations.reduce((sum, value) => sum + value, 0)
+      : null;
+
+  const [selectedLocationId, setSelectedLocationId] = useState<
+    string | undefined
+  >(initialValues.locationId);
+
+  const [scheduleMode, setScheduleMode] = useState<ScheduleMode>(
+    initialValues.alwaysOn
+      ? "lightsOut"
+      : (initialValues.shifts?.length ?? 0) > 0
+        ? "some"
+        : "all"
+  );
+
+  useEffect(() => {
+    if (type !== "modal") return;
+
+    if (fetcher.state === "loading" && fetcher.data?.data) {
+      onClose?.();
+      toast.success(t`Created work center`);
+    } else if (fetcher.state === "idle" && fetcher.data?.error) {
+      toast.error(
+        t`Failed to create work center: ${fetcher.data.error.message}`
+      );
+    }
+  }, [fetcher.data, fetcher.state, onClose, type, t]);
+
+  const isEditing = initialValues.id !== undefined;
+  const isDisabled = isEditing
+    ? !permissions.can("update", "resources")
+    : !permissions.can("create", "resources");
+
+  return (
+    <ModalDrawerProvider type={type}>
+      <ModalDrawer
+        open={open}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) onClose?.();
+        }}
+      >
+        <ModalDrawerContent size="lg">
+          <ValidatedForm
+            validator={workCenterValidator}
+            method="post"
+            action={
+              isEditing
+                ? path.to.workCenter(initialValues.id!)
+                : path.to.newWorkCenter
+            }
+            defaultValues={initialValues}
+            fetcher={fetcher}
+            className="flex flex-col h-full"
+          >
+            <ModalDrawerHeader>
+              <ModalDrawerTitle>
+                {isEditing ? (
+                  <Trans>Edit Work Center</Trans>
+                ) : (
+                  <Trans>New Work Center</Trans>
+                )}
+              </ModalDrawerTitle>
+            </ModalDrawerHeader>
+            <ModalDrawerBody>
+              <Hidden name="id" />
+              <Hidden name="type" value={type} />
+              <VStack spacing={4}>
+                <Subheading variant="heavy" className="block">
+                  <Trans>Basic Information</Trans>
+                </Subheading>
+                <Input name="name" label={t`Name`} />
+                {showProcesses && (
+                  <Processes
+                    name="processes"
+                    label={t`Processes`}
+                    termId="work-center-processes"
+                  />
+                )}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full">
+                  <Location
+                    name="locationId"
+                    label={t`Location`}
+                    onChange={(location) =>
+                      setSelectedLocationId(location?.value)
+                    }
+                  />
+                  <Department name="departmentId" label={t`Department`} />
+                </div>
+                <StandardFactor
+                  name="defaultStandardFactor"
+                  label={t`Default Unit`}
+                  termId="work-center-default-unit"
+                  value={initialValues.defaultStandardFactor}
+                />
+                <TextArea name="description" label={t`Description`} />
+
+                <Subheading variant="heavy" className="block pt-2">
+                  <Trans>Costing</Trans>
+                </Subheading>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 w-full">
+                  <Number
+                    name="laborRate"
+                    label={t`Labor Rate`}
+                    termId="work-center-labor-rate"
+                    formatOptions={INPUT_FORMAT.rate(
+                      baseCurrency,
+                      currencyDecimals
+                    )}
+                  />
+                  <Number
+                    name="machineRate"
+                    label={t`Machine Rate`}
+                    termId="work-center-machine-rate"
+                    formatOptions={INPUT_FORMAT.rate(
+                      baseCurrency,
+                      currencyDecimals
+                    )}
+                  />
+                  <Number
+                    name="overheadRate"
+                    label={t`Overhead Rate`}
+                    termId="work-center-overhead-rate"
+                    formatOptions={INPUT_FORMAT.rate(
+                      baseCurrency,
+                      currencyDecimals
+                    )}
+                  />
+                </div>
+
+                {capitalCost && capitalCost.length > 0 && (
+                  <>
+                    <Subheading variant="heavy" className="block pt-2">
+                      <Trans>Capital Cost</Trans>
+                    </Subheading>
+                    <Table>
+                      <Thead>
+                        <Tr>
+                          <Th>
+                            <Trans>Asset</Trans>
+                          </Th>
+                          <Th>
+                            <Trans>Name</Trans>
+                          </Th>
+                          <Th className="text-right">
+                            <Trans>Net Book Value</Trans>
+                          </Th>
+                          <Th className="text-right">
+                            <Trans>Monthly Depreciation</Trans>
+                          </Th>
+                        </Tr>
+                      </Thead>
+                      <Tbody>
+                        {capitalCost.map((asset) => (
+                          <Tr key={asset.id}>
+                            <Td>
+                              <Hyperlink to={path.to.fixedAsset(asset.id)}>
+                                {asset.fixedAssetId}
+                              </Hyperlink>
+                            </Td>
+                            <Td>{asset.name}</Td>
+                            <Td className="text-right tabular-nums">
+                              {currencyFormatter.format(asset.netBookValue)}
+                            </Td>
+                            <Td className="text-right tabular-nums">
+                              {asset.monthlyDepreciation === null
+                                ? "—"
+                                : currencyFormatter.format(
+                                    asset.monthlyDepreciation
+                                  )}
+                            </Td>
+                          </Tr>
+                        ))}
+                      </Tbody>
+                      <Tfoot>
+                        <Tr>
+                          <Td colSpan={2}>
+                            <Trans>Total</Trans>
+                          </Td>
+                          <Td className="text-right tabular-nums">
+                            {currencyFormatter.format(totalNetBookValue)}
+                          </Td>
+                          <Td className="text-right tabular-nums">
+                            {totalMonthlyDepreciation === null
+                              ? "—"
+                              : currencyFormatter.format(
+                                  totalMonthlyDepreciation
+                                )}
+                          </Td>
+                        </Tr>
+                      </Tfoot>
+                    </Table>
+                  </>
+                )}
+
+                <Subheading variant="heavy" className="block pt-2">
+                  <Trans>Scheduling</Trans>
+                </Subheading>
+                <FormControl>
+                  <FormLabel htmlFor="scheduleMode">
+                    {t`Operating hours`}
+                  </FormLabel>
+                  <Select
+                    value={scheduleMode}
+                    onValueChange={(value) =>
+                      setScheduleMode(value as ScheduleMode)
+                    }
+                  >
+                    <SelectTrigger id="scheduleMode" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">{t`All Shifts`}</SelectItem>
+                      <SelectItem value="some">{t`Some Shifts`}</SelectItem>
+                      <SelectItem value="lightsOut">
+                        {t`Lights Out (24×7)`}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <FormHelperText>
+                    {scheduleMode === "lightsOut"
+                      ? t`Runs unattended around the clock, ignoring shift calendars.`
+                      : scheduleMode === "all"
+                        ? t`Runs during every shift at the location.`
+                        : t`Runs only during the shifts you select.`}
+                  </FormHelperText>
+                </FormControl>
+                {scheduleMode === "some" && (
+                  <Shifts
+                    name="shifts"
+                    label={t`Shifts`}
+                    locationId={selectedLocationId}
+                  />
+                )}
+                <ClearArrayField
+                  name="shifts"
+                  active={scheduleMode === "some"}
+                />
+                {scheduleMode === "lightsOut" && (
+                  <Hidden name="alwaysOn" value="on" />
+                )}
+
+                <Subheading variant="heavy" className="block pt-2">
+                  <Trans>Batching</Trans>
+                </Subheading>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full">
+                  <Number
+                    name="batchCapacity"
+                    label={t`Batch Capacity`}
+                    formatOptions={INPUT_FORMAT.quantity}
+                    step={INPUT_STEP.quantity}
+                    minValue={1}
+                    helperText={t`Pieces per run. Leave empty for no limit.`}
+                  />
+                  <Number
+                    name="minimumBatchQuantity"
+                    label={t`Minimum Batch Quantity`}
+                    formatOptions={INPUT_FORMAT.quantity}
+                    step={INPUT_STEP.quantity}
+                    minValue={1}
+                    helperText={t`Smallest run worth batching. Leave empty for none.`}
+                  />
+                </div>
+
+                <CustomFormFields table="workCenter" />
+              </VStack>
+            </ModalDrawerBody>
+            <ModalDrawerFooter>
+              <HStack>
+                <Submit isDisabled={isDisabled}>
+                  <Trans>Save</Trans>
+                </Submit>
+                <Button size="md" variant="solid" onClick={() => onClose?.()}>
+                  <Trans>Cancel</Trans>
+                </Button>
+              </HStack>
+            </ModalDrawerFooter>
+          </ValidatedForm>
+        </ModalDrawerContent>
+      </ModalDrawer>
+    </ModalDrawerProvider>
+  );
+};
+
+/**
+ * Clears a controlled array field when it should be inactive.
+ * Must be rendered inside a ValidatedForm.
+ */
+function ClearArrayField({ name, active }: { name: string; active: boolean }) {
+  const [, setValue] = useControlField<string[]>(name);
+  useEffect(() => {
+    if (!active) {
+      setValue([]);
+    }
+  }, [active, setValue]);
+  return null;
+}
+
+export default WorkCenterForm;

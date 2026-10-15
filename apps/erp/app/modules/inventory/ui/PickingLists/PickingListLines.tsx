@@ -1,0 +1,726 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type {
+  ActionPresentation,
+  TrackedEntityOption,
+  TrackedEntityPickOrder,
+  TrackedEntitySelection
+} from "@carbon/react";
+import {
+  ActionPresentationProvider,
+  Badge,
+  BarProgress,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  Skeleton,
+  Status,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  TrackedEntityPicker,
+  toast,
+  useViewport,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import {
+  LuChevronDown,
+  LuCirclePlus,
+  LuQrCode,
+  LuTriangleAlert,
+  LuUndo2
+} from "react-icons/lu";
+import { Await, useFetcher } from "react-router";
+import { Empty, ItemThumbnail } from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { usePercentFormatter, usePermissions } from "~/hooks";
+import { useItems } from "~/stores";
+import { path } from "~/utils/path";
+import { isPickingListLocked } from "../../inventory.models";
+import type {
+  getPickingList,
+  getPickingListLines,
+  PickingListRecommendation
+} from "../../inventory.service";
+import { ShortPickModal } from "./ShortPickModal";
+
+type PickLineSourceMaterial = {
+  itemId?: string | null;
+  quantity?: number | string | null;
+  substitutionFactor?: number | string | null;
+  item?: {
+    readableId?: string | null;
+    itemSupersession?: { conversionFactor?: number | string | null } | null;
+  } | null;
+};
+
+export function assembliesCovered(
+  pickItemId: string,
+  quantityToPick: number,
+  material: PickLineSourceMaterial | null | undefined
+): number | null {
+  const perAssembly = Number(material?.quantity ?? 0);
+  if (!material?.itemId || !(perAssembly > 0)) return null;
+  const substitutionFactor = Number(material.substitutionFactor ?? 0);
+  const conversionFactor = Number(
+    material.item?.itemSupersession?.conversionFactor ?? 0
+  );
+  const factor =
+    substitutionFactor > 0
+      ? 1 / substitutionFactor
+      : conversionFactor > 0
+        ? conversionFactor
+        : null;
+  if (factor === null || pickItemId === material.itemId) return null;
+  const assemblies = quantityToPick / (perAssembly * factor);
+  return Number.isInteger(assemblies) ? assemblies : null;
+}
+
+type PickingListData = NonNullable<
+  Awaited<ReturnType<typeof getPickingList>>["data"]
+>;
+
+type PickingListLineData = NonNullable<
+  Awaited<ReturnType<typeof getPickingListLines>>["data"]
+>;
+
+type RecommendationsPromise = Promise<
+  Record<string, PickingListRecommendation[]>
+>;
+
+type PickingListLinesProps = {
+  pickingListLines: PickingListLineData;
+  pickingListId: string;
+  pickingList: PickingListData;
+  recommendations: RecommendationsPromise;
+};
+
+// A "kit" is the box a kitter fills for one job operation. Parts must not be
+// mixed across operations, so lines are grouped by job operation — the job +
+// operation + work center identify the box.
+type Kit = {
+  key: string;
+  jobReadableId: string | null;
+  operationName: string | null;
+  workCenterName: string | null;
+  lines: PickingListLineData;
+};
+
+const PickingListLines = ({
+  pickingListLines,
+  pickingListId,
+  pickingList,
+  recommendations
+}: PickingListLinesProps) => {
+  const isLocked = isPickingListLocked(pickingList?.status);
+  const kits = useMemo(() => {
+    const groups = new Map<string, Kit>();
+    for (const line of pickingListLines) {
+      const key = line.jobOperationId ?? "ungrouped";
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          jobReadableId: line.job?.jobId ?? null,
+          operationName: line.jobOperation?.process?.name ?? null,
+          workCenterName: line.jobOperation?.workCenter?.name ?? null,
+          lines: []
+        });
+      }
+      groups.get(key)!.lines.push(line);
+    }
+    return Array.from(groups.values()).sort((a, b) => {
+      const job = (a.jobReadableId ?? "").localeCompare(b.jobReadableId ?? "");
+      if (job !== 0) return job;
+      return (a.operationName ?? "").localeCompare(b.operationName ?? "");
+    });
+  }, [pickingListLines]);
+
+  if (kits.length === 0) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            <Trans>Picking Lines</Trans>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="border rounded-lg">
+            <Empty className="py-6" />
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <VStack spacing={4} className="w-full">
+      {kits.map((kit) => (
+        <PickingKitCard
+          key={kit.key}
+          kit={kit}
+          pickingListId={pickingListId}
+          isLocked={isLocked}
+          recommendations={recommendations}
+        />
+      ))}
+    </VStack>
+  );
+};
+
+function PickingKitCard({
+  kit,
+  pickingListId,
+  isLocked,
+  recommendations
+}: {
+  kit: Kit;
+  pickingListId: string;
+  isLocked: boolean;
+  recommendations: RecommendationsPromise;
+}) {
+  const totalToPick = kit.lines.reduce(
+    (sum, l) => sum + Number(l.quantityToPick ?? 0),
+    0
+  );
+  const totalPicked = kit.lines.reduce(
+    (sum, l) =>
+      sum +
+      Math.min(Number(l.quantityPicked ?? 0), Number(l.quantityToPick ?? 0)),
+    0
+  );
+  const progress = totalToPick > 0 ? (totalPicked / totalToPick) * 100 : 0;
+  const { t } = useLingui();
+  const { isPhone } = useViewport();
+  const percentFormatter = usePercentFormatter();
+
+  // Phones: an overline header for the kit, then each line as its own card.
+  if (isPhone) {
+    const percent = percentFormatter.format(progress / 100);
+    return (
+      <section className="flex w-full flex-col gap-3">
+        <div className="flex items-center justify-between gap-3 px-1 text-xs font-medium uppercase tracking-[0.04em] text-muted-foreground">
+          <div className="min-w-0 truncate normal-case tracking-normal">
+            {kit.jobReadableId ?? t`Unknown Job`}
+            {kit.operationName ? ` · ${kit.operationName}` : ""}
+            {kit.workCenterName ? ` · ${kit.workCenterName}` : ""}
+          </div>
+          <span className="shrink-0 tabular-nums">
+            <Trans>{percent} picked</Trans>
+          </span>
+        </div>
+        {kit.lines.map((line) => (
+          <Card key={line.id} className="bg-card">
+            <PickingListLineItem
+              line={line}
+              pickingListId={pickingListId}
+              isLast
+              isLocked={isLocked}
+              recommendations={recommendations}
+            />
+          </Card>
+        ))}
+      </section>
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>
+          {kit.jobReadableId ?? "Unknown Job"}
+          {kit.operationName ? ` · ${kit.operationName}` : ""}
+        </CardTitle>
+        {kit.workCenterName && (
+          <CardDescription>
+            <Enumerable value={kit.workCenterName} />
+          </CardDescription>
+        )}
+      </CardHeader>
+      <CardContent>
+        <BarProgress progress={progress} className="mb-4" />
+        {/* The rows size themselves by this list's width, not the viewport:
+            the content pane it sits in is resizable. */}
+        <div className="@container border rounded-lg">
+          {kit.lines.map((line, index) => (
+            <PickingListLineItem
+              key={line.id}
+              line={line}
+              pickingListId={pickingListId}
+              isLast={index === kit.lines.length - 1}
+              isLocked={isLocked}
+              recommendations={recommendations}
+            />
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+const phoneActionCells: ActionPresentation = {
+  kind: "bar",
+  emphasis: "secondary"
+};
+
+function PickingListLineItem({
+  line,
+  pickingListId,
+  isLast,
+  isLocked,
+  recommendations
+}: {
+  line: PickingListLineData[number];
+  pickingListId: string;
+  isLast: boolean;
+  isLocked: boolean;
+  recommendations: RecommendationsPromise;
+}) {
+  const permissions = usePermissions();
+  const { t } = useLingui();
+  const { isPhone } = useViewport();
+  const [items] = useItems();
+  const fetcher = useFetcher<{ success: boolean; message?: string }>();
+  const isPending = fetcher.state !== "idle";
+  const [shortOpen, setShortOpen] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const trackedFetcher = useFetcher<{
+    entities: TrackedEntityOption[];
+    trackingType: "Serial" | "Batch";
+    quantityRequired: number;
+    nearExpiryWarningDays: number;
+    expiredEntityPolicy: "Warn" | "Block" | "BlockWithOverride";
+    defaultOrder: TrackedEntityPickOrder;
+  }>();
+
+  useEffect(() => {
+    if (fetcher.data && fetcher.data.success === false) {
+      toast.error(fetcher.data.message ?? "Failed to pick line");
+    }
+  }, [fetcher.data]);
+
+  const openPicker = () => {
+    setPickerOpen(true);
+    trackedFetcher.load(path.to.pickingListTracked(pickingListId, line.id));
+  };
+
+  const pickTracked = (selection: TrackedEntitySelection) => {
+    const formData = new FormData();
+    formData.append("trackedEntityId", selection.trackedEntityId);
+    formData.append("quantity", String(selection.quantity));
+    if (selection.storageUnitId) {
+      formData.append("fromStorageUnitId", selection.storageUnitId);
+    }
+    fetcher.submit(formData, {
+      method: "post",
+      action: path.to.pickingListTracked(pickingListId, line.id)
+    });
+    setPickerOpen(false);
+  };
+
+  const unpickTracked = (trackedEntityId: string) => {
+    const formData = new FormData();
+    formData.append("trackedEntityId", trackedEntityId);
+    formData.append("unpick", "true");
+    fetcher.submit(formData, {
+      method: "post",
+      action: path.to.pickingListTracked(pickingListId, line.id)
+    });
+  };
+
+  const item = items.find((i) => i.id === line.itemId);
+  const itemName = item?.name ?? line.item?.name ?? "";
+  // Pick quantities are in the picked item's own stock unit (a substituted
+  // line is already converted into the successor's units at generation).
+  const unitOfMeasureCode = line.item?.unitOfMeasureCode ?? null;
+  const unitSuffix = unitOfMeasureCode ? ` ${unitOfMeasureCode}` : "";
+  // A pick is substituted when its item differs from the source job material's
+  // item (an item-supersession redirect at generation time). Show the original.
+  const sourceMaterial = (
+    line as {
+      jobMaterial?: PickLineSourceMaterial | null;
+    }
+  ).jobMaterial;
+  const substitutedFrom =
+    sourceMaterial?.itemId && sourceMaterial.itemId !== line.itemId
+      ? (items.find((i) => i.id === sourceMaterial.itemId)
+          ?.readableIdWithRevision ??
+        sourceMaterial.item?.readableId ??
+        sourceMaterial.itemId)
+      : null;
+  const quantityToPick = Number(line.quantityToPick ?? 0);
+  const assemblies = substitutedFrom
+    ? assembliesCovered(line.itemId, quantityToPick, sourceMaterial)
+    : null;
+  const quantityPicked = Number(line.quantityPicked ?? 0);
+  const quantityReturned = Number(
+    (line as { quantityReturned?: number | null }).quantityReturned ?? 0
+  );
+  const isPicked = quantityToPick > 0 && quantityPicked >= quantityToPick;
+  const isShort = line.status === "Short";
+  const isResolved = isPicked || isShort;
+  const isTracked =
+    item?.itemTrackingType === "Serial" || item?.itemTrackingType === "Batch";
+  const isBatch = item?.itemTrackingType === "Batch";
+  const source = (line as { storageUnit?: { name?: string } }).storageUnit
+    ?.name;
+  // Warehouse on-hand available (incl. the unassigned/null bin). A null source
+  // bin is NOT a shortage if there's on-hand sitting in the unassigned bin.
+  const availableQuantity = Number(
+    (line as { availableQuantity?: number }).availableQuantity ?? 0
+  );
+  const isShortStock = availableQuantity <= 0;
+  // Only lots that were actually PICKED (quantityPicked > 0) count as picked —
+  // not mere allocations.
+  const pickedLots = (
+    (
+      line as {
+        trackedEntities?: Array<{
+          trackedEntityId: string;
+          quantityPicked?: number | null;
+          trackedEntity?: { readableId?: string | null } | null;
+        }>;
+      }
+    ).trackedEntities ?? []
+  ).filter((t) => Number(t.quantityPicked ?? 0) > 0);
+  const canPick = permissions.can("update", "inventory");
+
+  const pick = (quantity: number) => {
+    const formData = new FormData();
+    formData.append("pickingListLineId", line.id);
+    formData.append("quantity", String(quantity));
+    fetcher.submit(formData, {
+      method: "post",
+      action: path.to.pickingListLineQuantity(pickingListId)
+    });
+  };
+
+  const quantityBadge = isTracked ? (
+    <Badge
+      variant={isPicked ? "green" : quantityPicked > 0 ? "orange" : "red"}
+      className="text-base tabular-nums"
+    >
+      {quantityPicked}/{quantityToPick}
+      {unitSuffix}
+    </Badge>
+  ) : (
+    <Badge
+      variant={isPicked ? "green" : isShort ? "orange" : "red"}
+      className="text-base tabular-nums"
+    >
+      {isShort ? quantityPicked : quantityToPick}
+      {unitSuffix}
+    </Badge>
+  );
+
+  // Phones: the buttons fill their own row as equal 44pt cells.
+  const actions = isLocked ? null : (
+    <ActionPresentationProvider value={isPhone ? phoneActionCells : null}>
+      <HStack
+        spacing={1}
+        className="max-md:basis-full max-md:gap-2 max-md:space-x-0 max-md:[&>button]:min-w-fit max-md:[&>button]:flex-1"
+      >
+        {isTracked ? (
+          <>
+            {pickedLots.length === 1 ? (
+              <Button
+                variant="secondary"
+                leftIcon={<LuUndo2 />}
+                isDisabled={!canPick || isPending}
+                onClick={() => unpickTracked(pickedLots[0].trackedEntityId)}
+              >
+                {pickedLots[0].trackedEntity?.readableId ? (
+                  <Trans>Unpick {pickedLots[0].trackedEntity.readableId}</Trans>
+                ) : (
+                  <Trans>Unpick</Trans>
+                )}
+              </Button>
+            ) : pickedLots.length > 1 ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="secondary"
+                    leftIcon={<LuUndo2 />}
+                    rightIcon={<LuChevronDown />}
+                    isDisabled={!canPick || isPending}
+                  >
+                    <Trans>Unpick</Trans>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {pickedLots.map((lot) => (
+                    <DropdownMenuItem
+                      key={lot.trackedEntityId}
+                      onClick={() => unpickTracked(lot.trackedEntityId)}
+                    >
+                      <DropdownMenuIcon icon={<LuUndo2 />} />
+                      {lot.trackedEntity?.readableId ?? lot.trackedEntityId}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
+            {!isPicked && (
+              <Button
+                variant="secondary"
+                leftIcon={<LuQrCode />}
+                isDisabled={!canPick || isPending}
+                onClick={openPicker}
+              >
+                <Trans>Scan</Trans>
+              </Button>
+            )}
+          </>
+        ) : isPicked ? (
+          <Button
+            variant="secondary"
+            leftIcon={<LuUndo2 />}
+            isDisabled={!canPick || isPending}
+            isLoading={isPending}
+            onClick={() => pick(0)}
+          >
+            <Trans>Unpick</Trans>
+          </Button>
+        ) : (
+          <>
+            <Button
+              variant="secondary"
+              isDisabled={!canPick || isPending}
+              onClick={() => setShortOpen(true)}
+            >
+              <Trans>Short</Trans>
+            </Button>
+            <Button
+              leftIcon={<LuCirclePlus />}
+              isDisabled={!canPick || isPending}
+              isLoading={isPending}
+              onClick={() => pick(quantityToPick)}
+            >
+              <Trans>Pick</Trans>
+            </Button>
+          </>
+        )}
+      </HStack>
+    </ActionPresentationProvider>
+  );
+
+  return (
+    <div
+      className={cn(
+        "group flex flex-col gap-4 p-4 border-b @3xl:flex-row @3xl:items-center @3xl:justify-between @3xl:gap-6 max-md:gap-3",
+        isLast && "border-none"
+      )}
+    >
+      {/* Stacked while the list is narrow; one line once it is wide enough.
+          The item takes what the pick controls leave. */}
+      <HStack
+        spacing={4}
+        className={cn(
+          "w-full min-w-0 transition-opacity duration-150 @3xl:w-auto @3xl:flex-1",
+          isResolved && "opacity-50 group-hover:opacity-100"
+        )}
+      >
+        <ItemThumbnail
+          size="xl"
+          thumbnailPath={null}
+          type={(item?.type as "Part") ?? "Part"}
+        />
+        <VStack spacing={0} className="flex-1 min-w-0">
+          <p className="truncate text-base font-medium sm:text-sm">
+            {itemName}
+          </p>
+          <p className="truncate font-mono text-sm text-muted-foreground sm:text-xs">
+            {item?.readableIdWithRevision ?? line.item?.readableId}
+          </p>
+          {substitutedFrom && (
+            <p className="truncate text-sm text-blue-700 dark:text-blue-300 sm:text-xs">
+              ↩{" "}
+              {assemblies !== null ? (
+                <Trans>
+                  picking in place of {substitutedFrom}, the item on the job,
+                  for {assemblies} assemblies
+                </Trans>
+              ) : (
+                <Trans>
+                  picking in place of {substitutedFrom}, the item on the job
+                </Trans>
+              )}
+            </p>
+          )}
+          {isTracked && !isPicked && (
+            <RecommendedLots resolve={recommendations} lineId={line.id} />
+          )}
+        </VStack>
+        {isPhone && isShort && (
+          <Status color="orange" disableTooltip className="ml-auto shrink-0">
+            <Trans>Short</Trans>
+          </Status>
+        )}
+      </HStack>
+
+      <div className="flex flex-wrap items-center justify-end gap-x-6 gap-y-2 @3xl:shrink-0 @3xl:flex-nowrap max-md:gap-3">
+        {source ? (
+          <div className="text-base font-medium whitespace-nowrap">
+            {source}
+          </div>
+        ) : isShortStock && !isPicked ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge
+                variant="yellow"
+                className="gap-1 py-1.5 px-2.5 cursor-default"
+              >
+                <LuTriangleAlert />
+                <Trans>No stock</Trans>
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-[240px]">
+              <Trans>
+                No warehouse stock is on record for this item. You can still
+                pick it — on-hand will go negative until the count is
+                reconciled.
+              </Trans>
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
+        {pickedLots.length > 0 && (
+          <HStack spacing={1} className="max-w-[280px] flex-wrap justify-end">
+            {pickedLots.map((lot) => (
+              <Badge
+                key={lot.trackedEntityId}
+                variant="secondary"
+                className="font-mono tabular-nums normal-case"
+              >
+                {lot.trackedEntity?.readableId ?? lot.trackedEntityId}
+                {isBatch &&
+                  ` × ${Number(lot.quantityPicked ?? 0)}${unitSuffix}`}
+              </Badge>
+            ))}
+          </HStack>
+        )}
+        {quantityReturned > 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge
+                variant="secondary"
+                className="gap-1 tabular-nums cursor-default"
+              >
+                <LuUndo2 />
+                <Trans>Returned</Trans> {quantityReturned}
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-[240px]">
+              <Trans>
+                Unused picked material flushed back from the work center to the
+                warehouse.
+              </Trans>
+            </TooltipContent>
+          </Tooltip>
+        )}
+        {isPhone ? (
+          <span className="ml-auto inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+            {isTracked || isPicked || isShort ? (
+              <Trans>Picked</Trans>
+            ) : (
+              <Trans>To pick</Trans>
+            )}
+            {quantityBadge}
+          </span>
+        ) : (
+          quantityBadge
+        )}
+        {actions}
+      </div>
+
+      {shortOpen && (
+        <ShortPickModal
+          pickingListId={pickingListId}
+          lineId={line.id}
+          itemName={itemName}
+          quantityToPick={quantityToPick}
+          quantityPicked={quantityPicked}
+          unitOfMeasureCode={unitOfMeasureCode}
+          onClose={() => setShortOpen(false)}
+        />
+      )}
+
+      {pickerOpen && (
+        <TrackedEntityPicker
+          trackingType={
+            item?.itemTrackingType === "Serial" ? "Serial" : "Batch"
+          }
+          entities={trackedFetcher.data?.entities ?? []}
+          quantityRequired={Math.max(0, quantityToPick - quantityPicked)}
+          title={`Pick ${itemName}`}
+          description={
+            item?.itemTrackingType === "Serial"
+              ? t`Choose a serial number`
+              : t`Choose a batch number`
+          }
+          nearExpiryWarningDays={
+            trackedFetcher.data?.nearExpiryWarningDays ?? 0
+          }
+          expiredEntityPolicy={
+            trackedFetcher.data?.expiredEntityPolicy ?? "Warn"
+          }
+          defaultOrder={trackedFetcher.data?.defaultOrder}
+          onSelect={pickTracked}
+          onClose={() => setPickerOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * At-a-glance recommended serial/batch numbers for a tracked line, streamed in
+ * from the deferred list-wide recommendations so the row paints immediately.
+ * Rendered as readable monospace chips, no label — the chips speak for themselves.
+ */
+function RecommendedLots({
+  resolve,
+  lineId
+}: {
+  resolve: RecommendationsPromise;
+  lineId: string;
+}) {
+  return (
+    <Suspense
+      fallback={<Skeleton className="mt-2 h-6 w-36 rounded-md sm:h-5" />}
+    >
+      <Await resolve={resolve} errorElement={null}>
+        {(byLine) => {
+          const lots = byLine?.[lineId] ?? [];
+          if (lots.length === 0) return null;
+          return (
+            <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5 text-base sm:text-sm">
+              {lots.map((lot) => (
+                <span
+                  key={lot.trackedEntityId}
+                  className="max-w-full truncate rounded-md border border-border bg-muted px-2 py-0.5 font-mono tabular-nums text-foreground"
+                >
+                  {lot.readableId ?? lot.trackedEntityId}
+                </span>
+              ))}
+            </div>
+          );
+        }}
+      </Await>
+    </Suspense>
+  );
+}
+
+export default PickingListLines;

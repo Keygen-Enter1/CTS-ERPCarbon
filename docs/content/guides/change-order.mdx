@@ -1,0 +1,124 @@
+---
+title: Revise a part
+description: An engineering change, drafted against the real method, reviewed as a diff, and released so planning phases over on its own.
+label: "(I)"
+index: 0
+flow: engineering-change
+flowName: Engineering change
+flowIndex: 4
+---
+
+The satellite bus's antenna pointing bracket needs a thicker wall and one fewer fastener. Create a
+<Term id="change-order">change notice</Term>, edit a hidden draft of the part's method, review the diff, and release
+the change. Until release, jobs, planning, and costing continue to use the current bracket.
+
+> A change notice records the change and contains its working draft. Release makes that draft active.
+
+## Start with the parts, not the change
+
+Start from **Items → Change Notices → New**, the part header, the part's table row, or **New Change Notice** in
+the method-version menu. Item-based entry points attach the bracket as the first affected item. Creating a
+notice from a quality issue links the non-conformance to the resulting change.
+
+The header form contains **Name**, **Category**, **Reason for Change**, **Description of Change**, **Owner**,
+**Priority**, and dates. Categories come from the configured change-notice types, initially seeded with values
+such as *Design Improvement*, *Cost Reduction*, and *Obsolescence / End-of-Life*. A quality-issue entry point
+also links its non-conformance. After creation, **Add Affected Item** accepts Parts only; materials,
+consumables, and services are excluded.
+
+A part on an open change notice displays *"This part is on 1 open change notice"* with a link to the notice.
+This warning is informational. Carbon permits parallel notices for the same part and assigns independent
+draft versions to avoid version collisions.
+
+<Screenshot src="/screens/co-new-notice.png" label="New change notice form" caption="Name, category, reason, owner, and priority. The header before any affected item is added." ratio="wide" />
+
+<Callout tone="blue" badge="TOP-DOWN, NOT BOTTOM-UP" title="You pick the parts first, then edit them in place.">
+Select the affected part, then edit its bill of materials and bill of process inside the change notice. The
+completed draft defines the change.
+</Callout>
+
+## Draft the change in place
+
+Adding the bracket copies its active <Term id="bom">method</Term> into a **Draft** version associated with the
+change notice. The draft is excluded from version selectors, copy-target lists, MRP, jobs, and costing. Edit it
+with the standard **Bill of Material** and **Bill of Process** editors.
+
+Before editing, select a **change type** for the affected item. The type determines which fields are editable
+and what release creates. Changing the type later discards the draft and creates a new one from the live
+method, removing all draft edits.
+
+<Screenshot src="/screens/co-affected-item.png" label="Affected item with change-type selector" caption="An affected item's draft method open for editing on CN-000001, with the 'Change type' select on the item card." ratio="wide" />
+
+- <Term id="change-order-change-type">Version</Term> changes the BoM or BoP for the same part. Release activates
+  a new method version and archives the previous version. It creates no item or supersession.
+- **Revision** creates the next revision under the same Part ID. Its draft supports attributes, documents, and
+  method edits. Release activates the revision and supersedes the previous one.
+- **Replacement Part** derives a new part number from the affected part. Release activates it and supersedes
+  the affected part in a one-to-one replacement.
+- **New Part** creates a part without a predecessor. Release activates it without creating a supersession.
+
+<Callout tone="amber" badge="A VERSION MOVES THE METHOD, NOT THE PART" title="Only Revision and Replacement Part supersede.">
+A **Version** changes the method on the existing item, preserving its stock and history without supersession.
+A **Revision** or **Replacement Part** derives a new item and writes a supersession at release. A **New Part**
+has no predecessor and creates none. Because a purchased part has no method to version, a **Buy** item defaults
+to **Revision**.
+</Callout>
+
+This bracket requires a new drawing revision and a stock phase-over, so select **Revision**. Update the wall
+attribute, remove the fastener from the BoM, and attach the revised drawing to the draft.
+
+<Callout tone="green" badge="PURCHASED PARTS KEEP THEIR SUPPLIERS" title="A bought revision inherits the old revision's suppliers.">
+A purchased revision includes a **Supplier Parts** grid. A Revision draft starts with the old revision's
+supplier parts and price breaks, plus its lead time, batch size, and reordering policy. Change the grid only
+where the new revision differs, such as a new supplier part number. A **Replacement Part** or **New Part**
+starts with an empty grid. Add its supplier parts before you release, or the released item cannot be added to
+a purchase order.
+</Callout>
+
+## Review the diff
+
+Advance the notice one stage at a time: **Draft**, **Start**, **Engineering Complete**, then **Implementation**.
+Entering **Start**, **Implementation**, or **Done** notifies the notice assignee and action-task assignees.
+The stages are the approval and release workflow; there is no separate approval configuration. **Cancel** is
+available at every open stage. It locks the notice but preserves its drafts. **Reopen** returns a Cancelled
+notice to Draft with its edits intact.
+
+The overview's **Changes** card displays each affected item's current diff throughout authoring, including
+material, property, and supplier-part changes.
+
+At **Implementation**, **Release** first displays a read-only diff for every affected item. It compares added
+and removed materials, operation and step changes, and modified attributes with the snapshotted method.
+
+<Screenshot src="/screens/co-release-diff.png" label="Release change notice — diff review" caption="The dropped fastener line and the thicker-wall attribute, shown as a diff before you confirm." ratio="tall" />
+
+<Callout tone="neutral" badge="EXACT BY CONSTRUCTION" title="The diff is real because the draft is real.">
+The diff compares the actual draft method with its live source method. The reviewed draft is the artifact that
+release activates.
+</Callout>
+
+## Release, and let supersession carry it
+
+On confirmation, Carbon processes each affected item. For the bracket revision, it activates the draft method,
+archives the previous version, activates the new revision, and writes a <Term>supersession</Term> from the old
+revision to the new one. After all items are released, the notice becomes read-only in **Done**.
+
+Configure phase-over through the affected item's cutover fields: a <Term id="supersession-mode">supersession
+mode</Term>, which defaults to **Consume First**, a discontinuation date, and a successor effectivity date.
+Release creates the supersession automatically.
+
+<Figure illustration="conversion-factor" caption="Once effective, the old bracket's demand redirects to the new revision, times its conversion factor." />
+
+**Consume First** uses on-hand stock of the old bracket before redirecting demand. **Prefer New** redirects new
+demand immediately. After the successor becomes effective, MRP redirects planned demand to the new revision,
+and **Get Method** substitutes it on new jobs while retaining the source item for traceability.
+
+<Callout tone="green" badge="NOTHING IN FLIGHT SHIFTS" title="Release steers the future, not the past.">
+Existing stock remains on the old bracket. Existing jobs retain their materials and method versions. Open
+purchase orders and quote lines also retain the old revision without warning or rewrite. Supersession affects
+only forward planning: jobs created after the effectivity date use the new revision; earlier jobs do not.
+</Callout>
+
+<Divider />
+
+The new revision contains a *"Created by CN-…"* link to its change notice, and the bracket page retains the
+complete change-notice history.

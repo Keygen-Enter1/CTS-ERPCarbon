@@ -1,0 +1,301 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+import { EPSILON } from "@carbon/database/precision";
+
+type SalesOrderLine = Pick<
+  Database["public"]["Tables"]["salesOrderLine"]["Row"],
+  | "salesOrderLineType"
+  | "invoicedComplete"
+  | "sentComplete"
+  | "id"
+  | "methodType"
+  | "saleQuantity"
+  | "quantitySent"
+>;
+
+type SalesOrderJob = Pick<
+  Database["public"]["Tables"]["job"]["Row"],
+  | "salesOrderLineId"
+  | "productionQuantity"
+  | "quantityComplete"
+  | "status"
+  | "id"
+  | "jobId"
+  | "dueDate"
+>;
+
+export const getSalesOrderStatus = (
+  lines: Array<{
+    salesOrderLineType: SalesOrderLine["salesOrderLineType"] | null;
+    invoicedComplete: SalesOrderLine["invoicedComplete"] | null;
+    sentComplete: SalesOrderLine["sentComplete"] | null;
+  }>
+) => {
+  const allInvoiced = lines.every(
+    (line) => line.salesOrderLineType === "Comment" || line.invoicedComplete
+  );
+
+  const allShipped = lines.every(
+    (line) =>
+      line.salesOrderLineType === "Comment" ||
+      // Services are never shipped — they can't block shipping completeness
+      line.salesOrderLineType === "Service" ||
+      line.sentComplete
+  );
+
+  let status: Database["public"]["Tables"]["salesOrder"]["Row"]["status"] =
+    "To Ship and Invoice";
+
+  if (allInvoiced && allShipped) {
+    status = "Completed";
+  } else if (allShipped) {
+    status = "To Invoice";
+  } else if (allInvoiced) {
+    status = "To Ship";
+  }
+
+  return { status, allInvoiced, allShipped };
+};
+
+type PurchaseOrderLine = Pick<
+  Database["public"]["Tables"]["purchaseOrderLine"]["Row"],
+  "purchaseOrderLineType" | "receivedComplete" | "invoicedComplete"
+>;
+
+export const getPurchaseOrderStatus = (
+  lines: Array<{
+    purchaseOrderLineType: PurchaseOrderLine["purchaseOrderLineType"] | null;
+    invoicedComplete: PurchaseOrderLine["invoicedComplete"] | null;
+    receivedComplete: PurchaseOrderLine["receivedComplete"] | null;
+  }>
+) => {
+  const allInvoices = lines.every(
+    (line) => line.purchaseOrderLineType === "Comment" || line.invoicedComplete
+  );
+
+  const allLinesReceived = lines.every(
+    (line) =>
+      line.purchaseOrderLineType === "Comment" ||
+      line.purchaseOrderLineType === "G/L Account" ||
+      // Services are never received — they can't block receipt completeness
+      line.purchaseOrderLineType === "Service" ||
+      line.receivedComplete
+  );
+
+  let status: Database["public"]["Tables"]["purchaseOrder"]["Row"]["status"] =
+    "To Receive and Invoice";
+  if (allInvoices && allLinesReceived) {
+    status = "Completed";
+  } else if (allInvoices) {
+    status = "To Receive";
+  } else if (allLinesReceived) {
+    status = "To Invoice";
+  }
+
+  return { status, allInvoices, allLinesReceived };
+};
+
+const isReturnLineSettled = (line: {
+  quantity: number | string | null;
+  moved: number | string | null;
+  closedComplete: boolean | null;
+}) =>
+  !!line.closedComplete ||
+  Number(line.moved ?? 0) >= Number(line.quantity ?? 0) - EPSILON;
+
+/**
+ * Derived supplier-return (purchase return) status, mirroring
+ * `getPurchaseOrderStatus`: the header status is a pure function of the lines,
+ * never set by hand. A return is "Completed" once every line has shipped its
+ * authorized quantity or been short-closed; otherwise it is "To Ship". The
+ * granular "partially shipped" signal is display-only (derived in the view),
+ * not a status. Issuing the supplier credit is out-of-band and does not gate
+ * completion.
+ */
+export const getPurchaseReturnOrderStatus = (
+  lines: Array<{
+    quantity: number | string | null;
+    quantityShipped: number | string | null;
+    closedComplete: boolean | null;
+  }>
+) => {
+  const allShipped =
+    lines.length > 0 &&
+    lines.every((line) =>
+      isReturnLineSettled({ ...line, moved: line.quantityShipped })
+    );
+
+  const status: Database["public"]["Tables"]["purchaseReturnOrder"]["Row"]["status"] =
+    allShipped ? "Completed" : "To Ship";
+
+  return { status, allShipped };
+};
+
+/**
+ * Derived customer-return (sales return / RMA) status. The mirror of
+ * `getPurchaseReturnOrderStatus`: "Completed" once every line has received its
+ * authorized quantity or been short-closed, otherwise "To Receive". Shipping a
+ * replacement back to the customer is out-of-band and does not gate completion.
+ */
+export const getSalesReturnOrderStatus = (
+  lines: Array<{
+    quantity: number | string | null;
+    quantityReceived: number | string | null;
+    closedComplete: boolean | null;
+  }>
+) => {
+  const allReceived =
+    lines.length > 0 &&
+    lines.every((line) =>
+      isReturnLineSettled({ ...line, moved: line.quantityReceived })
+    );
+
+  const status: Database["public"]["Tables"]["salesReturnOrder"]["Row"]["status"] =
+    allReceived ? "Completed" : "To Receive";
+
+  return { status, allReceived };
+};
+
+export const getSalesOrderJobStatus = (
+  jobs: SalesOrderJob[] | undefined,
+  line: SalesOrderLine
+) => {
+  const filteredJobs =
+    jobs?.filter((j) => j.salesOrderLineId === line.id) ?? [];
+  const isMade = line.methodType === "Make to Order";
+  const saleQuantity = line.saleQuantity ?? 0;
+
+  const totalProduction = filteredJobs.reduce(
+    (acc, job) => acc + (job.productionQuantity ?? 0),
+    0
+  );
+  // A job's quantityComplete persists after the job is reopened, so completion
+  // must be gated on the job actually being in a completed status. Otherwise a
+  // reopened (In Progress) job that still has quantityComplete >= saleQuantity
+  // would keep the line reading "Completed" (or "Shipped").
+  const totalCompleted = filteredJobs.reduce(
+    (acc, job) =>
+      acc +
+      (["Completed", "Closed"].includes(job.status ?? "")
+        ? job.quantityComplete
+        : 0),
+    0
+  );
+  const totalReleased = filteredJobs.reduce((acc, job) => {
+    if (job.status !== "Planned" && job.status !== "Draft") {
+      return acc + (job.productionQuantity ?? 0);
+    }
+    return acc;
+  }, 0);
+
+  const hasEnoughJobsToCoverQuantity = totalProduction >= saleQuantity;
+  const hasEnoughCompletedToCoverQuantity = totalCompleted >= saleQuantity;
+  const hasAnyQuantityReleased = totalReleased > 0;
+  const isCompleted =
+    hasEnoughJobsToCoverQuantity && hasEnoughCompletedToCoverQuantity;
+  // A Service line never ships: completing its jobs fulfills it, and the
+  // database fills quantitySent / sentComplete from those jobs. Reading that as
+  // "Shipped" told people a shipment had gone out when none can.
+  const isService = line.salesOrderLineType === "Service";
+  const quantitySent = line.quantitySent ?? 0;
+  const isPartiallyShipped =
+    !isService && quantitySent > 0 && quantitySent < saleQuantity;
+
+  let jobVariant: "green" | "red" | "orange";
+  let jobLabel:
+    | "Completed"
+    | "Requires Jobs"
+    | "In Progress"
+    | "Planned"
+    | "Shipped"
+    | "Partially Shipped";
+
+  if (isCompleted && line.sentComplete && !isService) {
+    jobLabel = "Shipped";
+    jobVariant = "green";
+  } else if (isCompleted) {
+    jobLabel = "Completed";
+    jobVariant = "green";
+  } else if (isPartiallyShipped) {
+    jobLabel = "Partially Shipped";
+    jobVariant = "orange";
+  } else if (isMade && filteredJobs.length === 0) {
+    jobLabel = "Requires Jobs";
+    jobVariant = "red";
+  } else if (hasAnyQuantityReleased) {
+    jobLabel = "In Progress";
+    jobVariant = "orange";
+  } else {
+    jobLabel = "Planned";
+    jobVariant = "orange";
+  }
+
+  return { jobVariant, jobLabel, jobs: filteredJobs };
+};
+
+export type SalesOrderForProductionCheck = {
+  jobs?: Array<{
+    salesOrderLineId: string;
+    productionQuantity: number;
+    quantityComplete: number;
+    status: string;
+  }>;
+  lines?: Array<{
+    id: string;
+    methodType: "Purchase to Order" | "Make to Order" | "Pull from Inventory";
+    saleQuantity: number;
+  }>;
+};
+
+/**
+ * Checks if a Sales Order still has "Make" lines with no job at all.
+ * Gate the convert-to-jobs actions on this, not on whether the order has any
+ * job — converting one line individually must leave the rest convertible.
+ */
+export const hasLinesRequiringJobs = (
+  salesOrder: SalesOrderForProductionCheck
+): boolean => {
+  const jobs = salesOrder.jobs ?? [];
+  return (salesOrder.lines ?? []).some(
+    (line) =>
+      line.methodType === "Make to Order" &&
+      !jobs.some((job) => job.salesOrderLineId === line.id)
+  );
+};
+
+/**
+ * Checks if a Sales Order has incomplete jobs.
+ * Returns true if any "Make" line item has incomplete jobs.
+ * A job is considered complete when quantityComplete >= saleQuantity for that line.
+ */
+export const hasIncompleteJobs = (
+  salesOrder: SalesOrderForProductionCheck
+): boolean => {
+  const jobs = salesOrder.jobs ?? [];
+  const lines = salesOrder.lines ?? [];
+
+  const makeLines = lines.filter((line) => line.methodType === "Make to Order");
+  if (makeLines.length === 0) {
+    return false;
+  }
+
+  for (const line of makeLines) {
+    const lineJobs = jobs.filter((job) => job.salesOrderLineId === line.id);
+    if (lineJobs.length === 0) {
+      return true;
+    }
+
+    const totalCompleted = lineJobs.reduce(
+      (acc, job) => acc + (job.quantityComplete ?? 0),
+      0
+    );
+    if (totalCompleted < (line.saleQuantity ?? 0)) {
+      return true;
+    }
+  }
+
+  return false;
+};

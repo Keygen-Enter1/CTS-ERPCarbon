@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { notFound } from "@carbon/auth";
+import type { Database } from "@carbon/database";
+import { getLogger } from "@carbon/logger";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import * as cookie from "cookie";
+
+const logger = getLogger("mes", "location");
+
+export function getCompanySettings(request: Request, companyId: string) {
+  const cookieHeader = request.headers.get("cookie");
+  const parsed = cookieHeader ? cookie.parse(cookieHeader)[companyId] : null;
+  if (parsed && !parsed.includes(":")) {
+    // temporary check for backwards compatibility
+    return { location: parsed };
+  }
+  return {
+    location: undefined
+  };
+}
+
+export function setLocation(companyId: string, locationId: string) {
+  return cookie.serialize(companyId, locationId, {
+    path: "/",
+    maxAge: 31536000
+  });
+}
+
+export async function getLocation(
+  request: Request,
+  client: SupabaseClient<Database>,
+  args: {
+    userId: string;
+    companyId: string;
+  }
+) {
+  const { userId, companyId } = args;
+  let { location } = getCompanySettings(request, companyId);
+
+  let updated = false;
+
+  // The cookie is client-controlled: only honor it when it names a location
+  // of this company, otherwise fall through to the defaults below.
+  if (location) {
+    const owned = await client
+      .from("location")
+      .select("id")
+      .eq("id", location)
+      .eq("companyId", companyId)
+      .maybeSingle();
+    // A request the browser gave up on (it navigated, or a newer reload
+    // replaced this one) aborts its reads: that is not a failure to report.
+    if (owned.error && !request.signal.aborted) {
+      logger.error("Failed to verify the location cookie", {
+        companyId,
+        locationId: location,
+        error: owned.error
+      });
+    }
+    if (!owned.data) location = undefined;
+  }
+
+  if (!location) {
+    const employeeJob = await client
+      .from("employeeJob")
+      .select("locationId")
+      .eq("id", userId)
+      .eq("companyId", companyId)
+      .single();
+
+    if (employeeJob.data && employeeJob.data.locationId) {
+      location = employeeJob.data.locationId;
+      updated = true;
+    } else {
+      const locations = await client
+        .from("location")
+        .select("id")
+        .eq("companyId", companyId);
+      if (locations.data && locations.data.length > 0) {
+        location = locations.data[0].id;
+        updated = true;
+      }
+    }
+  }
+
+  if (!location)
+    throw notFound(
+      "Failed to get a valid location. Please add one in the resources module."
+    );
+
+  if (updated) {
+    setLocation(companyId, location);
+  }
+
+  return { location, updated };
+}

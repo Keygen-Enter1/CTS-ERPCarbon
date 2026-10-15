@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { RecordOutlet, VStack } from "@carbon/react";
+import { msg } from "@lingui/core/macro";
+import type { LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import { usePlanGate } from "~/hooks/usePlanGate";
+import {
+  EmployeeTypesTable,
+  EmployeeTypesUpgradeOverlay,
+  getEmployeeTypes
+} from "~/modules/users";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+import { getGenericQueryFilters } from "~/utils/query";
+
+export const handle: Handle = {
+  breadcrumb: msg`Employee Types`,
+  to: path.to.employeeTypes
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "users",
+    role: "employee"
+  });
+
+  const url = new URL(request.url);
+  const searchParams = new URLSearchParams(url.search);
+  const search = searchParams.get("search");
+  const { limit, offset, sorts, filters } =
+    getGenericQueryFilters(searchParams);
+
+  const employeeTypes = await getEmployeeTypes(client, companyId, {
+    search,
+    limit,
+    offset,
+    sorts,
+    filters
+  });
+
+  return {
+    data: employeeTypes.data ?? [],
+    count: employeeTypes.count ?? 0
+  };
+}
+
+export default function EmployeeTypesRoute() {
+  const { data, count } = useLoaderData<typeof loader>();
+  const { isGated } = usePlanGate({ feature: "PERMISSIONS" });
+
+  if (isGated) {
+    return <EmployeeTypesUpgradeOverlay />;
+  }
+
+  return (
+    <VStack spacing={0} className="h-full">
+      <EmployeeTypesTable data={data ?? []} count={count ?? 0} />
+      <RecordOutlet />
+    </VStack>
+  );
+}

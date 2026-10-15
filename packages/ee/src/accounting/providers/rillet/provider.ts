@@ -1,0 +1,1624 @@
+// SPDX-License-Identifier: LicenseRef-Carbon-Commercial
+// Carbon Enterprise file, licensed only under the Carbon Commercial License
+// (packages/ee/LICENSE). Not AGPL. Running, modifying, or copying it beyond those terms requires a commercial license.
+
+import { createHash } from "node:crypto";
+import type {
+  CounterpartSearchKeys,
+  ExternalIdentityKind,
+  RemoteCandidate
+} from "../../core/counterpart-types";
+import { ProviderID } from "../../core/models";
+import {
+  parseRilletTrialBalance,
+  type RemoteTrialBalanceRow,
+  type RilletTrialBalanceResponse
+} from "../../core/trial-balance";
+import type {
+  AccountingEntityType,
+  AuthProvider,
+  DimensionTarget,
+  GlobalSyncConfig,
+  ListChangesResult,
+  ProviderCapabilities,
+  ProviderChange,
+  ProviderConfig,
+  ProviderCredentials
+} from "../../core/types";
+import { BaseProvider } from "../../core/types";
+import {
+  AccountingApiError,
+  type ApiErrorDetails,
+  HTTPClient,
+  type HttpResponse
+} from "../../core/utils";
+import {
+  getRilletBillPaymentSyncEntityId,
+  getRilletPaymentSyncEntityId
+} from "./entities/payment";
+import type {
+  Rillet,
+  RilletBillCreate,
+  RilletChargeCreate,
+  RilletCreditMemoApplicationsRequest,
+  RilletCreditMemoCreate,
+  RilletCustomerWrite,
+  RilletInvoiceCreate,
+  RilletJournalEntryCreate,
+  RilletPaymentCreate,
+  RilletProductWrite,
+  RilletReimbursementCreate,
+  RilletVendorCreditApplicationsRequest,
+  RilletVendorCreditCreate,
+  RilletVendorWrite
+} from "./models";
+import { readCarbonExternalReference } from "./references";
+
+const RILLET_PRODUCTION_HOST = "https://api.rillet.com";
+const RILLET_SANDBOX_HOST = "https://sandbox.api.rillet.com";
+
+/**
+ * Pinned Rillet API version, sent as X-Rillet-API-Version on every request
+ * — the server-side default flips on 2026-08-01, so pinning is what keeps
+ * the wire contract stable. Bump deliberately, in one place.
+ */
+export const RILLET_API_VERSION = "4";
+
+/** Rillet's page-size cap for cursor-paginated list endpoints. */
+export const RILLET_PAGE_SIZE = 100;
+
+/** Dimension slot target prefix: `field:<fieldId>` (Rillet Field uuid). */
+const RILLET_FIELD_TARGET_PREFIX = "field:";
+
+export function buildRilletFieldTarget(fieldId: string): string {
+  return `${RILLET_FIELD_TARGET_PREFIX}${fieldId}`;
+}
+
+/** The Field uuid inside a `field:<id>` target; null otherwise. */
+export function parseRilletFieldTarget(target: string): string | null {
+  if (!target.startsWith(RILLET_FIELD_TARGET_PREFIX)) return null;
+  const fieldId = target.slice(RILLET_FIELD_TARGET_PREFIX.length);
+  return fieldId.length > 0 ? fieldId : null;
+}
+
+// /********************************************************\
+// *              RFC 9457 problem parsing                  *
+// \********************************************************/
+
+/**
+ * Parse a Rillet error response into structured ApiErrorDetails. Rillet
+ * errors are RFC 9457 problem details — `{ type (uri), title, status,
+ * detail }` — optionally carrying an `errors` array extension whose entry
+ * shape is not pinned by the docs, so it is read defensively (strings or
+ * objects with pointer/field + detail/message).
+ */
+export function extractRilletErrorDetails(
+  statusCode: number,
+  statusText: string,
+  responseData: unknown
+): ApiErrorDetails {
+  const details: ApiErrorDetails = {
+    statusCode,
+    statusText,
+    rawResponse: responseData
+  };
+
+  let data: unknown = responseData;
+  if (typeof responseData === "string") {
+    try {
+      data = JSON.parse(responseData);
+    } catch {
+      if (responseData.length < 500) {
+        details.providerMessage = responseData;
+      }
+      return details;
+    }
+  }
+
+  if (typeof data !== "object" || data === null) {
+    return details;
+  }
+
+  const problem = data as Record<string, unknown>;
+
+  if (typeof problem.type === "string") {
+    details.providerErrorType = problem.type;
+  }
+  if (
+    typeof problem.status === "number" ||
+    typeof problem.status === "string"
+  ) {
+    details.providerErrorCode = problem.status;
+  }
+  if (typeof problem.detail === "string") {
+    details.providerMessage = problem.detail;
+  } else if (typeof problem.title === "string") {
+    details.providerMessage = problem.title;
+  }
+
+  if (Array.isArray(problem.errors)) {
+    const validationErrors: Array<{ field?: string; message: string }> = [];
+    for (const entry of problem.errors) {
+      if (typeof entry === "string") {
+        validationErrors.push({ message: entry });
+        continue;
+      }
+      if (typeof entry !== "object" || entry === null) continue;
+
+      const record = entry as Record<string, unknown>;
+      const field = [record.pointer, record.field, record.path].find(
+        (value): value is string => typeof value === "string"
+      );
+      const message = [record.detail, record.message, record.title].find(
+        (value): value is string => typeof value === "string"
+      );
+      validationErrors.push({
+        field,
+        message: message ?? JSON.stringify(entry)
+      });
+    }
+    if (validationErrors.length > 0) {
+      details.validationErrors = validationErrors;
+    }
+  }
+
+  return details;
+}
+
+/**
+ * Creates, logs and throws an AccountingApiError from a failed Rillet
+ * response (parallel to throwQboApiError / throwXeroApiError).
+ */
+export function throwRilletApiError(
+  operation: string,
+  response: { error: boolean; message: string; code: number; data: unknown }
+): never {
+  const details = extractRilletErrorDetails(
+    response.code,
+    response.message,
+    response.data
+  );
+
+  const error = new AccountingApiError("rillet", operation, details);
+
+  console.error(`[Rillet API Error] ${operation}`, {
+    statusCode: details.statusCode,
+    statusText: details.statusText,
+    providerErrorType: details.providerErrorType,
+    providerErrorCode: details.providerErrorCode,
+    providerMessage: details.providerMessage,
+    validationErrors: details.validationErrors
+  });
+
+  throw error;
+}
+
+/**
+ * True when Rillet rejected a write because an external_references entry
+ * uses a type slug the organization hasn't registered. Reference types are
+ * dashboard-only configuration (Rillet Settings → External References) —
+ * there is no API to create them — so callers degrade: optional references
+ * are stripped and the write retried; required ones (AR_ONLY invoices)
+ * surface a user-fixable Warning.
+ */
+export function isRilletUnknownExternalReferenceTypeError(
+  error: unknown
+): boolean {
+  if (!(error instanceof AccountingApiError)) return false;
+  // Rillet's RFC 9457 type URI is the stable signal; the message text is a
+  // fallback for older responses that only carried the detail.
+  if (
+    typeof error.details.providerErrorType === "string" &&
+    error.details.providerErrorType.endsWith(
+      "/exception/external_reference_type_not_found"
+    )
+  ) {
+    return true;
+  }
+  return (
+    typeof error.details.providerMessage === "string" &&
+    error.details.providerMessage.includes(
+      "External reference type does not exist"
+    )
+  );
+}
+
+/**
+ * Deterministic Idempotency-Key for a Rillet create POST (Rillet replays
+ * the stored response for 24h): the same company + operation + local
+ * entity always produces the same key, so a retried push cannot
+ * double-create — even when the retry's payload drifted (dimension
+ * resolution, an edit between attempts). The payload is deliberately NOT
+ * hashed (v4 spec, Pillar C): a crash between the remote create and the
+ * local mapping write retries the push, and a payload-sensitive key would
+ * mint a fresh key for the drifted payload and duplicate the document
+ * remotely. Every call site's localId identifies one logical create
+ * (composite ids for payments, `:reversal`-suffixed ids for reversal
+ * journals, batch keys for consolidated journals).
+ */
+export function buildRilletIdempotencyKey(args: {
+  companyId: string;
+  operation: string;
+  localId: string;
+}): string {
+  return createHash("sha256")
+    .update(`${args.companyId}:${args.operation}:${args.localId}`)
+    .digest("hex");
+}
+
+// /********************************************************\
+// *              Sync-config constraints                   *
+// \********************************************************/
+
+/**
+ * Entities whose AUTOMATIC sync is PUSH-ONLY (Carbon → Rillet). Carbon is
+ * the system of record for all of them, so no sweep, webhook or event ever
+ * pulls one on its own.
+ *
+ * `customer` and `vendor` are still pullable ON DEMAND: the "Import
+ * customers & vendors" action (`accounting-master-sync`) enqueues explicit
+ * `pull-from-accounting` ledger operations, which the drain routes to the
+ * syncer's pull path regardless of this direction — the same override the
+ * inbound webhook path uses. `owner: "carbon"` below is what keeps that
+ * safe: `BaseEntitySyncer.pullBatchFromAccounting` skips a record that is
+ * already linked, so a re-import can seed new Rillet contacts but can never
+ * overwrite a Carbon-owned one.
+ */
+export const RILLET_PUSH_ONLY_ENTITIES = [
+  "customer",
+  "vendor",
+  "item",
+  "invoice",
+  "bill",
+  "journalEntry",
+  "charge",
+  "creditMemo",
+  "supplierCredit",
+  "reimbursement"
+] as const satisfies readonly AccountingEntityType[];
+
+/**
+ * Entities Rillet syncs TWO-WAY: `payment`. Inbound (pull) — provider-recorded
+ * invoice/bill payments settle Carbon documents (Phase F). Outbound (push) —
+ * Carbon-born Posted payments (e.g. a bill paid through Ramp, recorded in
+ * Carbon) are written to Rillet as payment documents (Phase G). Which direction
+ * fires per record is decided by origin: a payment already carrying a `payment`
+ * mapping is provider-known and skips push; a mapping-less Carbon payment is
+ * pushed. Both flow through the same `payment` syncer.
+ */
+export const RILLET_TWO_WAY_ENTITIES = [
+  "payment"
+] as const satisfies readonly AccountingEntityType[];
+
+/**
+ * Entities Rillet does not sync (force-disabled): Rillet has no purchase
+ * order endpoint, and inventory adjustments flow as journals through the
+ * posting sync.
+ */
+export const RILLET_DISABLED_ENTITIES = [
+  "purchaseOrder",
+  "salesOrder",
+  "inventoryAdjustment",
+  "employee"
+] as const satisfies readonly AccountingEntityType[];
+
+/**
+ * Constrain a resolved sync config to what Rillet supports (modeled on
+ * buildQbdSyncConfig): supported document entities are forced to direction
+ * "push-to-accounting" with owner "carbon" (push-only is a capability
+ * limit, not a preference — stored two-way/pull overrides are ignored)
+ * while their per-company `enabled` flag survives; `payment` is forced
+ * `two-way` AND enabled (inbound pull + outbound push must both work as soon
+ * as the integration is connected — there is no per-company toggle for it,
+ * and the documents-mode families gate governs whether it actually runs);
+ * everything else is force-disabled.
+ */
+export function buildRilletSyncConfig(
+  resolved: GlobalSyncConfig
+): GlobalSyncConfig {
+  const entities = Object.fromEntries(
+    Object.entries(resolved.entities).map(([entityType, entityConfig]) => [
+      entityType,
+      { ...entityConfig }
+    ])
+  ) as GlobalSyncConfig["entities"];
+
+  for (const entityType of RILLET_PUSH_ONLY_ENTITIES) {
+    entities[entityType] = {
+      ...entities[entityType],
+      direction: "push-to-accounting",
+      owner: "carbon"
+    };
+  }
+
+  for (const entityType of RILLET_TWO_WAY_ENTITIES) {
+    entities[entityType] = {
+      ...entities[entityType],
+      direction: "two-way",
+      owner: "accounting",
+      enabled: true
+    };
+  }
+
+  for (const entityType of RILLET_DISABLED_ENTITIES) {
+    entities[entityType] = { ...entities[entityType], enabled: false };
+  }
+
+  // Always-on: automated postings sync whenever the integration is connected.
+  // Forced here (defense-in-depth over the DEFAULT_SYNC_CONFIG default) so a
+  // stale stored `enabled: false` override can't silently turn journals off.
+  entities.journalEntry = { ...entities.journalEntry, enabled: true };
+
+  return { entities };
+}
+
+// /********************************************************\
+// *                      Provider                          *
+// \********************************************************/
+
+type RilletProviderConfig = ProviderConfig<{
+  /**
+   * Credentials parsed from `companyIntegration.metadata.credentials`
+   * (parseStoredCredentials). Expected to be the `apiKey` variant; absent
+   * until an API key is entered on the integration settings page.
+   */
+  credentials?: ProviderCredentials;
+}> & { id: ProviderID.RILLET };
+
+const NO_OAUTH_MESSAGE =
+  "Rillet authenticates with an API key entered on the integration settings page — there is no OAuth flow";
+
+function getRilletApiKeyCredentials(
+  credentials: ProviderCredentials
+): Extract<ProviderCredentials, { type: "apiKey" }> {
+  if (credentials.type !== "apiKey") {
+    throw new Error(
+      `Rillet requires apiKey credentials, received "${credentials.type}"`
+    );
+  }
+  return credentials;
+}
+
+/**
+ * Rillet single-object endpoints are documented as returning the bare
+ * object, but be defensive about a wrapped envelope (e.g.
+ * `{ journal_entry: {...} }`) — accept both.
+ */
+function unwrapRilletEntity<T>(data: unknown, envelopeKey: string): T | null {
+  if (data === null || typeof data !== "object") return null;
+  const wrapped = (data as Record<string, unknown>)[envelopeKey];
+  if (wrapped && typeof wrapped === "object") return wrapped as T;
+  return data as T;
+}
+
+export class RilletProvider extends BaseProvider {
+  static id = ProviderID.RILLET;
+
+  readonly capabilities: ProviderCapabilities = {
+    role: "accounting",
+    transport: "rest",
+    supportsWebhooks: true,
+    supportsJournalPush: true,
+    // Rillet was the ONLY provider creating contacts without looking first —
+    // Xero searches by contact name, QuickBooks queries DisplayName, Ramp
+    // matches its spend vendors. Declaring these opts Rillet into the shared
+    // ladder (core/counterpart.ts), so a Carbon supplier whose Rillet twin a
+    // human typed in links instead of duplicating.
+    searchableCounterparts: ["customer", "vendor"],
+    // The same two lists back the master-data import; Rillet has no
+    // search-by-name endpoint, so listing IS how it answers both questions.
+    importableEntities: ["customer", "vendor"]
+  };
+
+  /** No cap: /invoice-payments `updated.gt` reaches arbitrarily far back. */
+  readonly pullLookbackDays?: number;
+
+  http: HTTPClient;
+
+  private readonly syncConfig: GlobalSyncConfig;
+
+  constructor(public config: Omit<RilletProviderConfig, "id">) {
+    super();
+    this.creds = config.credentials;
+    this.syncConfig = buildRilletSyncConfig(config.syncConfig);
+
+    // API keys are environment-specific — the stored credentials pick the host
+    const environment =
+      config.credentials?.type === "apiKey"
+        ? config.credentials.environment
+        : "production";
+    this.http = new HTTPClient(
+      environment === "sandbox" ? RILLET_SANDBOX_HOST : RILLET_PRODUCTION_HOST
+    );
+
+    // No OAuth client: the API key IS the whole connection. getCredentials
+    // still works so generic code can read the stored credentials.
+    const auth: AuthProvider = {
+      getCredentials: () => {
+        if (!this.creds) {
+          throw new Error(
+            "Rillet integration has no stored credentials — enter an API key on the integration settings page"
+          );
+        }
+        return this.creds;
+      },
+      getAuthUrl: () => {
+        throw new Error(NO_OAUTH_MESSAGE);
+      },
+      exchangeCode: () => {
+        throw new Error(NO_OAUTH_MESSAGE);
+      },
+      refresh: () => {
+        throw new Error(NO_OAUTH_MESSAGE);
+      }
+    };
+    this.auth = auth;
+  }
+
+  get id(): ProviderID.RILLET {
+    return ProviderID.RILLET;
+  }
+
+  getSyncConfig(entity: AccountingEntityType) {
+    return this.syncConfig.entities[entity];
+  }
+
+  async authenticate(): Promise<ProviderCredentials> {
+    throw new Error(NO_OAUTH_MESSAGE);
+  }
+
+  /** `providerMetadata.subsidiaryId` when configured, else null. */
+  get subsidiaryId(): string | null {
+    if (this.creds?.type !== "apiKey") return null;
+    const value = this.creds.providerMetadata?.subsidiaryId;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  /** `providerMetadata.webhookToken` — the inbound webhook route's shared secret. */
+  get webhookToken(): string | null {
+    if (this.creds?.type !== "apiKey") return null;
+    const value = this.creds.providerMetadata?.webhookToken;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  /**
+   * Perform an authenticated Rillet request. Every call carries the bearer
+   * API key and the pinned X-Rillet-API-Version. There is NO 401-refresh
+   * retry: API keys don't refresh, so a 401 is terminal (revoked/wrong
+   * key). HTTPClient already converts 429 into a RatelimitError.
+   */
+  async request<T>(
+    method: string,
+    url: string,
+    options?: RequestInit & { idempotencyKey?: string }
+  ): Promise<HttpResponse<T>> {
+    const credentials = getRilletApiKeyCredentials(this.auth.getCredentials());
+    const { idempotencyKey, ...init } = options ?? {};
+
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${credentials.apiKey}`,
+      "X-Rillet-API-Version": RILLET_API_VERSION,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+      ...((init.headers ?? {}) as Record<string, string>)
+    };
+
+    return this.http.request<T>(method, url, { ...init, headers });
+  }
+
+  /**
+   * Drain a cursor-paginated list endpoint (`?limit=100&cursor=...` →
+   * `pagination.next_cursor`, absent on the last page) in ONE pass —
+   * Rillet cursors expire after 2 hours, so pagination is never resumed
+   * across runs.
+   */
+  private async listPaginated<T>(
+    path: string,
+    extractRows: (data: Record<string, unknown>) => T[] | undefined
+  ): Promise<T[]> {
+    const rows: T[] = [];
+    let cursor: string | undefined;
+
+    do {
+      const separator = path.includes("?") ? "&" : "?";
+      const url = `${path}${separator}limit=${RILLET_PAGE_SIZE}${
+        cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""
+      }`;
+
+      const response = await this.request<Record<string, unknown>>("GET", url);
+      if (response.error) {
+        throwRilletApiError(`list ${path}`, response);
+      }
+
+      rows.push(...(extractRows(response.data ?? {}) ?? []));
+
+      const pagination = (
+        response.data as {
+          pagination?: { next_cursor?: string | null };
+        } | null
+      )?.pagination;
+      cursor = pagination?.next_cursor ?? undefined;
+    } while (cursor);
+
+    return rows;
+  }
+
+  /** Credentials work iff GET /accounts succeeds. */
+  async validate(): Promise<boolean> {
+    try {
+      const response = await this.request<{ accounts?: Rillet.Account[] }>(
+        "GET",
+        "/accounts"
+      );
+      return !response.error;
+    } catch (error) {
+      console.error("Rillet validate error:", error);
+      return false;
+    }
+  }
+
+  // =================================================================
+  // Chart of accounts
+  // =================================================================
+
+  /**
+   * Fetch the active Rillet chart of accounts, normalized to the
+   * `{ id, code, name }` shape the settings loader / account-mapping UI
+   * consumes. INACTIVE and code-less accounts are dropped — journal/bill
+   * items address accounts by CODE. Returns [] on failure, mirroring the
+   * Xero/QBO forgiving contract.
+   */
+  async listChartOfAccounts(): Promise<
+    Array<{ id: string; code: string; name: string }>
+  > {
+    try {
+      // GET /accounts is documented unpaginated
+      const response = await this.request<{ accounts?: Rillet.Account[] }>(
+        "GET",
+        "/accounts"
+      );
+      if (response.error) {
+        throwRilletApiError("list accounts", response);
+      }
+
+      const accounts = response.data?.accounts ?? [];
+      return accounts
+        .filter((account) => account.status === "ACTIVE" && account.code)
+        .map((account) => ({
+          id: account.id,
+          code: account.code!,
+          name: account.name ?? account.code!
+        }));
+    } catch (error) {
+      console.error("Failed to fetch Rillet accounts:", error);
+      return [];
+    }
+  }
+
+  /**
+   * The trial balance as at `date` (YYYY-MM-DD), one row per account
+   * (GET /reports/trial-balance), scoped to the configured subsidiary.
+   * Rillet closes income and expense into retained earnings at `fromDate`,
+   * so pass the fiscal year start: income and expense then hold the
+   * fiscal year to date. Account types come from GET /accounts, inactive
+   * accounts included, since a closed account can still carry a balance.
+   */
+  async getTrialBalance(
+    date: string,
+    fromDate: string
+  ): Promise<RemoteTrialBalanceRow[]> {
+    const params = new URLSearchParams({ from_date: fromDate, to_date: date });
+    if (this.subsidiaryId) params.set("subsidiary_id", this.subsidiaryId);
+
+    const [report, accounts] = await Promise.all([
+      this.request<RilletTrialBalanceResponse>(
+        "GET",
+        `/reports/trial-balance?${params.toString()}`
+      ),
+      this.request<{ accounts?: Rillet.Account[] }>("GET", "/accounts")
+    ]);
+    if (report.error || !report.data) {
+      throwRilletApiError("read trial balance", report);
+    }
+    if (accounts.error) {
+      throwRilletApiError("list accounts", accounts);
+    }
+
+    return parseRilletTrialBalance(
+      report.data,
+      new Map(
+        (accounts.data?.accounts ?? []).flatMap((account) =>
+          account.type ? [[account.id, account.type] as const] : []
+        )
+      )
+    );
+  }
+
+  /**
+   * Fetch the Rillet subsidiaries (multi-entity ledger; the configured
+   * `providerMetadata.subsidiaryId` scopes every pushed document). Returns
+   * [] on failure — a settings-surface read, same forgiving contract as
+   * listChartOfAccounts.
+   */
+  async listSubsidiaries(): Promise<Rillet.Subsidiary[]> {
+    try {
+      return await this.listPaginated<Rillet.Subsidiary>(
+        "/subsidiaries",
+        (data) => data.subsidiaries as Rillet.Subsidiary[] | undefined
+      );
+    } catch (error) {
+      console.error("Failed to fetch Rillet subsidiaries:", error);
+      return [];
+    }
+  }
+
+  // =================================================================
+  // Fields (dimensions) — verified v4 surface (spec changelog 2026-08-04)
+  // =================================================================
+
+  /**
+   * Fetch the Rillet Field definitions with their pick-list values
+   * (GET /fields → `{ fields: [...] }`). The endpoint is documented
+   * unpaginated, but a cursor is followed defensively if one ever
+   * appears. Throws a structured error on API failure.
+   */
+  async listFields(): Promise<Rillet.Field[]> {
+    const fields: Rillet.Field[] = [];
+    let cursor: string | undefined;
+
+    do {
+      const url = `/fields${
+        cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""
+      }`;
+      const response = await this.request<Record<string, unknown>>("GET", url);
+      if (response.error) {
+        throwRilletApiError("list fields", response);
+      }
+
+      const data = response.data ?? {};
+      fields.push(...((data.fields as Rillet.Field[] | undefined) ?? []));
+
+      const pagination = (
+        data as { pagination?: { next_cursor?: string | null } }
+      ).pagination;
+      cursor = pagination?.next_cursor ?? undefined;
+    } while (cursor);
+
+    return fields;
+  }
+
+  /**
+   * The journal dimension targets this org supports: one
+   * `field:<fieldId>` target per Rillet Field (dimension-native — no
+   * structural cap). Returns [] on failure, mirroring the forgiving
+   * settings-surface contract of listChartOfAccounts.
+   */
+  async journalDimensionTargets(): Promise<DimensionTarget[]> {
+    try {
+      const fields = await this.listFields();
+      return fields.map((field) => ({
+        id: buildRilletFieldTarget(field.id),
+        label: field.name,
+        capacity: 1
+      }));
+    } catch (error) {
+      console.error("Failed to fetch Rillet fields:", error);
+      return [];
+    }
+  }
+
+  /**
+   * Upsert a Field pick-list value BY NAME
+   * (POST /fields/{id}/values `{ name }`) — Rillet returns the FULL Field
+   * including the created value's uuid. NOT idempotent server-side (verified
+   * on sandbox 2026-08-14: a name that already exists — e.g. provisioned by
+   * an earlier Carbon instance whose mappings are gone, or seeded in the
+   * Rillet UI — 400s `Value "<name>" already exists`), so on that rejection
+   * the existing value is recovered by name via `GET /fields` (there is no
+   * `GET /fields/{id}` — 405). Throws when Rillet accepts the write but the
+   * value cannot be found on the returned Field (contract drift — fail loud,
+   * not with a broken ref).
+   */
+  async upsertFieldValue(
+    fieldId: string,
+    rawName: string
+  ): Promise<Rillet.FieldValue> {
+    // Rillet TRIMS value names on write and dedupes them trim-insensitively
+    // (verified on sandbox 2026-08-14: creating "Test " comes back stored as
+    // "Test", and a later POST of "Test" 400s `already exists`). Carbon's
+    // dimension labels can carry inconsistent whitespace across lines ("Test"
+    // vs "Test "), so we normalize to Rillet's own behavior — trim on write and
+    // match trimmed on both sides — so those resolve to ONE Field value instead
+    // of failing the whole journal on an exact-string miss.
+    const name = rawName.trim();
+    let field: Rillet.Field;
+    try {
+      field = await this.writeEntity<Rillet.Field>({
+        method: "POST",
+        path: `/fields/${fieldId}/values`,
+        envelopeKey: "field",
+        operation: "upsert field value",
+        payload: { name }
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/already exists/i.test(message)) {
+        const existingField = (await this.listFields()).find(
+          (candidate) => candidate.id === fieldId
+        );
+        const existingValue =
+          existingField?.values?.find(
+            (candidate) =>
+              candidate.name?.trim() === name && !candidate.deactivated
+          ) ??
+          existingField?.values?.find(
+            (candidate) => candidate.name?.trim() === name
+          );
+        if (existingValue) return existingValue;
+      }
+      throw err;
+    }
+
+    const value = (field.values ?? []).find(
+      (candidate) => candidate.name?.trim() === name
+    );
+    if (!value) {
+      throw new Error(
+        `Rillet accepted the field-value upsert but "${name}" is not on the returned field ${fieldId}`
+      );
+    }
+
+    return value;
+  }
+
+  /**
+   * Create a Field definition (a whole dimension) BY NAME
+   * (POST /fields). `area` is the applicability scope — EXPENSES covers
+   * bills + manual journal entries, REVENUE covers invoices/credit memos —
+   * written as `settings.<AREA> = { mandatory, display }` with display
+   * STANDALONE (single-select; one value per line per Carbon dimension).
+   * Unlike upsertFieldValue this is NOT idempotent by name server-side, so
+   * callers must check for an existing Field first (see resolveLineDimensions)
+   * and pass a deterministic Idempotency-Key to guard a create-retry.
+   *
+   * VERIFY: the POST /fields request body is inferred from the documented
+   * GET /fields shape (v3 spec changelog 2026-08-04) — confirm against the
+   * live Rillet sandbox before relying on auto-provisioning in production.
+   */
+  async createField(
+    name: string,
+    area: "EXPENSES" | "REVENUE",
+    idempotencyKey?: string
+  ): Promise<Rillet.Field> {
+    return this.writeEntity<Rillet.Field>({
+      method: "POST",
+      path: "/fields",
+      envelopeKey: "field",
+      operation: "create field",
+      payload: {
+        name,
+        settings: { [area]: { mandatory: false, display: "STANDALONE" } }
+      },
+      idempotencyKey
+    });
+  }
+
+  // Memoized per provider INSTANCE. The contact import lists the full set
+  // once (to enqueue ids) and then each drained batch re-reads it through the
+  // customer/vendor syncer's fetchRemoteBatch — Rillet has no get-many
+  // endpoint, so without this a 10k-record import re-scans /customers once per
+  // 50-id batch (~200 full cursor drains). Reusing ONE provider across the
+  // whole import collapses that to a single drain per entity type. Not shared
+  // across provider instances, so an unrelated caller that wants fresh data
+  // constructs its own provider (as every sweep/webhook already does).
+  private listedCustomers?: Promise<Rillet.Customer[]>;
+  private listedVendors?: Promise<Rillet.Vendor[]>;
+
+  /** All Rillet customers (cursor-drained, memoized). Throws on API failure. */
+  async listCustomers(): Promise<Rillet.Customer[]> {
+    this.listedCustomers ??= this.listPaginated<Rillet.Customer>(
+      "/customers",
+      (data) => data.customers as Rillet.Customer[] | undefined
+    ).catch((err) => {
+      // Don't cache a rejection — a retried batch must be able to list again.
+      this.listedCustomers = undefined;
+      throw err;
+    });
+    return this.listedCustomers;
+  }
+
+  /**
+   * Candidates for the counterpart ladder (`core/counterpart.ts`). Reuses the
+   * SAME memoized list the contact import drains, so a whole sync run costs one
+   * pass per entity type rather than one per record — Rillet has no
+   * search-by-name endpoint, so the list IS the search.
+   *
+   * `carbonReference` is read company-qualified: a Rillet record carrying
+   * ANOTHER Carbon instance's id must not look like ours.
+   */
+  async findRemoteCandidates(
+    kind: ExternalIdentityKind,
+    _keys: CounterpartSearchKeys
+  ): Promise<RemoteCandidate[]> {
+    const carbonRef = (
+      references: Rillet.ExternalReference[] | undefined
+    ): string | null =>
+      readCarbonExternalReference(references, this.config.companyId);
+
+    if (kind === "vendor") {
+      return (await this.listVendors()).map((vendor) => ({
+        remoteId: vendor.id,
+        name: vendor.name ?? null,
+        email: vendor.email ?? null,
+        taxId: vendor.tax_id ?? null,
+        carbonReference: carbonRef(vendor.external_references)
+      }));
+    }
+
+    if (kind === "customer") {
+      // A Rillet customer carries `emails[]` (typed MAIN_SENDER/CC/BCC), not a
+      // single `email`, and has no tax id — so the ladder resolves a customer
+      // by carbonReference then name, never by tax id.
+      return (await this.listCustomers()).map((customer) => ({
+        remoteId: customer.id,
+        name: customer.name ?? null,
+        email:
+          customer.emails?.find((entry) => entry.type === "MAIN_SENDER")
+            ?.email ??
+          customer.emails?.[0]?.email ??
+          null,
+        taxId: null,
+        carbonReference: carbonRef(customer.external_references)
+      }));
+    }
+
+    return [];
+  }
+
+  /**
+   * Every remote id of a master-data kind, for the one-shot import. Reuses the
+   * SAME memoized lists the counterpart ladder drains, so an import that then
+   * pushes costs one pass per entity type rather than two.
+   */
+  async listRemoteEntityIds(kind: ExternalIdentityKind): Promise<string[]> {
+    if (kind === "customer") {
+      return (await this.listCustomers()).map((customer) => customer.id);
+    }
+    if (kind === "vendor") {
+      return (await this.listVendors()).map((vendor) => vendor.id);
+    }
+    return [];
+  }
+
+  /** All Rillet vendors (cursor-drained, memoized). Throws on API failure. */
+  async listVendors(): Promise<Rillet.Vendor[]> {
+    this.listedVendors ??= this.listPaginated<Rillet.Vendor>(
+      "/vendors",
+      (data) => data.vendors as Rillet.Vendor[] | undefined
+    ).catch((err) => {
+      this.listedVendors = undefined;
+      throw err;
+    });
+    return this.listedVendors;
+  }
+
+  // =================================================================
+  // Entity reads/writes (reads return null on failure; writes throw a
+  // structured AccountingApiError; creates carry an Idempotency-Key)
+  // =================================================================
+
+  private async readEntity<T>(
+    path: string,
+    envelopeKey: string
+  ): Promise<T | null> {
+    const response = await this.request<unknown>("GET", path);
+    if (response.error) return null;
+    return unwrapRilletEntity<T>(response.data, envelopeKey);
+  }
+
+  private async deleteEntity(path: string, operation: string): Promise<void> {
+    const response = await this.request<unknown>("DELETE", path);
+    // The mapping survives a delete. A retry after a successful remote delete
+    // but failed local transaction must converge when the resource is absent.
+    if (response.error && response.code !== 404) {
+      throwRilletApiError(operation, response);
+    }
+  }
+
+  async deleteInvoice(id: string): Promise<void> {
+    await this.deleteEntity(`/invoices/${id}`, "void invoice");
+  }
+
+  async deleteBill(id: string): Promise<void> {
+    await this.deleteEntity(`/bills/${id}`, "void bill");
+  }
+
+  async deleteCharge(id: string): Promise<void> {
+    await this.deleteEntity(`/charges/${id}`, "void charge");
+  }
+
+  async deleteReimbursement(id: string): Promise<void> {
+    await this.deleteEntity(`/reimbursements/${id}`, "void reimbursement");
+  }
+
+  async deleteCreditMemo(id: string): Promise<void> {
+    await this.deleteEntity(`/credit-memos/${id}`, "void credit memo");
+  }
+
+  async deleteVendorCredit(id: string): Promise<void> {
+    await this.deleteEntity(`/vendor-credits/${id}`, "void vendor credit");
+  }
+
+  async deleteInvoicePayment(
+    invoiceId: string,
+    paymentId: string
+  ): Promise<void> {
+    await this.deleteEntity(
+      `/invoices/${invoiceId}/payments/${paymentId}`,
+      "void invoice payment"
+    );
+  }
+
+  async deleteBillPayment(billId: string, paymentId: string): Promise<void> {
+    await this.deleteEntity(
+      `/bills/${billId}/payments/${paymentId}`,
+      "void bill payment"
+    );
+  }
+
+  /**
+   * `DELETE /reimbursements/{reimbursement_id}/payments/{payment_id}` —
+   * VERIFIED against Rillet's published OpenAPI
+   * (docs.api.rillet.com/reference/delete-a-reimbursement-payment,
+   * 2026-09-23), 204 on success. A Carbon payout that is voided must delete
+   * the REIMBURSEMENT payment, not a bill payment: the two id spaces are
+   * disjoint and `/bills/{reimbursementId}/payments/...` would 404 (or, worse,
+   * hit an unrelated bill).
+   */
+  async deleteReimbursementPayment(
+    reimbursementId: string,
+    paymentId: string
+  ): Promise<void> {
+    await this.deleteEntity(
+      `/reimbursements/${reimbursementId}/payments/${paymentId}`,
+      "void reimbursement payment"
+    );
+  }
+
+  private async writeEntity<T>(args: {
+    method: "POST" | "PUT";
+    path: string;
+    envelopeKey: string;
+    operation: string;
+    payload: unknown;
+    idempotencyKey?: string;
+  }): Promise<T> {
+    const response = await this.request<unknown>(args.method, args.path, {
+      body: JSON.stringify(args.payload),
+      idempotencyKey: args.idempotencyKey
+    });
+
+    if (response.error) {
+      throwRilletApiError(args.operation, response);
+    }
+
+    const entity = unwrapRilletEntity<T>(response.data, args.envelopeKey);
+    if (!entity) {
+      throw new Error(
+        `Rillet returned success but no ${args.envelopeKey} body for ${args.operation}`
+      );
+    }
+
+    return entity;
+  }
+
+  async getJournalEntry(id: string): Promise<Rillet.JournalEntry | null> {
+    return this.readEntity<Rillet.JournalEntry>(
+      `/journal-entries/${id}`,
+      "journal_entry"
+    );
+  }
+
+  /**
+   * Create a Rillet journal entry. No update counterpart: pushed journals
+   * are immutable (the journal syncer hard-skips already-mapped ids).
+   */
+  async createJournalEntry(
+    journalEntry: RilletJournalEntryCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.JournalEntry> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/journal-entries",
+      envelopeKey: "journal_entry",
+      operation: "create journal entry",
+      payload: journalEntry,
+      idempotencyKey
+    });
+  }
+
+  async getCustomer(id: string): Promise<Rillet.Customer | null> {
+    return this.readEntity<Rillet.Customer>(`/customers/${id}`, "customer");
+  }
+
+  async createCustomer(
+    customer: RilletCustomerWrite,
+    idempotencyKey?: string
+  ): Promise<Rillet.Customer> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/customers",
+      envelopeKey: "customer",
+      operation: "create customer",
+      payload: customer,
+      idempotencyKey
+    });
+  }
+
+  async updateCustomer(
+    id: string,
+    customer: RilletCustomerWrite
+  ): Promise<Rillet.Customer> {
+    return this.writeEntity({
+      method: "PUT",
+      path: `/customers/${id}`,
+      envelopeKey: "customer",
+      operation: "update customer",
+      payload: customer
+    });
+  }
+
+  async getVendor(id: string): Promise<Rillet.Vendor | null> {
+    return this.readEntity<Rillet.Vendor>(`/vendors/${id}`, "vendor");
+  }
+
+  async createVendor(
+    vendor: RilletVendorWrite,
+    idempotencyKey?: string
+  ): Promise<Rillet.Vendor> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/vendors",
+      envelopeKey: "vendor",
+      operation: "create vendor",
+      payload: vendor,
+      idempotencyKey
+    });
+  }
+
+  async updateVendor(
+    id: string,
+    vendor: RilletVendorWrite
+  ): Promise<Rillet.Vendor> {
+    return this.writeEntity({
+      method: "PUT",
+      path: `/vendors/${id}`,
+      envelopeKey: "vendor",
+      operation: "update vendor",
+      payload: vendor
+    });
+  }
+
+  async getProduct(id: string): Promise<Rillet.Product | null> {
+    return this.readEntity<Rillet.Product>(`/products/${id}`, "product");
+  }
+
+  async createProduct(
+    product: RilletProductWrite,
+    idempotencyKey?: string
+  ): Promise<Rillet.Product> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/products",
+      envelopeKey: "product",
+      operation: "create product",
+      payload: product,
+      idempotencyKey
+    });
+  }
+
+  async updateProduct(
+    id: string,
+    product: RilletProductWrite
+  ): Promise<Rillet.Product> {
+    return this.writeEntity({
+      method: "PUT",
+      path: `/products/${id}`,
+      envelopeKey: "product",
+      operation: "update product",
+      payload: product
+    });
+  }
+
+  async getInvoice(id: string): Promise<Rillet.Invoice | null> {
+    return this.readEntity<Rillet.Invoice>(`/invoices/${id}`, "invoice");
+  }
+
+  /** Create a native invoice (Carbon issues it; Rillet recognizes the posting). */
+  async createInvoice(
+    invoice: RilletInvoiceCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.Invoice> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/invoices",
+      envelopeKey: "invoice",
+      operation: "create invoice",
+      payload: invoice,
+      idempotencyKey
+    });
+  }
+
+  async getBill(id: string): Promise<Rillet.Bill | null> {
+    return this.readEntity<Rillet.Bill>(`/bills/${id}`, "bill");
+  }
+
+  async createBill(
+    bill: RilletBillCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.Bill> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/bills",
+      envelopeKey: "bill",
+      operation: "create bill",
+      payload: bill,
+      idempotencyKey
+    });
+  }
+
+  async getCharge(id: string): Promise<Rillet.Charge | null> {
+    return this.readEntity<Rillet.Charge>(`/charges/${id}`, "charge");
+  }
+
+  async getReimbursement(id: string): Promise<Rillet.Reimbursement | null> {
+    return this.readEntity<Rillet.Reimbursement>(
+      `/reimbursements/${id}`,
+      "reimbursement"
+    );
+  }
+
+  /** `POST /reimbursements` — an employee reimbursement (see `Rillet.ReimbursementSchema`). */
+  async createReimbursement(
+    reimbursement: RilletReimbursementCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.Reimbursement> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/reimbursements",
+      envelopeKey: "reimbursement",
+      operation: "create reimbursement",
+      payload: reimbursement,
+      idempotencyKey
+    });
+  }
+
+  /** `POST /charges` — a credit-card charge (see `Rillet.ChargeSchema`). */
+  async createCharge(
+    charge: RilletChargeCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.Charge> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/charges",
+      envelopeKey: "charge",
+      operation: "create charge",
+      payload: charge,
+      idempotencyKey
+    });
+  }
+
+  async getVendorCredit(id: string): Promise<Rillet.VendorCredit | null> {
+    return this.readEntity<Rillet.VendorCredit>(
+      `/vendor-credits/${id}`,
+      "vendor_credit"
+    );
+  }
+
+  /**
+   * `POST /vendor-credits` — Rillet's native AP credit document. Lines are
+   * account-coded (`line_items[].account_code`), so a supplier credit needs
+   * no product: the memo's reason account IS the GL binding.
+   */
+  async createVendorCredit(
+    vendorCredit: RilletVendorCreditCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.VendorCredit> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/vendor-credits",
+      envelopeKey: "vendor_credit",
+      operation: "create vendor credit",
+      payload: vendorCredit,
+      idempotencyKey
+    });
+  }
+
+  async getCreditMemo(id: string): Promise<Rillet.CreditMemo | null> {
+    return this.readEntity<Rillet.CreditMemo>(
+      `/credit-memos/${id}`,
+      "credit_memo"
+    );
+  }
+
+  /**
+   * `POST /credit-memos` — Rillet's native AR credit document. Every line
+   * REQUIRES `price.product_id`, `price.quantity` and `price.amount_per_unit`;
+   * there is no account-coded AR line variant anywhere in the API, which is
+   * why a customer credit resolves a reason-bound product first
+   * (`core/credit-reason-item.ts` + `createProduct`).
+   *
+   * Deliberately NOT a journal entry: a sandbox probe (2026-09-23) showed
+   * Rillet accepts a journal to the AR control account and SILENTLY DISCARDS
+   * `related_entity`, leaving the control balance moved with no subledger
+   * document behind it. Do not add a journal fallback.
+   */
+  async createCreditMemo(
+    creditMemo: RilletCreditMemoCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.CreditMemo> {
+    return this.writeEntity({
+      method: "POST",
+      path: "/credit-memos",
+      envelopeKey: "credit_memo",
+      operation: "create credit memo",
+      payload: creditMemo,
+      idempotencyKey
+    });
+  }
+
+  /**
+   * `POST /credit-memos/{id}/applications` — **FULL RECONCILE**. Rillet
+   * replaces the credit memo's ENTIRE application set with this body, so an
+   * entry omitted here is DELETED remotely. Callers must always pass the
+   * complete desired set (the credit memo syncer derives it from every
+   * `invoiceSettlement` row of the memo in one call), never one entry at a
+   * time.
+   *
+   * Returns nothing: the response body is not an entity envelope, so this
+   * goes through `request` directly rather than `writeEntity`.
+   */
+  async applyCreditMemo(
+    id: string,
+    applications: Rillet.CreditMemoApplication[],
+    idempotencyKey?: string
+  ): Promise<void> {
+    const body: RilletCreditMemoApplicationsRequest = { applications };
+    const response = await this.request<unknown>(
+      "POST",
+      `/credit-memos/${id}/applications`,
+      { body: JSON.stringify(body), idempotencyKey }
+    );
+    if (response.error) {
+      throwRilletApiError("apply credit memo", response);
+    }
+  }
+
+  /**
+   * `POST /vendor-credits/{id}/applications` — entries are
+   * `{ bill_id, amount }`; this side has **no `application_date`**. Carbon
+   * sends the complete set in one call, so it satisfies the AR
+   * full-reconcile rule too whatever this endpoint's own semantics are.
+   */
+  async applyVendorCredit(
+    id: string,
+    applications: Rillet.VendorCreditApplication[],
+    idempotencyKey?: string
+  ): Promise<void> {
+    const body: RilletVendorCreditApplicationsRequest = { applications };
+    const response = await this.request<unknown>(
+      "POST",
+      `/vendor-credits/${id}/applications`,
+      { body: JSON.stringify(body), idempotencyKey }
+    );
+    if (response.error) {
+      throwRilletApiError("apply vendor credit", response);
+    }
+  }
+
+  /**
+   * `POST /charges/{id}` — attach a receipt (PDF, JPEG or PNG) as multipart
+   * form data with a single file part. Bypasses `request()` because that
+   * pins `Content-Type: application/json`; fetch sets the multipart boundary
+   * itself when the body is a FormData. Throws on a non-2xx so the caller
+   * (best-effort by contract) can log and move on.
+   */
+  async uploadChargeDocument(
+    id: string,
+    file: { name: string; type: string; bytes: Uint8Array }
+  ): Promise<void> {
+    const credentials = getRilletApiKeyCredentials(this.auth.getCredentials());
+    const form = new FormData();
+    form.append(
+      "file",
+      new Blob([file.bytes as BlobPart], { type: file.type }),
+      file.name
+    );
+    const response = await this.http.request<unknown>(
+      "POST",
+      `/charges/${id}`,
+      {
+        body: form,
+        headers: {
+          Authorization: `Bearer ${credentials.apiKey}`,
+          "X-Rillet-API-Version": RILLET_API_VERSION,
+          Accept: "application/json"
+        }
+      }
+    );
+    if (response.error) throwRilletApiError("upload charge document", response);
+  }
+
+  /**
+   * Payments recorded against one invoice. Throws on API failure (unlike
+   * the getX reads) — the payment pull needs to distinguish "invoice has
+   * no such payment" from "the listing itself failed".
+   */
+  async listInvoicePayments(
+    invoiceId: string
+  ): Promise<Rillet.InvoicePayment[]> {
+    const response = await this.request<{
+      payments?: Rillet.InvoicePayment[];
+    }>("GET", `/invoices/${invoiceId}/payments`);
+
+    if (response.error) {
+      throwRilletApiError("list invoice payments", response);
+    }
+
+    return response.data?.payments ?? [];
+  }
+
+  /**
+   * All invoice payments in the organization changed since `updatedAfter`
+   * (GET /invoice-payments — org-wide; no subsidiary or invoice filter
+   * exists on this endpoint).
+   */
+  async listInvoicePaymentsUpdatedSince(
+    updatedAfter: string
+  ): Promise<Rillet.InvoicePayment[]> {
+    return this.listPaginated<Rillet.InvoicePayment>(
+      `/invoice-payments?updated.gt=${encodeURIComponent(
+        updatedAfter
+      )}&sort_by=updated`,
+      (data) => data.payments as Rillet.InvoicePayment[] | undefined
+    );
+  }
+
+  /**
+   * Payments recorded against one bill (AP mirror of listInvoicePayments).
+   * Throws on API failure so the pull can distinguish "bill has no such
+   * payment" from "the listing itself failed".
+   *
+   * VERIFY: the `GET /bills/{billId}/payments` endpoint and its `{ payments:
+   * [...] }` envelope are assumed to mirror `/invoices/{id}/payments`; not yet
+   * confirmed against the live Rillet OpenAPI.
+   */
+  /**
+   * `GET /reimbursements/{reimbursement_id}/payments` — VERIFIED against
+   * Rillet's published OpenAPI
+   * (docs.api.rillet.com/reference/list-reimbursement-payments, 2026-09-23):
+   * a `{ payments: [...] }` envelope, the same shape the bill-payment listing
+   * returns.
+   */
+  async listReimbursementPayments(
+    reimbursementId: string
+  ): Promise<Rillet.ReimbursementPayment[]> {
+    const response = await this.request<{
+      payments?: Rillet.ReimbursementPayment[];
+    }>("GET", `/reimbursements/${reimbursementId}/payments`);
+
+    if (response.error) {
+      throwRilletApiError("list reimbursement payments", response);
+    }
+
+    return response.data?.payments ?? [];
+  }
+
+  async listBillPayments(billId: string): Promise<Rillet.BillPayment[]> {
+    const response = await this.request<{
+      payments?: Rillet.BillPayment[];
+    }>("GET", `/bills/${billId}/payments`);
+
+    if (response.error) {
+      throwRilletApiError("list bill payments", response);
+    }
+
+    return response.data?.payments ?? [];
+  }
+
+  /**
+   * Bills changed since `updatedAfter` (VERIFIED on sandbox 2026-08-13:
+   * `GET /bills?updated.gt` returns the `{ bills, pagination }` envelope,
+   * accepts `sort_by=updated`, and paying a bill bumps its `updated_at` —
+   * so the bill feed is a complete change signal for payment activity).
+   */
+  async listBillsUpdatedSince(updatedAfter: string): Promise<Rillet.Bill[]> {
+    return this.listPaginated<Rillet.Bill>(
+      `/bills?updated.gt=${encodeURIComponent(updatedAfter)}&sort_by=updated`,
+      (data) => data.bills as Rillet.Bill[] | undefined
+    );
+  }
+
+  /**
+   * All bill payments in the organization changed since `updatedAfter`
+   * (AP mirror of listInvoicePaymentsUpdatedSince).
+   *
+   * There is NO org-wide bill-payment feed: `GET /bill-payments` does not
+   * exist (VERIFIED on sandbox 2026-08-13 — 404, which threw here and killed
+   * every pull sweep). Composed instead from the two endpoints that do
+   * exist: bills changed since the cursor (payment activity bumps the
+   * bill's `updated_at`), then each changed bill's payments via
+   * GET /bills/{id}/payments. Costs one extra request per changed bill,
+   * bounded by the sweep window. Bill payments from the per-bill endpoint
+   * carry no `updated_at` of their own, so each is stamped with its bill's
+   * — the change signal that surfaced it.
+   */
+  async listBillPaymentsUpdatedSince(
+    updatedAfter: string
+  ): Promise<Rillet.BillPayment[]> {
+    const bills = await this.listBillsUpdatedSince(updatedAfter);
+
+    const payments: Rillet.BillPayment[] = [];
+    for (const bill of bills) {
+      const billPayments = await this.listBillPayments(bill.id);
+      for (const payment of billPayments) {
+        payments.push({
+          ...payment,
+          bill_id: payment.bill_id ?? bill.id,
+          updated_at: payment.updated_at ?? bill.updated_at
+        });
+      }
+    }
+    return payments;
+  }
+
+  /**
+   * Record a payment against one AR invoice (Phase G outbound write-back for a
+   * Carbon-born payment). Returns the created Rillet payment so its id can seed
+   * the composite mapping. Idempotency-Key protects against double-create on a
+   * push retry (Rillet replays the stored response for 24h).
+   *
+   * Request body is FLAT (writeEntity never wraps requests; envelopeKey only
+   * unwraps responses, and unwrapRilletEntity falls back to the flat object).
+   * VERIFIED on the bill mirror (sandbox 2026-08-11): flat body with `date`
+   * (not `payment_date`), flat response payment object. The invoice path is
+   * assumed to mirror it; not separately confirmed.
+   */
+  async createInvoicePayment(
+    invoiceId: string,
+    payment: RilletPaymentCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.InvoicePayment> {
+    return this.writeEntity({
+      method: "POST",
+      path: `/invoices/${invoiceId}/payments`,
+      envelopeKey: "payment",
+      operation: "create invoice payment",
+      payload: payment,
+      idempotencyKey
+    });
+  }
+
+  /**
+   * Record a payment against one AP bill (AP mirror of createInvoicePayment).
+   *
+   * VERIFIED (sandbox 2026-08-11): POST /bills/{id}/payments takes a FLAT
+   * body `{ amount, date, account_code, external_references? }` — `payment_date`
+   * 400s ("date must not be null") — and returns the created payment FLAT
+   * (`{ id, status, bill_id, amount, date, account_code }`, status UNCLEARED);
+   * unwrapRilletEntity's flat fallback handles it.
+   */
+  async createBillPayment(
+    billId: string,
+    payment: RilletPaymentCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.BillPayment> {
+    return this.writeEntity({
+      method: "POST",
+      path: `/bills/${billId}/payments`,
+      envelopeKey: "payment",
+      operation: "create bill payment",
+      payload: payment,
+      idempotencyKey
+    });
+  }
+
+  /**
+   * Record a payment against one employee reimbursement.
+   *
+   * `POST /reimbursements/{id}/payments` — the AP-payout sibling of
+   * `createBillPayment`, and deliberately the same call shape: its request
+   * body is the identical required trio `{ amount, date, account_code }`
+   * (VERIFIED against Rillet's published OpenAPI,
+   * docs.api.rillet.com/reference/create-a-reimbursement-payment,
+   * 2026-09-23), and the response is flat
+   * (`{ id, status, reimbursement_id, amount, date, account_code }`), which
+   * `unwrapRilletEntity`'s flat fallback handles.
+   *
+   * `external_references` is NOT in the documented body for this endpoint —
+   * nor for `/bills/{id}/payments`, which nonetheless accepted it on the
+   * sandbox (2026-08-11). The shared `RilletPaymentCreate` therefore still
+   * carries it here; VERIFY on the sandbox before shipping, since an
+   * endpoint that rejects unknown fields would 400 the whole payout.
+   */
+  async createReimbursementPayment(
+    reimbursementId: string,
+    payment: RilletPaymentCreate,
+    idempotencyKey?: string
+  ): Promise<Rillet.ReimbursementPayment> {
+    return this.writeEntity({
+      method: "POST",
+      path: `/reimbursements/${reimbursementId}/payments`,
+      envelopeKey: "payment",
+      operation: "create reimbursement payment",
+      payload: payment,
+      idempotencyKey
+    });
+  }
+
+  /**
+   * SupportsIncrementalPull: invoice AND bill payments changed since `since`,
+   * for the generic accounting-pull-sweep cron. Both feeds are organization-
+   * wide while this instance owns one subsidiary, so every change carries a
+   * dependsOnMapping on its document (invoice for AR, bill for AP) — the sweep
+   * drops changes whose document has no local mapping (another instance's
+   * subsidiary, or a document created directly in Rillet) without ledger noise.
+   * Payments missing their document id cannot be addressed (composite id) and
+   * are logged and dropped.
+   */
+  async listChanges(args: { since: string }): Promise<ListChangesResult> {
+    const paymentConfig = this.getSyncConfig("payment");
+    if (!paymentConfig.enabled) {
+      return { changes: [] };
+    }
+
+    const changes: ProviderChange[] = [];
+
+    // AR — invoice payments settle Carbon sales invoices.
+    const invoicePayments = await this.listInvoicePaymentsUpdatedSince(
+      args.since
+    );
+    for (const payment of invoicePayments) {
+      if (!payment.invoice_id) {
+        console.warn(
+          `[Rillet] ignoring invoice payment ${payment.id} with no invoice_id`
+        );
+        continue;
+      }
+      changes.push({
+        entityType: "payment",
+        remoteId: getRilletPaymentSyncEntityId(payment.invoice_id, payment.id),
+        updatedAt: payment.updated_at ?? null,
+        dependsOnMapping: {
+          entityType: "invoice",
+          remoteId: payment.invoice_id
+        }
+      });
+    }
+
+    // AP — bill payments settle Carbon purchase invoices. Poll is the
+    // correctness guarantee: Rillet documents no bill-payment webhook event
+    // (only bill-created/updated/deleted), so this feed is the only mechanism.
+    const billPayments = await this.listBillPaymentsUpdatedSince(args.since);
+    for (const payment of billPayments) {
+      if (!payment.bill_id) {
+        console.warn(
+          `[Rillet] ignoring bill payment ${payment.id} with no bill_id`
+        );
+        continue;
+      }
+      changes.push({
+        entityType: "payment",
+        remoteId: getRilletBillPaymentSyncEntityId(payment.bill_id, payment.id),
+        updatedAt: payment.updated_at ?? null,
+        dependsOnMapping: {
+          entityType: "bill",
+          remoteId: payment.bill_id
+        }
+      });
+    }
+
+    return { changes };
+  }
+}

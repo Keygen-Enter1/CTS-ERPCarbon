@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { generateProductLabelZPL } from "@carbon/documents/zpl";
+import type { TrackedEntityAttributes } from "@carbon/utils";
+import { labelSizes, redirect } from "@carbon/utils";
+import type { LoaderFunctionArgs } from "react-router";
+import { getReceiptTracking } from "~/modules/inventory/inventory.service";
+import { getDocumentTemplateConfig } from "~/modules/settings";
+import {
+  getCompanyLogoForLabel,
+  resolveLabelLogo
+} from "~/modules/settings/labelLogo.server";
+import { getCompanySettings } from "~/modules/settings/settings.service";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "inventory"
+  });
+
+  const { id } = params;
+  if (!id) throw new Error("Could not find id");
+
+  const [companySettings, receiptLineTracking] = await Promise.all([
+    getCompanySettings(client, companyId),
+    getReceiptTracking(client, id, companyId)
+  ]);
+
+  const url = new URL(request.url);
+  const labelParam = url.searchParams.get("labelSize");
+  const lineIdParam = url.searchParams.get("lineId");
+  const labelSizeId =
+    labelParam || companySettings.data?.productLabelSize || "label2x1";
+
+  // Find the label size configuration
+  let labelSize = labelSizes.find((size) => size.id === labelSizeId);
+
+  if (!labelSize) {
+    throw new Error("Invalid label size");
+  }
+
+  if (!labelSize.zpl) {
+    throw redirect(
+      path.to.file.receiptLabelsPdf(id, {
+        labelSize: labelSize.id,
+        lineId: lineIdParam ?? undefined
+      })
+    );
+  }
+
+  let filteredTracking = receiptLineTracking.data;
+
+  // Filter by lineId if provided
+  if (lineIdParam) {
+    filteredTracking =
+      filteredTracking?.filter(
+        (tracking) =>
+          tracking.attributes &&
+          (tracking.attributes as TrackedEntityAttributes)["Receipt Line"] ===
+            lineIdParam
+      ) ?? [];
+  }
+
+  const items = filteredTracking
+    ?.map((tracking) => ({
+      itemId: tracking.sourceDocumentReadableId ?? "",
+      revision: "0",
+      number: tracking.readableId ?? "",
+      trackedEntityId: tracking.id,
+      quantity: tracking.quantity,
+      trackingType: tracking.quantity > 1 ? "Batch" : "Serial"
+    }))
+    .sort((a, b) => {
+      if (a.itemId === b.itemId) {
+        return a.number.localeCompare(b.number);
+      }
+      return a.itemId.localeCompare(b.itemId);
+    });
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return new Response(
+      `No items found for receipt ${id}${
+        lineIdParam ? ` and line ${lineIdParam}` : ""
+      }`,
+      { status: 404 }
+    );
+  }
+
+  if (!labelSize?.zpl) {
+    throw new Error("Invalid label size or missing ZPL configuration");
+  }
+
+  const template = await getDocumentTemplateConfig(
+    client,
+    companyId,
+    "trackingLabel"
+  );
+
+  const companyLogo = await getCompanyLogoForLabel(client, companyId);
+  const logo = await resolveLabelLogo(companyLogo, template, labelSize);
+
+  // Generate ZPL for each item
+  const zplCommands = items.map((item) =>
+    generateProductLabelZPL(item, labelSize, template, logo)
+  );
+  const zplOutput = zplCommands.join("\n");
+
+  const headers = new Headers({
+    "Content-Type": "application/zpl",
+    "Content-Disposition": `attachment; filename="labels-${id}.zpl"`
+  });
+
+  return new Response(zplOutput, { status: 200, headers });
+}

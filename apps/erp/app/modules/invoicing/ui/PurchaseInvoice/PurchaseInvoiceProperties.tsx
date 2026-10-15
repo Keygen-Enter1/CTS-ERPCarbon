@@ -1,0 +1,498 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Json } from "@carbon/database";
+import { DatePicker, InputControlled, ValidatedForm } from "@carbon/form";
+import { useAction } from "@carbon/query";
+import {
+  Button,
+  Copy,
+  HStack,
+  IconButton,
+  Subheading,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  toast,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useCallback } from "react";
+import {
+  LuCopy,
+  LuInfo,
+  LuKeySquare,
+  LuLink,
+  LuRefreshCcw
+} from "react-icons/lu";
+import { useFetcher, useParams } from "react-router";
+import { z } from "zod";
+import { zfd } from "zod-form-data";
+import { Assignee, DateTime, useOptimisticAssignment } from "~/components";
+import {
+  Currency,
+  Location,
+  PaymentTerm,
+  Supplier,
+  SupplierContact,
+  SupplierLocation
+} from "~/components/Form";
+import CustomFormInlineFields from "~/components/Form/CustomFormInlineFields";
+import {
+  usePermissions,
+  useRouteData,
+  useSupplierApprovalRequired,
+  useUser
+} from "~/hooks";
+import type { action as exchangeRateAction } from "~/routes/x+/purchase-invoice+/$invoiceId.exchange-rate";
+import type { action } from "~/routes/x+/purchase-invoice+/update";
+import { path } from "~/utils/path";
+import { copyToClipboard } from "~/utils/string";
+import { isPurchaseInvoiceLocked } from "../../invoicing.models";
+import type { PurchaseInvoice } from "../../types";
+
+const PurchaseInvoiceProperties = () => {
+  const { t } = useLingui();
+  const { invoiceId } = useParams();
+  if (!invoiceId) throw new Error("invoiceId not found");
+
+  const routeData = useRouteData<{
+    purchaseInvoice: PurchaseInvoice;
+  }>(path.to.purchaseInvoice(invoiceId));
+
+  const fetcher = useAction<typeof action>({
+    onError: (data) => {
+      if (data?.error) {
+        toast.error(data.error.message);
+      }
+    }
+  });
+  const { company } = useUser();
+  const exchangeRateFetcher = useFetcher<typeof exchangeRateAction>();
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  const onUpdate = useCallback(
+    (field: keyof PurchaseInvoice, value: string | null) => {
+      if (value === routeData?.purchaseInvoice[field]) {
+        return;
+      }
+      const formData = new FormData();
+
+      formData.append("ids", invoiceId);
+      formData.append("field", field);
+      formData.append("value", value ?? "");
+      fetcher.submit(formData, {
+        method: "post",
+        action: path.to.bulkUpdatePurchaseInvoice
+      });
+    },
+
+    [invoiceId, routeData?.purchaseInvoice]
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  const onUpdateCustomFields = useCallback(
+    (value: string) => {
+      const formData = new FormData();
+
+      formData.append("ids", invoiceId);
+      formData.append("table", "purchaseInvoice");
+      formData.append("value", value);
+
+      fetcher.submit(formData, {
+        method: "post",
+        action: path.to.customFields
+      });
+    },
+
+    [invoiceId]
+  );
+
+  const permissions = usePermissions();
+  const supplierApprovalRequired = useSupplierApprovalRequired();
+  const optimisticAssignment = useOptimisticAssignment({
+    id: invoiceId,
+    table: "purchaseInvoice"
+  });
+  const assignee =
+    optimisticAssignment !== undefined
+      ? optimisticAssignment
+      : routeData?.purchaseInvoice?.assignee;
+
+  const canUpdate = permissions.can("update", "invoicing");
+  const isLocked = isPurchaseInvoiceLocked(routeData?.purchaseInvoice?.status);
+  const isDisabled = !canUpdate || isLocked;
+
+  return (
+    <VStack
+      spacing={4}
+      className="w-96 bg-background/30 h-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent border-l border-border px-4 py-2 text-sm"
+    >
+      <VStack spacing={4}>
+        <HStack className="w-full justify-between">
+          <Subheading as="h3" variant="light">
+            <Trans>Properties</Trans>
+          </Subheading>
+          <HStack spacing={1}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  aria-label={t`Link`}
+                  size="sm"
+                  className="p-1"
+                  onClick={() =>
+                    copyToClipboard(
+                      window.location.origin +
+                        path.to.purchaseInvoiceDetails(invoiceId)
+                    )
+                  }
+                >
+                  <LuLink className="w-3 h-3" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span>Copy link to Purchase Invoice</span>
+              </TooltipContent>
+            </Tooltip>
+            <Copy
+              text={invoiceId}
+              label={t`Copy purchase invoice unique identifier`}
+              icon={<LuKeySquare className="size-3" />}
+              variant="ghost"
+              className="w-auto"
+            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  aria-label={t`Copy`}
+                  size="sm"
+                  className="p-1"
+                  onClick={() =>
+                    copyToClipboard(routeData?.purchaseInvoice?.invoiceId ?? "")
+                  }
+                >
+                  <LuCopy className="w-3 h-3" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span>Copy Purchase Invoice number</span>
+              </TooltipContent>
+            </Tooltip>
+          </HStack>
+        </HStack>
+        <span className="text-sm">{routeData?.purchaseInvoice?.invoiceId}</span>
+      </VStack>
+
+      <Assignee
+        id={invoiceId}
+        table="purchaseInvoice"
+        value={assignee ?? ""}
+        variant="inline"
+        isReadOnly={!canUpdate}
+      />
+
+      <ValidatedForm
+        defaultValues={{ supplierId: routeData?.purchaseInvoice?.supplierId }}
+        validator={z.object({
+          supplierId: z.string().min(1, { message: "Supplier is required" })
+        })}
+        className="w-full"
+      >
+        <Supplier
+          name="supplierId"
+          inline
+          isReadOnly={isDisabled}
+          onlyApproved={supplierApprovalRequired}
+          defaultCurrencyCode={
+            routeData?.purchaseInvoice?.currencyCode ?? undefined
+          }
+          onChange={(value) => {
+            if (value?.value) {
+              onUpdate("supplierId", value.value);
+            }
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          supplierReference:
+            routeData?.purchaseInvoice?.supplierReference ?? undefined
+        }}
+        validator={z.object({
+          supplierReference: zfd.text(z.string().optional())
+        })}
+        className="w-full"
+      >
+        <InputControlled
+          name="supplierReference"
+          label={t`Supplier Ref. Number`}
+          value={routeData?.purchaseInvoice?.supplierReference ?? ""}
+          size="sm"
+          inline
+          isReadOnly={isDisabled}
+          onBlur={(e) => {
+            onUpdate("supplierReference", e.target.value);
+          }}
+        />
+      </ValidatedForm>
+      <ValidatedForm
+        defaultValues={{
+          invoiceSupplierId: routeData?.purchaseInvoice?.invoiceSupplierId
+        }}
+        validator={z.object({
+          invoiceSupplierId: z
+            .string()
+            .min(1, { message: "Supplier is required" })
+        })}
+        className="w-full"
+      >
+        <Supplier
+          name="invoiceSupplierId"
+          label={t`Invoice Supplier`}
+          inline
+          isReadOnly={isDisabled}
+          onlyApproved={supplierApprovalRequired}
+          defaultCurrencyCode={
+            routeData?.purchaseInvoice?.currencyCode ?? undefined
+          }
+          onChange={(value) => {
+            if (value?.value) {
+              onUpdate("invoiceSupplierId", value.value);
+            }
+          }}
+        />
+      </ValidatedForm>
+      <ValidatedForm
+        defaultValues={{
+          invoiceSupplierLocationId:
+            routeData?.purchaseInvoice?.invoiceSupplierLocationId ?? ""
+        }}
+        validator={z.object({
+          invoiceSupplierLocationId: zfd.text(z.string().optional())
+        })}
+        className="w-full"
+      >
+        <SupplierLocation
+          name="invoiceSupplierLocationId"
+          label={t`Invoice Supplier Location`}
+          supplier={routeData?.purchaseInvoice?.invoiceSupplierId ?? ""}
+          inline
+          isReadOnly={isDisabled}
+          onChange={(supplierLocation) => {
+            if (supplierLocation?.id) {
+              onUpdate("invoiceSupplierLocationId", supplierLocation.id);
+            }
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          invoiceSupplierContactId:
+            routeData?.purchaseInvoice?.invoiceSupplierContactId ?? ""
+        }}
+        validator={z.object({
+          invoiceSupplierContactId: zfd.text(z.string().optional())
+        })}
+        className="w-full"
+      >
+        <SupplierContact
+          name="invoiceSupplierContactId"
+          label={t`Invoice Supplier Contact`}
+          supplier={routeData?.purchaseInvoice?.invoiceSupplierId ?? ""}
+          inline
+          isReadOnly={isDisabled}
+          onChange={(supplierContact) => {
+            if (supplierContact?.id) {
+              onUpdate("invoiceSupplierContactId", supplierContact.id);
+            }
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          dateIssued: routeData?.purchaseInvoice?.dateIssued ?? ""
+        }}
+        validator={z.object({
+          dateIssued: z.string().min(1, { message: "Invoice date is required" })
+        })}
+        className="w-full"
+      >
+        <DatePicker
+          name="dateIssued"
+          label={t`Date Issued`}
+          inline
+          isDisabled={!canUpdate}
+          value={routeData?.purchaseInvoice?.dateIssued ?? ""}
+          onChange={(date) => {
+            onUpdate("dateIssued", date);
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          dateDue: routeData?.purchaseInvoice?.dateDue ?? ""
+        }}
+        validator={z.object({
+          dateDue: zfd.text(z.string().optional())
+        })}
+        className="w-full"
+      >
+        <DatePicker
+          name="dateDue"
+          label={t`Date Due`}
+          inline
+          isDisabled={!canUpdate}
+          value={routeData?.purchaseInvoice?.dateDue ?? ""}
+          onChange={(date) => {
+            onUpdate("dateDue", date);
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          datePaid: routeData?.purchaseInvoice?.datePaid ?? ""
+        }}
+        validator={z.object({
+          datePaid: zfd.text(z.string().optional())
+        })}
+        className="w-full"
+      >
+        <DatePicker
+          name="datePaid"
+          label={t`Date Paid`}
+          inline
+          isDisabled={!canUpdate}
+          value={routeData?.purchaseInvoice?.datePaid ?? ""}
+          onChange={(date) => {
+            onUpdate("datePaid", date);
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{ locationId: routeData?.purchaseInvoice?.locationId }}
+        validator={z.object({
+          locationId: z.string().min(1, { message: "Location is required" })
+        })}
+        className="w-full"
+      >
+        <Location
+          label={t`Location`}
+          name="locationId"
+          inline
+          isReadOnly={isDisabled}
+          onChange={(value) => {
+            if (value?.value) {
+              onUpdate("locationId", value.value);
+            }
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          paymentTermId: routeData?.purchaseInvoice?.paymentTermId
+        }}
+        validator={z.object({
+          paymentTermId: z
+            .string()
+            .min(1, { message: "Payment term is required" })
+        })}
+        className="w-full"
+      >
+        <PaymentTerm
+          label={t`Payment Term`}
+          name="paymentTermId"
+          inline
+          isReadOnly={isDisabled}
+          onChange={(value) => {
+            if (value?.value) {
+              onUpdate("paymentTermId", value.value);
+            }
+          }}
+        />
+      </ValidatedForm>
+
+      <ValidatedForm
+        defaultValues={{
+          currencyCode: routeData?.purchaseInvoice?.currencyCode ?? undefined
+        }}
+        validator={z.object({
+          currencyCode: zfd.text(z.string().optional())
+        })}
+        className="w-full"
+      >
+        <Currency
+          name="currencyCode"
+          label={t`Currency`}
+          inline
+          value={routeData?.purchaseInvoice?.currencyCode ?? ""}
+          isReadOnly={isDisabled}
+          onChange={(value) => {
+            if (value?.value) {
+              onUpdate("currencyCode", value.value);
+            }
+          }}
+        />
+      </ValidatedForm>
+
+      {routeData?.purchaseInvoice?.currencyCode &&
+        routeData?.purchaseInvoice?.currencyCode !==
+          company.baseCurrencyCode && (
+          <VStack spacing={2}>
+            <HStack spacing={1}>
+              <span className="text-xs text-muted-foreground">
+                Exchange Rate
+              </span>
+              {routeData?.purchaseInvoice?.exchangeRateUpdatedAt && (
+                <DateTime
+                  value={routeData?.purchaseInvoice?.exchangeRateUpdatedAt}
+                  variant="absolute"
+                  side="bottom"
+                >
+                  <LuInfo className="h-4 w-4 text-muted-foreground" />
+                </DateTime>
+              )}
+            </HStack>
+            <HStack className="w-full justify-between">
+              <span>{routeData?.purchaseInvoice?.exchangeRate}</span>
+              <IconButton
+                size="sm"
+                variant="secondary"
+                aria-label={t`Refresh`}
+                icon={<LuRefreshCcw />}
+                isDisabled={isDisabled}
+                onClick={() => {
+                  exchangeRateFetcher.submit(null, {
+                    method: "post",
+                    action: path.to.purchaseInvoiceExchangeRate(invoiceId)
+                  });
+                }}
+              />
+            </HStack>
+          </VStack>
+        )}
+      <CustomFormInlineFields
+        customFields={
+          (routeData?.purchaseInvoice?.customFields ?? {}) as Record<
+            string,
+            Json
+          >
+        }
+        table="purchaseInvoice"
+        tags={[]}
+        onUpdate={onUpdateCustomFields}
+      />
+    </VStack>
+  );
+};
+
+export default PurchaseInvoiceProperties;

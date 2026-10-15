@@ -1,0 +1,1642 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useCarbon } from "@carbon/auth";
+import { getLogger } from "@carbon/logger";
+import {
+  Button,
+  Card,
+  CardAction,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  Input,
+  NumberField,
+  NumberInput,
+  Switch,
+  Table,
+  Tbody,
+  Td,
+  Th,
+  Thead,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  Tr,
+  toast,
+  VStack
+} from "@carbon/react";
+import { INPUT_FORMAT, round } from "@carbon/utils";
+import { getLocalTimeZone, today } from "@internationalized/date";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  LuCalculator,
+  LuCalendarClock,
+  LuChevronDown,
+  LuChevronRight,
+  LuCirclePlus,
+  LuInfo,
+  LuRefreshCcw,
+  LuTrash
+} from "react-icons/lu";
+import { useFetcher, useParams } from "react-router";
+import EditableNumberCell from "~/components/EditableNumberCell";
+import {
+  useCurrencyDecimals,
+  useCurrencyFormatter,
+  usePercentFormatter,
+  usePermissions,
+  useRouteData,
+  useSettings,
+  useUser
+} from "~/hooks";
+import type {
+  action as priceTraceAction,
+  loader as priceTraceLoader
+} from "~/routes/x+/quote+/$quoteId.$lineId.price-trace";
+import { path } from "~/utils/path";
+import {
+  type CostCategoryKey,
+  costCategoryKeys,
+  quoteLineAdditionalChargesValidator,
+  quoteLineCategoryMarkupsValidator
+} from "../../sales.models";
+import {
+  asConfiguration,
+  QUOTE_BASE_PRICE_SOURCES,
+  withBasePriceSource
+} from "../../sales.utils";
+import type {
+  Costs,
+  PriceResolutionResult,
+  PriceTraceStep,
+  Quotation,
+  QuotationLine,
+  QuotationPrice
+} from "../../types";
+import { hasPriceAdjustments } from "../Pricing/PriceTraceModal";
+import { CostRowLabel, costRowLabelCellClass } from "./CostRowLabel";
+import QuoteLeadTimeModal from "./QuoteLeadTimeModal";
+import QuoteLinePriceTraceModal from "./QuoteLinePriceTraceModal";
+
+const logger = getLogger("erp", "sales", "quote-line-pricing");
+
+const categoryLabels: Record<CostCategoryKey, string> = {
+  materialCost: "Material",
+  partCost: "Part",
+  toolCost: "Tool",
+  consumableCost: "Consumable",
+  serviceCost: "Service",
+  laborCost: "Labor",
+  machineCost: "Machine",
+  overheadCost: "Overhead",
+  outsideCost: "Outside"
+};
+
+const QuoteLinePricing = ({
+  line,
+  pricesByQuantity,
+  exchangeRate,
+  getLineCosts
+}: {
+  line: QuotationLine;
+  pricesByQuantity: Record<number, QuotationPrice>;
+  exchangeRate: number;
+  getLineCosts: (quantity: number) => Costs;
+}) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+
+  const hasCalculatedCost = line.methodType !== "Pull from Inventory";
+  // Present quantity breaks least-to-greatest; every column loop and the
+  // derived `...ByQuantity` arrays read from this one variable.
+  const quantities = [...new Set(line.quantity ?? [1])].sort((a, b) => a - b);
+
+  const { quoteId, lineId } = useParams();
+  if (!quoteId) throw new Error("Could not find quoteId");
+  if (!lineId) throw new Error("Could not find lineId");
+
+  // Consolidated state for all editable fields
+  const [editableFields, setEditableFields] = useState({
+    prices: pricesByQuantity,
+    unitCost: line.unitCost ?? 0,
+    additionalCharges: line.additionalCharges || {},
+    taxPercent: line.taxPercent ?? 0
+  });
+
+  const [showCategoryMarkups, setShowCategoryMarkups] = useState(false);
+  const [customMarkup, setCustomMarkup] = useState("");
+
+  useEffect(() => {
+    setEditableFields((prev) => ({
+      ...prev,
+      prices: pricesByQuantity,
+      unitCost: line.unitCost ?? 0,
+      additionalCharges: line.additionalCharges || {},
+      taxPercent: line.taxPercent ?? 0
+    }));
+  }, [
+    pricesByQuantity,
+    line.unitCost,
+    line.additionalCharges,
+    line.taxPercent
+  ]);
+
+  const settings = useSettings();
+  const defaultCategoryMarkups = useMemo(() => {
+    const raw = quoteLineCategoryMarkupsValidator.parse(
+      (settings as Record<string, unknown>).quoteLineCategoryMarkups ?? {}
+    );
+    // Settings stores decimals (0.5 = 50%), but quote line markups use whole numbers (50 = 50%)
+    const converted: Record<string, number> = {};
+    for (const [key, value] of Object.entries(raw)) {
+      converted[key] = value * 100;
+    }
+    return converted;
+  }, [settings]);
+
+  const categoryMarkupsByQuantity = useMemo(() => {
+    const result: Record<number, Record<string, number>> = {};
+    for (const quantity of quantities) {
+      const priceMarkups = quoteLineCategoryMarkupsValidator.parse(
+        (editableFields.prices[quantity] as Record<string, unknown>)
+          ?.categoryMarkups ?? {}
+      );
+      result[quantity] =
+        Object.keys(priceMarkups).length > 0
+          ? priceMarkups
+          : defaultCategoryMarkups;
+    }
+    return result;
+  }, [editableFields.prices, quantities, defaultCategoryMarkups]);
+
+  const unitPricePrecision = line.unitPricePrecision ?? 2;
+
+  const routeData = useRouteData<{
+    quote: Quotation;
+  }>(path.to.quote(quoteId));
+  const isEmployee = permissions.is("employee");
+  const isEditable =
+    permissions.can("update", "sales") &&
+    isEmployee &&
+    ["Draft"].includes(routeData?.quote?.status ?? "");
+
+  const fetcher = useFetcher<{ id?: string; error: string | null }>();
+  useEffect(() => {
+    if (fetcher.data?.error) {
+      toast.error(fetcher.data.error);
+    }
+  }, [fetcher.data]);
+
+  const { carbon } = useCarbon();
+  const { id: userId, company } = useUser();
+  const baseCurrency = company?.baseCurrencyCode ?? "USD";
+  const currencyDecimals = useCurrencyDecimals(baseCurrency);
+
+  const formatter = useCurrencyFormatter();
+  const percentFormatter = usePercentFormatter();
+  // Base currency: every value this formats (unit costs, category costs, net
+  // unit prices) reads a base-currency column. The quote-currency figures live
+  // in the converted rows below, behind the `currencyCode !== baseCurrency` gate.
+  const unitPriceFormatter = useCurrencyFormatter({
+    rate: true,
+    currency: baseCurrency,
+    decimalPlaces: unitPricePrecision
+  });
+  const presentationCurrencyFormatter = useCurrencyFormatter({
+    currency: routeData?.quote?.currencyCode ?? baseCurrency,
+    decimalPlaces: unitPricePrecision
+  });
+
+  const additionalCharges = useMemo(() => {
+    const parsedAdditionalCharges =
+      quoteLineAdditionalChargesValidator.safeParse(
+        editableFields.additionalCharges
+      );
+
+    return parsedAdditionalCharges.success ? parsedAdditionalCharges.data : {};
+  }, [editableFields.additionalCharges]);
+
+  const additionalChargesByQuantity = quantities.map((quantity) => {
+    const charges = Object.values(additionalCharges).reduce((acc, charge) => {
+      const amount = charge.amounts?.[quantity] ?? 0;
+      return acc + amount;
+    }, 0);
+    return charges;
+  });
+
+  const taxableAdditionalChargesByQuantity = quantities.map((quantity) => {
+    return Object.values(additionalCharges).reduce((acc, charge) => {
+      if (charge.taxable === false) return acc;
+      return acc + (charge.amounts?.[quantity] ?? 0);
+    }, 0);
+  });
+
+  const onUpdateChargeDescription = useCallback(
+    async (chargeId: string, description: string) => {
+      const updatedCharges = {
+        ...additionalCharges,
+        [chargeId]: {
+          ...additionalCharges[chargeId],
+          description
+        }
+      };
+
+      setEditableFields((prev) => {
+        return {
+          ...prev,
+          additionalCharges: updatedCharges
+        };
+      });
+
+      const costUpdate = await carbon
+        ?.from("quoteLine")
+        .update({
+          additionalCharges: updatedCharges
+        })
+        .eq("id", lineId);
+
+      if (costUpdate?.error) {
+        logger.error("Failed to update quote line pricing", {
+          error: costUpdate.error
+        });
+        toast.error(t`Failed to update quote line`);
+      }
+    },
+    [additionalCharges, lineId, carbon, t]
+  );
+
+  const onUpdateChargeAmount = useCallback(
+    async (chargeId: string, quantity: number, amount: number) => {
+      const updatedCharges = {
+        ...additionalCharges,
+        [chargeId]: {
+          ...additionalCharges[chargeId],
+          amounts: {
+            ...additionalCharges[chargeId].amounts,
+            [quantity]: amount
+          }
+        }
+      };
+
+      setEditableFields((prev) => ({
+        ...prev,
+        additionalCharges: updatedCharges
+      }));
+
+      const costUpdate = await carbon
+        ?.from("quoteLine")
+        .update({
+          additionalCharges: updatedCharges
+        })
+        .eq("id", lineId);
+
+      if (costUpdate?.error) {
+        logger.error("Failed to update quote line pricing", {
+          error: costUpdate.error
+        });
+        toast.error("Failed to update quote line");
+      }
+    },
+    [additionalCharges, carbon, lineId]
+  );
+
+  const onUpdateChargeTaxable = useCallback(
+    async (chargeId: string, taxable: boolean) => {
+      const updatedCharges = {
+        ...additionalCharges,
+        [chargeId]: {
+          ...additionalCharges[chargeId],
+          taxable
+        }
+      };
+
+      setEditableFields((prev) => ({
+        ...prev,
+        additionalCharges: updatedCharges
+      }));
+
+      const costUpdate = await carbon
+        ?.from("quoteLine")
+        .update({ additionalCharges: updatedCharges })
+        .eq("id", lineId);
+
+      if (costUpdate?.error) {
+        logger.error("Failed to update quote line pricing", {
+          error: costUpdate.error
+        });
+        toast.error("Failed to update quote line");
+      }
+    },
+    [additionalCharges, lineId, carbon]
+  );
+
+  const costsByQuantity = quantities.map((quantity) => {
+    const costs = getLineCosts(quantity);
+    return {
+      materialCost: costs.materialCost / quantity,
+      partCost: costs.partCost / quantity,
+      toolCost: costs.toolCost / quantity,
+      consumableCost: costs.consumableCost / quantity,
+      serviceCost: costs.serviceCost / quantity,
+      laborCost: costs.laborCost / quantity,
+      machineCost: costs.machineCost / quantity,
+      overheadCost: costs.overheadCost / quantity,
+      outsideCost: costs.outsideCost / quantity
+    };
+  });
+
+  const unitCostsByQuantity = hasCalculatedCost
+    ? costsByQuantity.map((costs) =>
+        Object.values(costs).reduce((sum, v) => sum + v, 0)
+      )
+    : quantities.map(() => editableFields.unitCost);
+
+  const computeUnitPriceFromMarkups = useCallback(
+    (
+      categoryCosts: Record<CostCategoryKey, number>,
+      markups: Record<string, number>
+    ): number => {
+      return costCategoryKeys.reduce((sum, key) => {
+        const cost = categoryCosts[key] ?? 0;
+        const markup = markups[key] ?? 0;
+        return sum + cost * (1 + markup / 100);
+      }, 0);
+    },
+    []
+  );
+
+  const visibleCategories = costCategoryKeys.filter((key: CostCategoryKey) =>
+    costsByQuantity.some((costs) => costs[key] > 0)
+  );
+
+  const netPricesByQuantity = quantities.map((quantity, index) => {
+    const price = editableFields.prices[quantity]?.unitPrice ?? 0;
+    const discount = editableFields.prices[quantity]?.discountPercent ?? 0;
+    const netPrice = price * (1 - discount);
+    return netPrice;
+  });
+
+  // A cost-plus rollup is only the starting price: the line's pricing rules,
+  // including its configuration prices, apply on top — the same pipeline as
+  // recalculateQuoteLinePrices on the server. Returns the price with the trace
+  // that explains it (stored alongside); null when the rules could not be
+  // applied.
+  const customerId = routeData?.quote?.customerId;
+  const [isRepricing, setIsRepricing] = useState(false);
+  const resolveRollupPrice = useCallback(
+    async (
+      quantity: number,
+      rollupPrice: number
+    ): Promise<{
+      unitPrice: number;
+      priceTrace: PriceTraceStep[] | null;
+    } | null> => {
+      if (!line.itemId) {
+        return {
+          unitPrice: round(rollupPrice, unitPricePrecision),
+          priceTrace: null
+        };
+      }
+      const configuration = asConfiguration(line.configuration);
+      try {
+        const response = await fetch(path.to.api.salesResolvePrice, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            itemId: line.itemId,
+            quantity,
+            existingBasePrice: rollupPrice,
+            ...(customerId ? { customerId } : {}),
+            ...(configuration ? { configuration } : {})
+          })
+        });
+        if (!response.ok) {
+          logger.error("Failed to resolve quote line price", {
+            lineId,
+            quantity,
+            status: response.status
+          });
+          return null;
+        }
+        const result: PriceResolutionResult = await response.json();
+        return {
+          unitPrice: round(result.finalPrice, unitPricePrecision),
+          priceTrace: withBasePriceSource(
+            result.trace,
+            QUOTE_BASE_PRICE_SOURCES.costPlus
+          )
+        };
+      } catch (error) {
+        logger.error("Failed to resolve quote line price", {
+          lineId,
+          quantity,
+          error
+        });
+        return null;
+      }
+    },
+    [line.itemId, line.configuration, customerId, lineId, unitPricePrecision]
+  );
+
+  const onRecalculate = async (markup: number) => {
+    const newMarkups: Record<string, number> = {};
+    for (const key of costCategoryKeys) {
+      newMarkups[key] = markup;
+    }
+
+    const newCategoryMarkupsByQuantity: Record<
+      string,
+      Record<string, number>
+    > = {};
+    for (const quantity of quantities) {
+      newCategoryMarkupsByQuantity[quantity] = newMarkups;
+    }
+
+    setIsRepricing(true);
+    const resolvedByQuantity = await Promise.all(
+      costsByQuantity.map((costs, index) =>
+        resolveRollupPrice(
+          quantities[index],
+          computeUnitPriceFromMarkups(costs, newMarkups)
+        )
+      )
+    );
+    setIsRepricing(false);
+
+    if (resolvedByQuantity.some((resolved) => resolved === null)) {
+      toast.error(t`Failed to apply pricing rules`);
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append(
+      "unitPricesByQuantity",
+      JSON.stringify(resolvedByQuantity.map((resolved) => resolved!.unitPrice))
+    );
+    formData.append(
+      "priceTracesByQuantity",
+      JSON.stringify(resolvedByQuantity.map((resolved) => resolved!.priceTrace))
+    );
+    formData.append("quantities", JSON.stringify(quantities));
+    formData.append(
+      "categoryMarkupsByQuantity",
+      JSON.stringify(newCategoryMarkupsByQuantity)
+    );
+    fetcher.submit(formData, {
+      method: "post",
+      action: path.to.quoteLineRecalculatePrice(quoteId, lineId)
+    });
+  };
+
+  const onUpdatePrecision = (precision: number | string) => {
+    const formData = new FormData();
+    formData.append("precision", precision.toString());
+    fetcher.submit(formData, {
+      method: "post",
+      action: path.to.quoteLineUpdatePrecision(quoteId, lineId)
+    });
+  };
+
+  const onUpdateCost = useCallback(
+    async (value: number) => {
+      if (!line.itemId) return;
+
+      setEditableFields((prev) => ({
+        ...prev,
+        unitCost: value
+      }));
+
+      const costUpdate = await carbon
+        ?.from("itemCost")
+        .update({
+          unitCost: value,
+          costIsAdjusted: true,
+          updatedAt: today(getLocalTimeZone()).toString()
+        })
+        .eq("itemId", line.itemId)
+        .single();
+
+      if (costUpdate?.error) {
+        logger.error("Failed to update quote line pricing", {
+          error: costUpdate.error
+        });
+        toast.error(t`Failed to update item cost`);
+      }
+    },
+    [carbon, line.itemId, t]
+  );
+
+  const onUpdateCategoryMarkup = useCallback(
+    async (category: CostCategoryKey, quantity: number, value: number) => {
+      const existingMarkups = categoryMarkupsByQuantity[quantity] ?? {};
+      const newMarkups = {
+        ...existingMarkups,
+        [category]: value
+      };
+
+      const quantityIndex = quantities.indexOf(quantity);
+      const categoryCosts = costsByQuantity[quantityIndex];
+      const resolved = await resolveRollupPrice(
+        quantity,
+        computeUnitPriceFromMarkups(categoryCosts, newMarkups)
+      );
+      if (resolved === null) {
+        toast.error(t`Failed to apply pricing rules`);
+        return;
+      }
+      const { unitPrice, priceTrace } = resolved;
+
+      setEditableFields((prev) => ({
+        ...prev,
+        prices: {
+          ...prev.prices,
+          [quantity]: {
+            ...prev.prices[quantity],
+            categoryMarkups: newMarkups,
+            priceSource: "system",
+            unitPrice,
+            priceTrace
+          }
+        }
+      }));
+
+      // Editing a per-category markup is explicit cost-plus intent: the row
+      // goes back to system pricing so BOM changes reprice it from these
+      // markups.
+      const priceUpdate = await carbon
+        ?.from("quoteLinePrice")
+        .update({
+          categoryMarkups: newMarkups,
+          priceSource: "system",
+          unitPrice,
+          priceTrace
+        })
+        .eq("quoteLineId", lineId)
+        .eq("quantity", quantity)
+        .eq("companyId", company.id);
+
+      if (priceUpdate?.error) {
+        logger.error("Failed to update quote line pricing", {
+          error: priceUpdate.error
+        });
+        toast.error(t`Failed to update category markups`);
+      }
+    },
+    [
+      categoryMarkupsByQuantity,
+      carbon,
+      company.id,
+      lineId,
+      costsByQuantity,
+      quantities,
+      computeUnitPriceFromMarkups,
+      resolveRollupPrice,
+      t
+    ]
+  );
+
+  const onUpdatePrice = useCallback(
+    async (
+      key: "leadTime" | "unitPrice" | "discountPercent" | "shippingCost",
+      quantity: number,
+      value: number
+    ) => {
+      const unitPricePrecision = line.unitPricePrecision ?? 2;
+
+      const hasPrice = !!editableFields.prices[quantity];
+      const oldPrices = { ...editableFields.prices };
+      const newPrices = { ...oldPrices };
+      if (!hasPrice) {
+        newPrices[quantity] = {
+          quoteId,
+          quoteLineId: lineId,
+          quantity,
+          leadTime: 0,
+          unitPrice: 0,
+          discountPercent: 0,
+          exchangeRate: exchangeRate ?? 1,
+          shippingCost: 0,
+          createdBy: userId
+        } as unknown as QuotationPrice;
+      }
+      let roundedValue = value;
+      if (key === "unitPrice") {
+        // Round the value to the precision of the quote line
+        roundedValue = round(value, unitPricePrecision);
+      }
+      newPrices[quantity] = {
+        ...newPrices[quantity],
+        [key]: roundedValue,
+        // A direct price / virtual-markup edit makes this a manual price:
+        // priceSource 'manual' tells every recalc to preserve it, clearing
+        // the stored per-category markups keeps the display consistent, and no
+        // rule explains it any more.
+        ...(key === "unitPrice"
+          ? { categoryMarkups: {}, priceSource: "manual", priceTrace: null }
+          : {})
+      };
+
+      setEditableFields((prev) => ({
+        ...prev,
+        prices: newPrices
+      }));
+
+      if (hasPrice) {
+        const update = await carbon
+          ?.from("quoteLinePrice")
+          .update({
+            [key]: roundedValue,
+            ...(key === "unitPrice"
+              ? { categoryMarkups: {}, priceSource: "manual", priceTrace: null }
+              : {}),
+            quoteLineId: lineId,
+            quantity
+          })
+          .eq("quoteLineId", lineId)
+          .eq("quantity", quantity)
+          .eq("companyId", company.id);
+        if (update?.error) {
+          logger.error("Failed to update quote line pricing", {
+            error: update.error
+          });
+          toast.error("Failed to update quote line");
+        }
+      } else {
+        const insert = await carbon?.from("quoteLinePrice").insert({
+          ...newPrices[quantity],
+          quoteLineId: lineId,
+          quantity
+        });
+
+        if (insert?.error) {
+          logger.error("Failed to update quote line pricing", {
+            error: insert.error
+          });
+          toast.error(t`Failed to insert quote line`);
+        }
+      }
+    },
+    [
+      line.unitPricePrecision,
+      editableFields.prices,
+      quoteId,
+      lineId,
+      exchangeRate,
+      userId,
+      carbon,
+      company.id,
+      t
+    ]
+  );
+
+  const [leadTimeModalOpen, setLeadTimeModalOpen] = useState(false);
+
+  // How each quantity's price was resolved. The stored traces arrive with the
+  // prices, so showing the button costs no request; today's calculation (the
+  // price-trace route) is loaded when the modal opens and after a reprice —
+  // and once on mount when no stored trace shows a rule, since only today's
+  // calculation can tell whether one applies now.
+  const [priceTraceModalOpen, setPriceTraceModalOpen] = useState(false);
+  const priceTraceFetcher = useFetcher<typeof priceTraceLoader>();
+  const repriceFetcher = useFetcher<typeof priceTraceAction>();
+  const priceTraceLoad = priceTraceFetcher.load;
+  const priceTraceUrl = path.to.quoteLinePriceTrace(quoteId, lineId);
+  useEffect(() => {
+    if (repriceFetcher.state !== "idle" || !repriceFetcher.data) return;
+    if (repriceFetcher.data.error) toast.error(repriceFetcher.data.error);
+    else priceTraceLoad(priceTraceUrl);
+  }, [
+    repriceFetcher.state,
+    repriceFetcher.data,
+    priceTraceLoad,
+    priceTraceUrl
+  ]);
+
+  const storedPrices = Object.values(editableFields.prices);
+  const hasStoredAdjustments = storedPrices.some((price) =>
+    hasPriceAdjustments(price.priceTrace as PriceTraceStep[] | null)
+  );
+  // No stored trace shows a rule, but a rule may have been added since (or
+  // the price predates traces): only today's calculation can tell, and it is
+  // what reveals the trace button.
+  const needsCurrentTrace =
+    !hasStoredAdjustments &&
+    storedPrices.some((price) => price.priceSource !== "manual");
+  useEffect(() => {
+    if (isEmployee && needsCurrentTrace) priceTraceLoad(priceTraceUrl);
+  }, [isEmployee, needsCurrentTrace, priceTraceLoad, priceTraceUrl]);
+
+  const priceTraces = priceTraceFetcher.data?.traces ?? [];
+  const hasPricingRules =
+    hasStoredAdjustments ||
+    priceTraces.some(
+      (price) =>
+        hasPriceAdjustments(price.trace) ||
+        hasPriceAdjustments(price.currentTrace)
+    );
+
+  // Applies one predicted lead time per quantity break in ONE state update:
+  // onUpdatePrice snapshots editableFields.prices per call and replaces the
+  // whole map, so looping it would keep only the last quantity's value.
+  const onUpdateLeadTimes = useCallback(
+    async (leadTimeByQuantity: Record<number, number>) => {
+      const prices = { ...editableFields.prices };
+      const missing: number[] = [];
+      for (const [key, days] of Object.entries(leadTimeByQuantity)) {
+        const quantity = Number(key);
+        if (prices[quantity]) {
+          prices[quantity] = { ...prices[quantity], leadTime: days };
+        } else {
+          missing.push(quantity);
+          prices[quantity] = {
+            quoteId,
+            quoteLineId: lineId,
+            quantity,
+            leadTime: days,
+            unitPrice: 0,
+            discountPercent: 0,
+            exchangeRate: exchangeRate ?? 1,
+            shippingCost: 0,
+            createdBy: userId
+          } as unknown as QuotationPrice;
+        }
+      }
+      setEditableFields((prev) => ({ ...prev, prices }));
+      const writes = Object.entries(leadTimeByQuantity).map(([key, days]) => {
+        const quantity = Number(key);
+        return missing.includes(quantity)
+          ? carbon
+              ?.from("quoteLinePrice")
+              .insert({ ...prices[quantity], quoteLineId: lineId, quantity })
+          : carbon
+              ?.from("quoteLinePrice")
+              .update({ leadTime: days, quoteLineId: lineId, quantity })
+              .eq("quoteLineId", lineId)
+              .eq("quantity", quantity);
+      });
+      const results = await Promise.all(writes);
+      const failed = Object.keys(leadTimeByQuantity)
+        .map(Number)
+        .filter((_, i) => results[i]?.error);
+      if (failed.length > 0) {
+        logger.error("Failed to update quote line lead times", {
+          errors: results.map((r) => r?.error).filter(Boolean)
+        });
+        // Roll back only the rows that did not save, so the state matches the
+        // database and a retry updates saved rows instead of re-inserting them.
+        setEditableFields((prev) => {
+          const reconciled = { ...prev.prices };
+          for (const quantity of failed) {
+            if (editableFields.prices[quantity]) {
+              reconciled[quantity] = editableFields.prices[quantity];
+            } else {
+              delete reconciled[quantity];
+            }
+          }
+          return { ...prev, prices: reconciled };
+        });
+        toast.error(t`Failed to update lead times`);
+        // Reject so the modal stays open instead of closing on a partial save.
+        throw new Error("Failed to update lead times");
+      }
+    },
+    [editableFields.prices, carbon, lineId, quoteId, exchangeRate, userId, t]
+  );
+
+  return (
+    <Card>
+      <HStack className="justify-between">
+        <CardHeader>
+          <CardTitle>
+            <Trans>Pricing</Trans>
+          </CardTitle>
+        </CardHeader>
+        {isEditable && (
+          <CardAction>
+            <HStack>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="secondary"
+                    rightIcon={<LuChevronDown />}
+                    isLoading={
+                      fetcher.state === "loading" &&
+                      fetcher.formAction ===
+                        path.to.quoteLineUpdatePrecision(quoteId, lineId)
+                    }
+                    isDisabled={
+                      !isEditable ||
+                      (fetcher.state === "loading" &&
+                        fetcher.formAction ===
+                          path.to.quoteLineUpdatePrecision(quoteId, lineId))
+                    }
+                  >
+                    Precision
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuRadioGroup
+                    value={unitPricePrecision.toString()}
+                    onValueChange={(value) => onUpdatePrecision(value)}
+                  >
+                    <DropdownMenuRadioItem value="2">.00</DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="3">
+                      .000
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="4">
+                      .0000
+                    </DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="secondary"
+                    leftIcon={<LuRefreshCcw />}
+                    rightIcon={<LuChevronDown />}
+                    isLoading={
+                      isRepricing ||
+                      (fetcher.state === "loading" &&
+                        fetcher.formAction ===
+                          path.to.quoteLineRecalculatePrice(quoteId, lineId))
+                    }
+                    isDisabled={
+                      !isEditable ||
+                      isRepricing ||
+                      (fetcher.state === "loading" &&
+                        fetcher.formAction ===
+                          path.to.quoteLineRecalculatePrice(quoteId, lineId))
+                    }
+                  >
+                    Markup %
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <div
+                    className="flex items-center gap-1 px-2 py-1.5 border-b border-border mb-1"
+                    onClick={(e) => e.stopPropagation()}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  >
+                    <NumberField
+                      value={
+                        customMarkup === "" ? undefined : Number(customMarkup)
+                      }
+                      minValue={0}
+                      formatOptions={INPUT_FORMAT.percentPoints}
+                      onChange={(val) => {
+                        if (Number.isFinite(val)) setCustomMarkup(String(val));
+                      }}
+                    >
+                      <NumberInput
+                        size="sm"
+                        placeholder="Custom %"
+                        className="w-32 h-7"
+                      />
+                    </NumberField>
+                    <DropdownMenuItem
+                      asChild
+                      onSelect={(e) => {
+                        const val = parseFloat(customMarkup);
+                        if (!Number.isFinite(val) || val < 0) {
+                          e.preventDefault();
+                          return;
+                        }
+                        onRecalculate(val);
+                        setCustomMarkup("");
+                      }}
+                    >
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        className="h-7 px-2 text-xs"
+                      >
+                        Apply
+                      </Button>
+                    </DropdownMenuItem>
+                  </div>
+                  <DropdownMenuItem onClick={() => onRecalculate(0)}>
+                    0% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(10)}>
+                    10% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(15)}>
+                    15% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(20)}>
+                    20% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(30)}>
+                    30% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(40)}>
+                    40% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(50)}>
+                    50% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(60)}>
+                    60% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(70)}>
+                    70% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(80)}>
+                    80% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(90)}>
+                    90% Markup
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRecalculate(100)}>
+                    100% Markup
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </HStack>
+          </CardAction>
+        )}
+      </HStack>
+      <CardContent>
+        <Table className="[&_td]:whitespace-nowrap [&_td]:tabular-nums">
+          <Thead>
+            <Tr>
+              <Th className={costRowLabelCellClass} />
+              {quantities.map((quantity) => (
+                <Th
+                  key={quantity.toString()}
+                  className="min-w-[140px] tabular-nums"
+                >
+                  {quantity}
+                </Th>
+              ))}
+            </Tr>
+          </Thead>
+          <Tbody>
+            <Tr>
+              <Td className={costRowLabelCellClass}>
+                <CostRowLabel
+                  label={<Trans>Lead Time</Trans>}
+                  badge={
+                    isEmployee && hasCalculatedCost ? (
+                      <IconButton
+                        aria-label={t`Predict lead time`}
+                        icon={<LuCalendarClock />}
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setLeadTimeModalOpen(true)}
+                      />
+                    ) : undefined
+                  }
+                />
+              </Td>
+              {quantities.map((quantity) => {
+                const leadTime = editableFields.prices[quantity]?.leadTime ?? 0;
+                return (
+                  <Td
+                    key={quantity.toString()}
+                    className="group-hover:bg-muted/50"
+                  >
+                    <EditableNumberCell
+                      value={leadTime}
+                      formatOptions={{
+                        style: "unit",
+                        unit: "day",
+                        unitDisplay: "long"
+                      }}
+                      minValue={0}
+                      isEditable={isEditable}
+                      onChange={(value) =>
+                        onUpdatePrice("leadTime", quantity, value)
+                      }
+                    />
+                  </Td>
+                );
+              })}
+            </Tr>
+            {isEmployee && (
+              <Tr className={cn(hasCalculatedCost && "[&>td]:bg-muted/60")}>
+                <Td className={costRowLabelCellClass}>
+                  <CostRowLabel label={<Trans>Unit Cost</Trans>} />
+                </Td>
+
+                {unitCostsByQuantity.map((cost, index) => {
+                  return hasCalculatedCost ? (
+                    <Td key={index} className="group-hover:bg-muted/50">
+                      <VStack spacing={0}>
+                        <span>
+                          {unitPriceFormatter.format(
+                            unitCostsByQuantity[index]
+                          )}
+                        </span>
+                      </VStack>
+                    </Td>
+                  ) : (
+                    <Td key={index} className="group-hover:bg-muted/50">
+                      <EditableNumberCell
+                        value={editableFields.unitCost}
+                        formatOptions={INPUT_FORMAT.rate(
+                          baseCurrency,
+                          currencyDecimals
+                        )}
+                        minValue={0}
+                        isEditable={isEditable}
+                        onChange={(value) => onUpdateCost(value)}
+                      />
+                    </Td>
+                  );
+                })}
+              </Tr>
+            )}
+
+            {isEmployee && (
+              <Tr>
+                <Td className={costRowLabelCellClass}>
+                  <CostRowLabel
+                    label={<Trans>Markup Percent</Trans>}
+                    info={
+                      <Tooltip>
+                        <TooltipTrigger tabIndex={-1}>
+                          <LuInfo className="w-4 h-4" />
+                        </TooltipTrigger>
+                        <TooltipContent>(Price - Cost) / Cost</TooltipContent>
+                      </Tooltip>
+                    }
+                  />
+                </Td>
+                {quantities.map((quantity, index) => {
+                  const price = editableFields.prices[quantity]?.unitPrice ?? 0;
+                  const cost = unitCostsByQuantity[index];
+
+                  const markup = cost > 0 ? (price - cost) / cost : 0;
+
+                  return (
+                    <Td key={quantity.toString()}>
+                      {cost > 0 ? (
+                        <EditableNumberCell
+                          value={markup}
+                          formatOptions={INPUT_FORMAT.percent}
+                          minValue={0}
+                          isEditable={isEditable}
+                          onChange={(value) =>
+                            onUpdatePrice(
+                              "unitPrice",
+                              quantity,
+                              cost * (1 + value)
+                            )
+                          }
+                        />
+                      ) : (
+                        <span className="text-muted-foreground">-</span>
+                      )}
+                    </Td>
+                  );
+                })}
+              </Tr>
+            )}
+            {isEmployee && hasCalculatedCost && (
+              <>
+                <Tr>
+                  <Td className={costRowLabelCellClass}>
+                    <Button
+                      variant="ghost"
+                      className="-ml-3"
+                      rightIcon={
+                        showCategoryMarkups ? (
+                          <LuChevronDown />
+                        ) : (
+                          <LuChevronRight />
+                        )
+                      }
+                      onClick={() =>
+                        setShowCategoryMarkups(!showCategoryMarkups)
+                      }
+                    >
+                      <Trans>Markup by Category</Trans>
+                    </Button>
+                  </Td>
+                  {quantities.map((quantity) => (
+                    <Td key={quantity.toString()} />
+                  ))}
+                </Tr>
+                {showCategoryMarkups &&
+                  visibleCategories.map((category: CostCategoryKey) => {
+                    return (
+                      <Tr key={category}>
+                        <Td className={cn(costRowLabelCellClass, "pl-8")}>
+                          <CostRowLabel label={categoryLabels[category]} />
+                        </Td>
+                        {quantities.map((quantity, index) => {
+                          const categoryCost =
+                            costsByQuantity[index]?.[category] ?? 0;
+                          const markupValue =
+                            categoryMarkupsByQuantity[quantity]?.[category] ??
+                            0;
+                          return (
+                            <Td key={quantity.toString()}>
+                              {categoryCost > 0 ? (
+                                <VStack spacing={0}>
+                                  <EditableNumberCell
+                                    value={markupValue / 100}
+                                    formatOptions={INPUT_FORMAT.percent}
+                                    minValue={0}
+                                    isEditable={isEditable}
+                                    onChange={(value) =>
+                                      onUpdateCategoryMarkup(
+                                        category,
+                                        quantity,
+                                        value * 100
+                                      )
+                                    }
+                                  />
+                                  <span className="text-xs text-muted-foreground">
+                                    {unitPriceFormatter.format(categoryCost)}
+                                  </span>
+                                </VStack>
+                              ) : (
+                                <span className="text-muted-foreground">-</span>
+                              )}
+                            </Td>
+                          );
+                        })}
+                      </Tr>
+                    );
+                  })}
+              </>
+            )}
+            <Tr>
+              <Td className={costRowLabelCellClass}>
+                <CostRowLabel
+                  label={<Trans>Unit Price</Trans>}
+                  badge={
+                    isEmployee &&
+                    hasPricingRules && (
+                      <IconButton
+                        aria-label={t`How this price was calculated`}
+                        icon={<LuCalculator />}
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          priceTraceLoad(priceTraceUrl);
+                          setPriceTraceModalOpen(true);
+                        }}
+                      />
+                    )
+                  }
+                />
+              </Td>
+              {quantities.map((quantity) => {
+                const price = editableFields.prices[quantity]?.unitPrice;
+                return (
+                  <Td key={quantity.toString()}>
+                    <EditableNumberCell
+                      value={price}
+                      formatOptions={INPUT_FORMAT.rate(
+                        baseCurrency,
+                        unitPricePrecision
+                      )}
+                      minValue={0}
+                      isEditable={isEditable}
+                      onChange={(value) =>
+                        onUpdatePrice("unitPrice", quantity, value)
+                      }
+                    />
+                  </Td>
+                );
+              })}
+            </Tr>
+
+            <Tr>
+              <Td className={costRowLabelCellClass}>
+                <CostRowLabel label={<Trans>Discount Percent</Trans>} />
+              </Td>
+              {quantities.map((quantity, index) => {
+                const discount =
+                  editableFields.prices[quantity]?.discountPercent;
+
+                return (
+                  <Td key={index}>
+                    <EditableNumberCell
+                      value={discount}
+                      formatOptions={INPUT_FORMAT.percent}
+                      minValue={0}
+                      maxValue={1}
+                      isEditable={isEditable}
+                      onChange={(value) =>
+                        onUpdatePrice("discountPercent", quantity, value)
+                      }
+                    />
+                  </Td>
+                );
+              })}
+            </Tr>
+            <Tr className="[&>td]:bg-muted/60">
+              <Td className={costRowLabelCellClass}>
+                <CostRowLabel label={<Trans>Net Unit Price</Trans>} />
+              </Td>
+              {netPricesByQuantity.map((price, index) => {
+                return (
+                  <Td key={index} className="group-hover:bg-muted/50">
+                    <VStack spacing={0}>
+                      <span>{unitPriceFormatter.format(price)}</span>
+                    </VStack>
+                  </Td>
+                );
+              })}
+            </Tr>
+
+            {isEmployee && (
+              <Tr className="[&>td]:bg-muted/60">
+                <Td className={costRowLabelCellClass}>
+                  <CostRowLabel
+                    label={<Trans>Profit Percent</Trans>}
+                    info={
+                      <Tooltip>
+                        <TooltipTrigger tabIndex={-1}>
+                          <LuInfo className="w-4 h-4" />
+                        </TooltipTrigger>
+                        <TooltipContent>(Price - Cost) / Price</TooltipContent>
+                      </Tooltip>
+                    }
+                  />
+                </Td>
+                {netPricesByQuantity.map((price, index) => {
+                  const cost = unitCostsByQuantity[index];
+                  const profit = ((price - cost) / price) * 100;
+                  return (
+                    <Td key={index} className="group-hover:bg-muted/50">
+                      <VStack spacing={0}>
+                        {Number.isFinite(profit) ? (
+                          <span
+                            className={cn(profit < -0.01 && "text-red-500")}
+                          >
+                            {percentFormatter.format(profit / 100)}
+                          </span>
+                        ) : (
+                          <span>-</span>
+                        )}
+                      </VStack>
+                    </Td>
+                  );
+                })}
+              </Tr>
+            )}
+            {isEmployee && (
+              <Tr className="[&>td]:bg-muted/60">
+                <Td className={costRowLabelCellClass}>
+                  <CostRowLabel label={<Trans>Total Profit</Trans>} />
+                </Td>
+                {quantities.map((quantity, index) => {
+                  const price = netPricesByQuantity[index];
+                  const cost = unitCostsByQuantity[index];
+                  const profit = (price - cost) * quantity;
+                  return (
+                    <Td key={index} className="group-hover:bg-muted/50">
+                      <VStack spacing={0}>
+                        {price ? (
+                          <span
+                            className={cn(profit < -0.01 && "text-red-500")}
+                          >
+                            {formatter.format(profit)}
+                          </span>
+                        ) : (
+                          <span>-</span>
+                        )}
+                      </VStack>
+                    </Td>
+                  );
+                })}
+              </Tr>
+            )}
+            <Tr>
+              <Td className={costRowLabelCellClass}>
+                <CostRowLabel label={<Trans>Shipping Cost</Trans>} />
+              </Td>
+              {quantities.map((quantity) => {
+                const shippingCost =
+                  editableFields.prices[quantity]?.shippingCost;
+                return (
+                  <Td key={quantity.toString()}>
+                    <EditableNumberCell
+                      value={shippingCost}
+                      formatOptions={INPUT_FORMAT.money(
+                        baseCurrency,
+                        currencyDecimals
+                      )}
+                      minValue={0}
+                      isEditable={isEditable}
+                      onChange={(value) =>
+                        onUpdatePrice("shippingCost", quantity, value)
+                      }
+                    />
+                  </Td>
+                );
+              })}
+            </Tr>
+            {Object.entries(additionalCharges)
+              .sort((a, b) => {
+                return a[1].description.localeCompare(b[1].description);
+              })
+              .map(([chargeId, charge]) => {
+                const isDeleting =
+                  fetcher.state === "loading" &&
+                  fetcher.formAction ===
+                    path.to.deleteQuoteLineCost(quoteId, lineId) &&
+                  fetcher.formData?.get("id") === chargeId;
+                return (
+                  <Tr key={chargeId}>
+                    <Td className={costRowLabelCellClass}>
+                      <HStack className="w-full justify-between ">
+                        <Input
+                          defaultValue={charge.description}
+                          size="sm"
+                          className="border-0 -ml-3 shadow-none"
+                          onBlur={(e) => {
+                            if (
+                              e.target.value &&
+                              e.target.value !== charge.description
+                            ) {
+                              onUpdateChargeDescription(
+                                chargeId,
+                                e.target.value
+                              );
+                            }
+                          }}
+                        />
+                        <HStack spacing={1} className="items-center pr-1">
+                          <Tooltip>
+                            <TooltipTrigger>
+                              <Switch
+                                variant="small"
+                                checked={charge.taxable !== false}
+                                disabled={!isEditable}
+                                onCheckedChange={(checked) =>
+                                  onUpdateChargeTaxable(
+                                    chargeId,
+                                    checked === true
+                                  )
+                                }
+                              />
+                            </TooltipTrigger>
+                            <TooltipContent>Taxable</TooltipContent>
+                          </Tooltip>
+                          <fetcher.Form
+                            method="post"
+                            action={path.to.deleteQuoteLineCost(
+                              quoteId,
+                              lineId
+                            )}
+                          >
+                            <input type="hidden" name="id" value={chargeId} />
+                            <input
+                              type="hidden"
+                              name="additionalCharges"
+                              value={JSON.stringify(additionalCharges ?? {})}
+                            />
+                            <Button
+                              type="submit"
+                              aria-label={t`Delete`}
+                              size="sm"
+                              variant="secondary"
+                              isDisabled={
+                                !permissions.can("update", "sales") ||
+                                isDeleting
+                              }
+                              isLoading={isDeleting}
+                            >
+                              <LuTrash className="w-3 h-3" />
+                            </Button>
+                          </fetcher.Form>
+                        </HStack>
+                      </HStack>
+                    </Td>
+                    {quantities.map((quantity) => {
+                      const amount = charge.amounts?.[quantity] ?? 0;
+                      return (
+                        <Td key={quantity.toString()}>
+                          <VStack spacing={0}>
+                            <EditableNumberCell
+                              value={amount}
+                              formatOptions={INPUT_FORMAT.money(
+                                baseCurrency,
+                                currencyDecimals
+                              )}
+                              minValue={0}
+                              isEditable={isEditable}
+                              onChange={(value) =>
+                                onUpdateChargeAmount(chargeId, quantity, value)
+                              }
+                            />
+                          </VStack>
+                        </Td>
+                      );
+                    })}
+                  </Tr>
+                );
+              })}
+            <Tr>
+              <Td className={costRowLabelCellClass}>
+                <HStack className="w-full justify-between ">
+                  <fetcher.Form
+                    method="post"
+                    action={path.to.newQuoteLineCost(quoteId, lineId)}
+                  >
+                    <input
+                      type="hidden"
+                      name="additionalCharges"
+                      value={JSON.stringify(additionalCharges ?? {})}
+                    />
+                    <Button
+                      className="-ml-3"
+                      type="submit"
+                      rightIcon={<LuCirclePlus />}
+                      variant="ghost"
+                      isLoading={
+                        fetcher.formAction ===
+                          path.to.newQuoteLineCost(quoteId, lineId) &&
+                        fetcher.state === "loading"
+                      }
+                      isDisabled={
+                        !isEditable ||
+                        (fetcher.formAction ===
+                          path.to.newQuoteLineCost(quoteId, lineId) &&
+                          fetcher.state === "loading")
+                      }
+                    >
+                      Add
+                    </Button>
+                  </fetcher.Form>
+                </HStack>
+              </Td>
+              {quantities.map((quantity) => {
+                return <Td key={quantity.toString()}></Td>;
+              })}
+            </Tr>
+            <Tr className="[&>td]:bg-muted/60">
+              <Td className={costRowLabelCellClass}>
+                <CostRowLabel label={<Trans>Subtotal</Trans>} />
+              </Td>
+              {quantities.map((quantity, index) => {
+                const price =
+                  (netPricesByQuantity[index] ?? 0) * quantity +
+                  (editableFields.prices[quantity]?.shippingCost ?? 0) +
+                  (additionalChargesByQuantity[index] ?? 0);
+                return (
+                  <Td key={index} className="group-hover:bg-muted/50">
+                    <VStack spacing={0}>
+                      <span>{formatter.format(price)}</span>
+                    </VStack>
+                  </Td>
+                );
+              })}
+            </Tr>
+            <Tr className="[&>td]:bg-muted/60">
+              <Td className={costRowLabelCellClass}>
+                <CostRowLabel label={<Trans>Tax Percent</Trans>} />
+              </Td>
+              {quantities.map((quantity, index) => {
+                const taxPercent = editableFields.taxPercent;
+                return (
+                  <Td key={index} className="group-hover:bg-muted/50">
+                    <EditableNumberCell
+                      value={taxPercent}
+                      formatOptions={INPUT_FORMAT.percent}
+                      minValue={0}
+                      isEditable={isEditable}
+                      onChange={(value) => {
+                        setEditableFields((prev) => ({
+                          ...prev,
+                          taxPercent: value
+                        }));
+
+                        // TODO: handle mutation
+                      }}
+                    />
+                  </Td>
+                );
+              })}
+            </Tr>
+            <Tr className="font-bold [&>td]:bg-muted/60">
+              <Td className={costRowLabelCellClass}>
+                <CostRowLabel label={<Trans>Total Price</Trans>} />
+              </Td>
+              {quantities.map((quantity, index) => {
+                const subtotal =
+                  (netPricesByQuantity[index] ?? 0) * quantity +
+                  (editableFields.prices[quantity]?.shippingCost ?? 0) +
+                  (additionalChargesByQuantity[index] ?? 0);
+                const taxableSubtotal =
+                  (netPricesByQuantity[index] ?? 0) * quantity +
+                  (editableFields.prices[quantity]?.shippingCost ?? 0) +
+                  (taxableAdditionalChargesByQuantity[index] ?? 0);
+                const tax = taxableSubtotal * editableFields.taxPercent;
+                const price = subtotal + tax;
+                return (
+                  <Td key={index} className="group-hover:bg-muted/50">
+                    <VStack spacing={0}>
+                      <span>{formatter.format(price)}</span>
+                    </VStack>
+                  </Td>
+                );
+              })}
+            </Tr>
+            {routeData?.quote?.currencyCode !== baseCurrency && (
+              <>
+                <Tr className="[&>td]:bg-muted/60">
+                  <Td className={costRowLabelCellClass}>
+                    <CostRowLabel label={<Trans>Exchange Rate</Trans>} />
+                  </Td>
+                  {quantities.map((quantity, index) => {
+                    const exchangeRate =
+                      editableFields.prices[quantity]?.exchangeRate;
+                    return (
+                      <Td key={index} className="group-hover:bg-muted/50">
+                        <VStack spacing={0}>
+                          <span>{exchangeRate ?? 1}</span>
+                        </VStack>
+                      </Td>
+                    );
+                  })}
+                </Tr>
+                <Tr className="font-bold [&>td]:bg-muted/60">
+                  <Td className={costRowLabelCellClass}>
+                    <CostRowLabel
+                      label={<Trans>Converted Total Price</Trans>}
+                    />
+                  </Td>
+                  {quantities.map((quantity, index) => {
+                    const subtotal =
+                      (netPricesByQuantity[index] ?? 0) * quantity +
+                      (editableFields.prices[quantity]?.shippingCost ?? 0) +
+                      (additionalChargesByQuantity[index] ?? 0);
+                    const taxableSubtotal =
+                      (netPricesByQuantity[index] ?? 0) * quantity +
+                      (editableFields.prices[quantity]?.shippingCost ?? 0) +
+                      (taxableAdditionalChargesByQuantity[index] ?? 0);
+                    const tax = taxableSubtotal * editableFields.taxPercent;
+                    const price = subtotal + tax;
+                    const exchangeRate =
+                      editableFields.prices[quantity]?.exchangeRate;
+                    const convertedPrice = price * (exchangeRate ?? 1);
+                    return (
+                      <Td key={index} className="group-hover:bg-muted/50">
+                        <VStack spacing={0}>
+                          <span>
+                            {presentationCurrencyFormatter.format(
+                              convertedPrice
+                            )}
+                          </span>
+                        </VStack>
+                      </Td>
+                    );
+                  })}
+                </Tr>
+              </>
+            )}
+          </Tbody>
+        </Table>
+      </CardContent>
+      {leadTimeModalOpen && (
+        <QuoteLeadTimeModal
+          quoteId={quoteId}
+          lineId={lineId}
+          quantities={quantities}
+          isEditable={isEditable}
+          onApply={onUpdateLeadTimes}
+          onClose={() => setLeadTimeModalOpen(false)}
+        />
+      )}
+      {priceTraceModalOpen && (
+        <QuoteLinePriceTraceModal
+          traces={priceTraces}
+          isLoading={priceTraceFetcher.state !== "idle"}
+          currencyCode={baseCurrency}
+          unitPricePrecision={unitPricePrecision}
+          isEditable={isEditable}
+          isRepricing={repriceFetcher.state !== "idle"}
+          onReprice={() =>
+            repriceFetcher.submit(null, {
+              method: "post",
+              action: priceTraceUrl
+            })
+          }
+          onClose={() => setPriceTraceModalOpen(false)}
+        />
+      )}
+    </Card>
+  );
+};
+
+export default QuoteLinePricing;

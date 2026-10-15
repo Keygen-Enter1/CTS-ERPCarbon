@@ -1,0 +1,450 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Button,
+  Checkbox,
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem,
+  useDisclosure
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo, useState } from "react";
+import {
+  LuBookMarked,
+  LuCalendar,
+  LuCheck,
+  LuCirclePlus,
+  LuClock,
+  LuFileText,
+  LuHash,
+  LuPencil,
+  LuTrash,
+  LuUser
+} from "react-icons/lu";
+import { useFetcher, useNavigate } from "react-router";
+import {
+  CustomerAvatar,
+  DateTime,
+  EmployeeAvatar,
+  Hyperlink,
+  Table
+} from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { ConfirmDelete } from "~/components/Modals";
+import { NewAction } from "~/components/New";
+import { usePermissions, useRealtime, useUrlParams } from "~/hooks";
+import { useCustomColumns } from "~/hooks/useCustomColumns";
+import { useCustomers, usePeople } from "~/stores";
+import { path } from "~/utils/path";
+import {
+  shipmentSourceDocumentType,
+  shipmentStatusType
+} from "../../inventory.models";
+import type { Shipment } from "../../types";
+import ShipmentStatus from "./ShipmentStatus";
+
+function NewShipment() {
+  const fetcher = useFetcher();
+  const { t } = useLingui();
+  return (
+    <NewAction
+      label={t`Add Shipment`}
+      isDisabled={fetcher.state !== "idle"}
+      onClick={() =>
+        fetcher.submit(null, { method: "post", action: path.to.newShipment })
+      }
+    >
+      <fetcher.Form method="post" action={path.to.newShipment}>
+        <Button
+          type="submit"
+          leftIcon={<LuCirclePlus />}
+          variant="primary"
+          isLoading={fetcher.state !== "idle"}
+        >
+          <Trans>Add Shipment</Trans>
+        </Button>
+      </fetcher.Form>
+    </NewAction>
+  );
+}
+
+type ShipmentsTableProps = {
+  data: Shipment[];
+  count: number;
+};
+
+const ShipmentsTable = memo(({ data, count }: ShipmentsTableProps) => {
+  useRealtime("shipment", `id=in.(${data.map((d) => d.id).join(",")})`);
+
+  const [params] = useUrlParams();
+  const { t } = useLingui();
+  const navigate = useNavigate();
+  const permissions = usePermissions();
+
+  const rows = useMemo(() => data, [data]);
+  const [people] = usePeople();
+  const [customers] = useCustomers();
+  const customColumns = useCustomColumns<Shipment>("shipment");
+
+  const columns = useMemo<ColumnDef<Shipment>[]>(() => {
+    const result: ColumnDef<(typeof rows)[number]>[] = [
+      {
+        accessorKey: "shipmentId",
+        header: t`Shipment ID`,
+        cell: ({ row }) => (
+          <Hyperlink to={path.to.shipmentDetails(row.original.id!)}>
+            {row.original.shipmentId}
+          </Hyperlink>
+        ),
+        meta: {
+          mobile: "P1",
+          icon: <LuBookMarked />
+        }
+      },
+      {
+        accessorKey: "sourceDocument",
+        header: t`Source Document`,
+        cell: (item) => <Enumerable value={item.getValue<string>()} />,
+        meta: {
+          mobile: "P2",
+          filter: {
+            type: "static",
+            options: shipmentSourceDocumentType.map((type) => ({
+              value: type,
+              label: <Enumerable value={type} />
+            }))
+          },
+          icon: <LuFileText />
+        }
+      },
+      {
+        accessorKey: "sourceDocumentReadableId",
+        header: t`Source Document ID`,
+        cell: ({ row }) => {
+          if (!row.original.sourceDocumentId) return null;
+          switch (row.original.sourceDocument) {
+            case "Sales Invoice":
+              return (
+                <Hyperlink
+                  to={path.to.salesInvoiceDetails(
+                    row.original.sourceDocumentId!
+                  )}
+                >
+                  {row.original.sourceDocumentReadableId}
+                </Hyperlink>
+              );
+            case "Sales Order":
+              return (
+                <Hyperlink
+                  to={path.to.salesOrderDetails(row.original.sourceDocumentId!)}
+                >
+                  {row.original.sourceDocumentReadableId}
+                </Hyperlink>
+              );
+            case "Purchase Order":
+              return (
+                <Hyperlink
+                  to={path.to.purchaseOrderDetails(
+                    row.original.sourceDocumentId!
+                  )}
+                >
+                  {row.original.sourceDocumentReadableId}
+                </Hyperlink>
+              );
+            case "Outbound Transfer":
+              return (
+                <Hyperlink
+                  to={path.to.warehouseTransferDetails(
+                    row.original.sourceDocumentId!
+                  )}
+                >
+                  {row.original.sourceDocumentReadableId}
+                </Hyperlink>
+              );
+            case "Rental Agreement":
+              return (
+                <Hyperlink
+                  to={path.to.rentalAgreementDetails(
+                    row.original.sourceDocumentId!
+                  )}
+                >
+                  {row.original.sourceDocumentReadableId}
+                </Hyperlink>
+              );
+            default:
+              return null;
+          }
+        },
+        meta: {
+          icon: <LuHash />
+        }
+      },
+
+      {
+        accessorKey: "status",
+        header: t`Status`,
+        cell: (item) => {
+          const status = item.getValue<(typeof shipmentStatusType)[number]>();
+          return (
+            <ShipmentStatus
+              status={status}
+              invoiced={item.row.original.invoiced}
+            />
+          );
+        },
+        meta: {
+          mobile: "P2",
+          filter: {
+            type: "static",
+            options: shipmentStatusType.map((type) => ({
+              value: type,
+              label: <ShipmentStatus status={type} />
+            }))
+          },
+          pluralHeader: t`Statuses`,
+          icon: <LuClock />
+        }
+      },
+      {
+        accessorKey: "invoiced",
+        header: t`Invoiced`,
+        cell: (item) => <Checkbox isChecked={item.getValue<boolean>()} />,
+        meta: {
+          filter: {
+            type: "static",
+            options: [
+              { value: "true", label: "Yes" },
+              { value: "false", label: "No" }
+            ]
+          },
+          icon: <LuCheck />
+        }
+      },
+      {
+        id: "postedBy",
+        header: t`Posted By`,
+        cell: ({ row }) => (
+          <EmployeeAvatar employeeId={row.original.postedBy} />
+        ),
+        meta: {
+          filter: {
+            type: "static",
+            options: people.map((employee) => ({
+              value: employee.id,
+              label: employee.name
+            }))
+          },
+          icon: <LuUser />
+        }
+      },
+      {
+        accessorKey: "postingDate",
+        header: t`Posting Date`,
+        cell: (item) => (
+          <DateTime value={item.getValue<string>()} variant="date" />
+        ),
+        meta: {
+          filter: {
+            type: "dateRange"
+          },
+          icon: <LuCalendar />
+        }
+      },
+      {
+        accessorKey: "assignee",
+        header: t`Assignee`,
+        cell: ({ row }) => (
+          <EmployeeAvatar employeeId={row.original.assignee} />
+        ),
+        meta: {
+          filter: {
+            type: "static",
+            options: people.map((employee) => ({
+              value: employee.id,
+              label: employee.name
+            }))
+          },
+          icon: <LuUser />
+        }
+      },
+      {
+        id: "customerId",
+        header: t`Customer`,
+        cell: ({ row }) => {
+          return <CustomerAvatar customerId={row.original.customerId} />;
+        },
+        meta: {
+          mobile: "P3",
+          filter: {
+            type: "static",
+            options: customers?.map((customer) => ({
+              value: customer.id,
+              label: customer.name
+            }))
+          },
+          icon: <LuUser />
+        }
+      },
+      {
+        accessorKey: "externalDocumentId",
+        header: t`External Ref.`,
+        cell: (item) => item.getValue(),
+        meta: {
+          icon: <LuHash />
+        }
+      },
+      {
+        id: "createdBy",
+        header: t`Created By`,
+        cell: ({ row }) => (
+          <EmployeeAvatar employeeId={row.original.createdBy} />
+        ),
+        meta: {
+          filter: {
+            type: "static",
+            options: people.map((employee) => ({
+              value: employee.id,
+              label: employee.name
+            }))
+          },
+          icon: <LuUser />
+        }
+      },
+      {
+        accessorKey: "createdAt",
+        header: t`Created At`,
+        cell: (item) => (
+          <DateTime value={item.getValue<string>()} variant="date" />
+        ),
+        meta: {
+          icon: <LuCalendar />
+        }
+      },
+      {
+        id: "updatedBy",
+        header: t`Updated By`,
+        cell: ({ row }) => (
+          <EmployeeAvatar employeeId={row.original.updatedBy} />
+        ),
+        meta: {
+          filter: {
+            type: "static",
+            options: people.map((employee) => ({
+              value: employee.id,
+              label: employee.name
+            }))
+          },
+          icon: <LuUser />
+        }
+      },
+      {
+        accessorKey: "updatedAt",
+        header: t`Updated At`,
+        cell: (item) => (
+          <DateTime value={item.getValue<string>()} variant="date" />
+        ),
+        meta: {
+          icon: <LuCalendar />
+        }
+      }
+    ];
+
+    return [...result, ...customColumns];
+  }, [people, customers, customColumns, t]);
+
+  const [selectedShipment, setSelectedShipment] = useState<Shipment | null>(
+    null
+  );
+  const deleteShipmentModal = useDisclosure();
+
+  const renderContextMenu = useCallback(
+    (row: Shipment) => {
+      return (
+        <>
+          <MenuItem
+            shortcut={
+              row.postingDate
+                ? MENU_ITEM_SHORTCUTS.view
+                : MENU_ITEM_SHORTCUTS.edit
+            }
+            disabled={!permissions.can("update", "inventory")}
+            onClick={() => {
+              navigate(
+                `${path.to.shipmentDetails(row.id!)}?${params.toString()}`
+              );
+            }}
+          >
+            <MenuIcon icon={<LuPencil />} />
+            {row.postingDate ? t`View Shipment` : t`Edit Shipment`}
+          </MenuItem>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.delete}
+            disabled={
+              !permissions.can("delete", "inventory") ||
+              !!row.postingDate ||
+              row.status === "Pending"
+            }
+            destructive
+            onClick={() => {
+              setSelectedShipment(row);
+              deleteShipmentModal.onOpen();
+            }}
+          >
+            <MenuIcon icon={<LuTrash />} />
+            <Trans>Delete Shipment</Trans>
+          </MenuItem>
+        </>
+      );
+    },
+    [deleteShipmentModal, navigate, params, permissions, t]
+  );
+
+  return (
+    <>
+      <Table<(typeof data)[number]>
+        data={data}
+        columns={columns}
+        count={count}
+        defaultColumnPinning={{
+          left: ["shipmentId"]
+        }}
+        defaultColumnVisibility={{
+          createdAt: false,
+          createdBy: false,
+          updatedAt: false,
+          updatedBy: false
+        }}
+        primaryAction={
+          permissions.can("create", "inventory") && <NewShipment />
+        }
+        renderContextMenu={renderContextMenu}
+        title={t`Shipments`}
+        table="shipment"
+        withSavedView
+      />
+      {selectedShipment && selectedShipment.id && (
+        <ConfirmDelete
+          action={path.to.deleteShipment(selectedShipment.id)}
+          isOpen={deleteShipmentModal.isOpen}
+          name={selectedShipment.shipmentId!}
+          text={`Are you sure you want to delete ${selectedShipment.shipmentId!}? This cannot be undone.`}
+          onCancel={() => {
+            deleteShipmentModal.onClose();
+            setSelectedShipment(null);
+          }}
+          onSubmit={() => {
+            deleteShipmentModal.onClose();
+            setSelectedShipment(null);
+          }}
+        />
+      )}
+    </>
+  );
+});
+
+ShipmentsTable.displayName = "ShipmentsTable";
+export default ShipmentsTable;

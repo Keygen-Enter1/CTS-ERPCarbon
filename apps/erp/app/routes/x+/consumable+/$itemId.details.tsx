@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import type { JSONContent } from "@carbon/react";
+import { VStack } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs } from "react-router";
+import { useParams } from "react-router";
+import { DeferredFiles } from "~/components";
+import { usePermissions, useRouteData } from "~/hooks";
+import type { ConsumableSummary, ItemFile } from "~/modules/items";
+import { consumableValidator, upsertConsumable } from "~/modules/items";
+import {
+  ItemDocuments,
+  ItemNotes,
+  ItemRiskRegister
+} from "~/modules/items/ui/Item";
+import { setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    update: "parts"
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const formData = await request.formData();
+  const validation = await validator(consumableValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const updateConsumable = await upsertConsumable(client, {
+    ...validation.data,
+    id: itemId,
+    companyId,
+    customFields: setCustomFields(formData),
+    updatedBy: userId
+  });
+  if (updateConsumable.error) {
+    throw redirect(
+      path.to.consumable(itemId),
+      await flash(
+        request,
+        error(updateConsumable.error, "Failed to update consumable")
+      )
+    );
+  }
+
+  throw redirect(
+    path.to.consumable(itemId),
+    await flash(request, success("Updated consumable"))
+  );
+}
+
+export default function ConsumableDetailsRoute() {
+  const { itemId } = useParams();
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const consumableData = useRouteData<{
+    consumableSummary: ConsumableSummary;
+    files: Promise<ItemFile[]>;
+  }>(path.to.consumable(itemId));
+
+  if (!consumableData) throw new Error("Could not find consumable data");
+  const permissions = usePermissions();
+
+  return (
+    <VStack spacing={4} className="p-4">
+      <ItemNotes
+        id={consumableData.consumableSummary?.id ?? null}
+        title={consumableData.consumableSummary?.name ?? ""}
+        subTitle={
+          consumableData.consumableSummary?.readableIdWithRevision ?? ""
+        }
+        notes={consumableData.consumableSummary?.notes as JSONContent}
+      />
+      {permissions.is("employee") && (
+        <>
+          <DeferredFiles resolve={consumableData?.files}>
+            {(resolvedFiles) => (
+              <ItemDocuments
+                files={resolvedFiles}
+                itemId={itemId}
+                type="Consumable"
+              />
+            )}
+          </DeferredFiles>
+
+          <ItemRiskRegister itemId={itemId} />
+        </>
+      )}
+    </VStack>
+  );
+}

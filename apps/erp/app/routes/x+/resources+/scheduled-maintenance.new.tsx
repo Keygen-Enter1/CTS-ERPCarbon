@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { trigger } from "@carbon/jobs";
+import { useCloseRoute } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import {
+  maintenanceScheduleValidator,
+  upsertMaintenanceSchedule
+} from "~/modules/resources";
+import MaintenanceScheduleForm from "~/modules/resources/ui/MaintenanceSchedule/MaintenanceScheduleForm";
+import { getUserDefaults } from "~/modules/users/users.server";
+import { getParams, path, requestReferrer } from "~/utils/path";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, companyId, userId } = await requirePermissions(request, {
+    create: "resources"
+  });
+
+  const defaults = await getUserDefaults(client, userId, companyId);
+
+  return {
+    defaultLocationId: defaults.data?.locationId ?? undefined
+  };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    create: "resources"
+  });
+
+  const formData = await request.formData();
+  const modal = formData.get("type") === "modal";
+
+  const validation = await validator(maintenanceScheduleValidator).validate(
+    formData
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  // biome-ignore lint/correctness/noUnusedVariables: suppressed due to migration
+  const { id, ...d } = validation.data;
+
+  const insertSchedule = await upsertMaintenanceSchedule(client, {
+    ...d,
+    companyId,
+    createdBy: userId
+  });
+
+  if (insertSchedule.error) {
+    return modal
+      ? insertSchedule
+      : redirect(
+          requestReferrer(request) ??
+            `${path.to.maintenanceSchedules}?${getParams(request)}`,
+          await flash(
+            request,
+            error(insertSchedule.error, "Failed to create maintenance schedule")
+          )
+        );
+  }
+
+  // Generate this schedule's dispatches + next-due date now, so it appears on
+  // the maintenance displays immediately instead of after the next nightly run.
+  if (insertSchedule.data?.id) {
+    await trigger("generate-maintenance", {
+      companyId,
+      scheduleId: insertSchedule.data.id
+    });
+  }
+
+  return modal
+    ? insertSchedule
+    : redirect(
+        `${path.to.maintenanceSchedules}?${getParams(request)}`,
+        await flash(request, success("Maintenance schedule created"))
+      );
+}
+
+export default function NewMaintenanceScheduleRoute() {
+  const { defaultLocationId } = useLoaderData<typeof loader>();
+  const closeRoute = useCloseRoute();
+  const initialValues = {
+    name: "",
+    workCenterId: "",
+    locationId: defaultLocationId ?? "",
+    frequency: "Weekly" as const,
+    priority: "Medium" as const,
+    estimatedDuration: undefined,
+    takesWorkCenterOffline: false,
+    nextDueAt: undefined,
+    active: true,
+    // Day-of-week defaults (all days enabled by default)
+    monday: true,
+    tuesday: true,
+    wednesday: true,
+    thursday: true,
+    friday: true,
+    saturday: true,
+    sunday: true,
+    skipHolidays: true,
+    procedureId: undefined
+  };
+
+  return (
+    <MaintenanceScheduleForm
+      initialValues={initialValues}
+      onClose={() => closeRoute()}
+    />
+  );
+}

@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { TermId } from "@carbon/content/glossary";
+import type { TextareaProps } from "@carbon/react";
+import {
+  FormControl,
+  FormErrorMessage,
+  FormLabel,
+  LabelWithHelp,
+  Textarea as TextAreaBase
+} from "@carbon/react";
+import type { ChangeEvent } from "react";
+import { forwardRef, useState } from "react";
+import { useField } from "../hooks";
+import { useFormStateContext } from "../internal/formStateContext";
+
+type FormTextArea = TextareaProps & {
+  name: string;
+  label?: string;
+  termId?: TermId;
+  size?: "sm" | "md" | "lg";
+  characterLimit?: number;
+  isRequired?: boolean;
+  isOptional?: boolean;
+  isDisabled?: boolean;
+};
+
+const TextArea = forwardRef<HTMLTextAreaElement, FormTextArea>(
+  (
+    {
+      name,
+      label,
+      termId,
+      size,
+      characterLimit,
+      isRequired,
+      isOptional,
+      isDisabled: isDisabledProp,
+      ...rest
+    },
+    ref
+  ) => {
+    const {
+      getInputProps,
+      error,
+      defaultValue,
+      isOptional: fieldIsOptional
+    } = useField(name);
+    const formState = useFormStateContext();
+    const disabled = formState.isDisabled || isDisabledProp || rest.disabled;
+    const readOnly = formState.isReadOnly || rest.readOnly;
+    const [characterCount, setCharacterCount] = useState(
+      defaultValue?.length ?? 0
+    );
+    const resolvedIsOptional =
+      isOptional ?? (isRequired ? false : (fieldIsOptional ?? false));
+
+    const onChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+      if (characterLimit) setCharacterCount(e.target.value.length);
+    };
+
+    return (
+      <FormControl isInvalid={!!error} isRequired={isRequired}>
+        {label && (
+          <FormLabel htmlFor={name} isOptional={resolvedIsOptional}>
+            <LabelWithHelp termId={termId}>{label}</LabelWithHelp>
+          </FormLabel>
+        )}
+        <TextAreaBase
+          ref={ref}
+          {...getInputProps({
+            id: name,
+            ...rest
+          })}
+          size={size}
+          maxLength={characterLimit}
+          onChange={onChange}
+          disabled={disabled}
+          readOnly={readOnly}
+        />
+        {characterLimit && (
+          <p className="text-sm text-muted-foreground">
+            {characterCount} of {characterLimit}
+          </p>
+        )}
+        {error && <FormErrorMessage>{error}</FormErrorMessage>}
+      </FormControl>
+    );
+  }
+);
+
+TextArea.displayName = "TextArea";
+
+export default TextArea;

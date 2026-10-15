@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  auditConfig,
+  getEntityLabel,
+  getEntityTypes,
+  getTableLabel
+} from "@carbon/database/audit.config";
+import type { AuditDiff, AuditLogEntry } from "@carbon/database/audit.types";
+import { Badge, HStack } from "@carbon/react";
+import { useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo } from "react";
+import { LuFilePen, LuFilePlus, LuFileX } from "react-icons/lu";
+import { Link } from "react-router";
+import { DateTime, EmployeeAvatar, Table } from "~/components";
+import { ChangeRow } from "~/components/AuditLog";
+import { getEntityPath } from "~/utils/entity";
+import { path } from "~/utils/path";
+
+type AuditLogTableProps = {
+  entries: AuditLogEntry[];
+  count: number;
+};
+
+const operationConfig: Record<
+  string,
+  { variant: "green" | "blue" | "red"; icon: React.ReactNode; label: string }
+> = {
+  INSERT: {
+    variant: "green",
+    icon: <LuFilePlus className="size-3" />,
+    label: "Created"
+  },
+  UPDATE: {
+    variant: "blue",
+    icon: <LuFilePen className="size-3" />,
+    label: "Updated"
+  },
+  DELETE: {
+    variant: "red",
+    icon: <LuFileX className="size-3" />,
+    label: "Deleted"
+  }
+};
+
+// Hide globally-skipped columns (and any nested suffix) from the rendered
+// diff. Defense-in-depth — backend strips skipFields too, but legacy entries
+// or newly-added skipFields can slip through.
+function isSkippedDiffKey(key: string): boolean {
+  const skip = auditConfig.skipFields as readonly string[];
+  for (let i = 0; i < skip.length; i++) {
+    const s = skip[i]!;
+    if (key === s || key.endsWith(`.${s}`)) return true;
+  }
+  return false;
+}
+
+function visibleDiffEntries(
+  diff: AuditDiff | null | undefined
+): [string, AuditDiff[string]][] {
+  if (!diff) return [];
+  return Object.entries(diff).filter(([k]) => !isSkippedDiffKey(k));
+}
+
+const ExpandedRowContent = memo(({ entry }: { entry: AuditLogEntry }) => {
+  const visibleEntries = visibleDiffEntries(entry.diff);
+  const hasDiff = visibleEntries.length > 0;
+
+  return (
+    <div className="px-6 py-4">
+      <div className="grid grid-cols-4 gap-4 mb-4 text-sm">
+        <div>
+          <span className="text-muted-foreground">Source</span>
+          <div className="text-xs font-medium">
+            {getTableLabel(entry.tableName)}
+          </div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">Event ID</span>
+          <div className="font-mono text-xs">{entry.id}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">Actor ID</span>
+          <div className="font-mono text-xs">{entry.actorId ?? "System"}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">Timestamp</span>
+          <div className="font-mono text-xs">
+            <DateTime value={entry.createdAt} variant="absolute" />
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <h4 className="text-sm font-medium mb-2">Changes</h4>
+        {hasDiff ? (
+          <div className="space-y-1">
+            {visibleEntries.map(([fieldName, change]) => (
+              <ChangeRow
+                key={fieldName}
+                columnKey={fieldName}
+                change={change}
+              />
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground italic">
+            {entry.operation === "INSERT"
+              ? "New record created"
+              : entry.operation === "DELETE"
+                ? "Record deleted"
+                : "No changes recorded"}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+});
+ExpandedRowContent.displayName = "ExpandedRowContent";
+
+const AuditLogTable = memo(({ entries, count }: AuditLogTableProps) => {
+  const { t } = useLingui();
+  const columns = useMemo<ColumnDef<AuditLogEntry>[]>(
+    () => [
+      {
+        accessorKey: "entityType",
+        header: t`Entity`,
+        cell: ({ row }) => {
+          const entry = row.original;
+          const entityPath = getEntityPath(entry.entityId);
+          return (
+            <div>
+              <div className="font-medium">
+                {getEntityLabel(
+                  entry.entityType as Parameters<typeof getEntityLabel>[0]
+                )}
+              </div>
+              {entityPath ? (
+                <Link
+                  to={entityPath}
+                  className="text-xs text-primary font-mono truncate max-w-[200px] block hover:underline"
+                >
+                  {entry.entityId}
+                </Link>
+              ) : (
+                <div className="text-xs text-muted-foreground font-mono truncate max-w-[200px]">
+                  {entry.entityId}
+                </div>
+              )}
+            </div>
+          );
+        },
+        meta: {
+          mobile: "P1",
+          filter: {
+            type: "static",
+            options: getEntityTypes().map((entityType) => ({
+              label: getEntityLabel(entityType),
+              value: entityType
+            }))
+          },
+          pluralHeader: t`Entities`
+        }
+      },
+      {
+        accessorKey: "operation",
+        header: t`Operation`,
+        cell: ({ row }) => {
+          const config = operationConfig[row.original.operation];
+          return (
+            <Badge
+              variant={config?.variant ?? "secondary"}
+              className="shrink-0"
+            >
+              <HStack className="gap-1">
+                {config?.icon}
+                <span>{config?.label ?? row.original.operation}</span>
+              </HStack>
+            </Badge>
+          );
+        },
+        meta: {
+          mobile: "P2",
+          filter: {
+            type: "static",
+            options: [
+              { label: "Created", value: "INSERT" },
+              { label: "Updated", value: "UPDATE" },
+              { label: "Deleted", value: "DELETE" }
+            ]
+          }
+        }
+      },
+      {
+        accessorKey: "actorId",
+        header: t`Changed By`,
+        meta: { mobile: "P3" },
+        cell: ({ row }) => {
+          const entry = row.original;
+          return entry.actorId ? (
+            <Link
+              to={path.to.employeeAccount(entry.actorId)}
+              className="hover:underline"
+            >
+              <EmployeeAvatar employeeId={entry.actorId} />
+            </Link>
+          ) : (
+            <span className="text-muted-foreground text-sm">System</span>
+          );
+        }
+      },
+      {
+        id: "changes",
+        header: t`Changes`,
+        cell: ({ row }) => {
+          const entry = row.original;
+          const visibleCount = visibleDiffEntries(entry.diff).length;
+          return (
+            <span className="text-sm text-muted-foreground">
+              {visibleCount > 0
+                ? `${visibleCount} change${visibleCount !== 1 ? "s" : ""}`
+                : "-"}
+            </span>
+          );
+        }
+      },
+      {
+        accessorKey: "createdAt",
+        header: t`When`,
+        meta: { mobile: "P2" },
+        cell: ({ row }) => (
+          <span className="text-sm text-muted-foreground">
+            <DateTime value={row.original.createdAt} variant="absolute" />
+          </span>
+        )
+      }
+    ],
+    [t]
+  );
+
+  const renderExpandedRow = useCallback(
+    (entry: AuditLogEntry) => <ExpandedRowContent entry={entry} />,
+    []
+  );
+
+  return (
+    <Table
+      data={entries}
+      columns={columns}
+      count={count}
+      title={t`Audit Log`}
+      table="auditLog"
+      withSearch
+      withPagination
+      renderExpandedRow={renderExpandedRow}
+    />
+  );
+});
+
+AuditLogTable.displayName = "AuditLogTable";
+export default AuditLogTable;

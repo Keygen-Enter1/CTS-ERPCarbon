@@ -1,0 +1,33 @@
+{
+  "name": "@carbon/locale",
+  "dependencies": {
+    "@carbon/env": "workspace:*",
+    "@lingui/core": "catalog:",
+    "@lingui/react": "catalog:"
+  },
+  "devDependencies": {
+    "@carbon/config": "workspace:*",
+    "@types/react": "catalog:",
+    "react": "catalog:",
+    "tsup": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "peerDependencies": {
+    "react": "catalog:"
+  },
+  "private": true,
+  "scripts": {
+    "clean": "rimraf .turbo node_modules",
+    "lint": "biome lint --write ",
+    "test": "vitest run",
+    "typecheck": "tsgo --noEmit"
+  },
+  "sideEffects": false,
+  "version": "0.0.0"
+}

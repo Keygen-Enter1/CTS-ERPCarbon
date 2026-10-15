@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useCarbon } from "@carbon/auth";
+import { getCompanyPrivateBucket, storage } from "@carbon/files";
+import { prepareImageUpload } from "@carbon/files/media";
+import { getLogger } from "@carbon/logger";
+import {
+  Button,
+  File as FileUpload,
+  HStack,
+  IconButton,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  toast
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { nanoid } from "nanoid";
+import type { ChangeEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { LuRefreshCw } from "react-icons/lu";
+import { useUser } from "~/hooks";
+import { regenerateModelThumbnail } from "~/utils/model-thumbnail";
+import { getPrivateUrl } from "~/utils/path";
+
+const logger = getLogger("erp", "itemthumnailupload");
+export function ItemThumbnailUpload({
+  path,
+  itemId,
+  modelId,
+  isReadOnly = false
+}: {
+  path?: string | null;
+  itemId: string;
+  modelId?: string | null;
+  isReadOnly?: boolean;
+}) {
+  const { t } = useLingui();
+  const { company } = useUser();
+  const { carbon } = useCarbon();
+
+  const [thumbnailPath, setThumbnailPath] = useState<string | null>(() => {
+    if (path) {
+      return getPrivateUrl(path);
+    }
+    return null;
+  });
+
+  useEffect(() => {
+    setThumbnailPath(path ? getPrivateUrl(path) : null);
+  }, [path]);
+
+  const onFileRemove = useCallback(async () => {
+    if (!carbon) {
+      toast.error(t`Carbon client not found`);
+      return;
+    }
+
+    setThumbnailPath(null);
+
+    const itemResult = await carbon
+      .from("item")
+      .update({
+        thumbnailPath: null
+      })
+      .eq("id", itemId);
+
+    if (itemResult.error) {
+      toast.error(t`Failed to remove thumbnail`);
+      return;
+    }
+
+    if (modelId) {
+      const modelResult = await carbon
+        .from("modelUpload")
+        .update({
+          thumbnailPath: null
+        })
+        .eq("id", modelId);
+
+      if (modelResult.error) {
+        toast.error(t`Failed to remove model thumbnail`);
+        return;
+      }
+    }
+
+    toast.success(t`Thumbnail removed`);
+  }, [carbon, itemId, modelId, t]);
+
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const [isRegenerating, setIsRegenerating] = useState(false);
+  const onRegenerate = useCallback(async () => {
+    if (!modelId || !carbon) return;
+    setIsRegenerating(true);
+    toast.info(t`Regenerating thumbnail…`);
+    try {
+      const path = await regenerateModelThumbnail({
+        carbon,
+        modelId,
+        isActive: () => mountedRef.current
+      });
+      if (!mountedRef.current) return;
+      if (path) {
+        setThumbnailPath(getPrivateUrl(path));
+        toast.success(t`Thumbnail updated`);
+      } else {
+        toast.info(t`Thumbnail is still generating`);
+      }
+    } catch {
+      if (mountedRef.current) toast.error(t`Failed to regenerate thumbnail`);
+    } finally {
+      if (mountedRef.current) setIsRegenerating(false);
+    }
+  }, [modelId, carbon, t]);
+
+  const onFileChange = useCallback(
+    async (e: ChangeEvent<HTMLInputElement>) => {
+      if (!carbon) {
+        toast.error(t`Carbon client not found`);
+        return;
+      }
+      const file = e.target.files?.[0];
+      if (file) {
+        toast.info(t`Uploading ${file.name}`);
+
+        try {
+          const processed = await prepareImageUpload(carbon, {
+            bucket: getCompanyPrivateBucket(company.id),
+            directory: `${company.id}/tmp`,
+            file,
+            contained: true
+          });
+
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            if (event.target?.result) {
+              const base64String = event.target.result as string;
+              setThumbnailPath(base64String);
+            }
+          };
+          reader.readAsDataURL(processed);
+
+          const fileExtension = processed.name.split(".").pop();
+          const fileName = `${nanoid()}.${fileExtension}`;
+          const thumbnailFile = new File([processed], fileName, {
+            type: processed.type
+          });
+          const { data, error } = await storage(carbon)
+            .company(company.id)
+            .upload(
+              `${company.id}/thumbnails/${itemId}/${fileName}`,
+              thumbnailFile,
+              {
+                upsert: true
+              }
+            );
+
+          if (error) {
+            toast.error(t`Failed to upload thumbnail`);
+            return;
+          }
+
+          const result = await carbon
+            .from("item")
+            .update({
+              thumbnailPath: data?.path
+            })
+            .eq("id", itemId);
+
+          if (result.error) {
+            toast.error(t`Failed to update thumbnail path`);
+            return;
+          }
+
+          if (data) {
+            setThumbnailPath(getPrivateUrl(data.path));
+            toast.success(t`Thumbnail uploaded`);
+          }
+        } catch (error) {
+          logger.error("Image processing error", { error: error });
+          toast.error(t`Failed to resize image`);
+        }
+      }
+    },
+    [carbon, company.id, itemId, t]
+  );
+
+  return (
+    <div className="relative w-full aspect-square">
+      {thumbnailPath ? (
+        <img
+          alt="thumbnail"
+          src={thumbnailPath}
+          className="w-full h-full object-cover bg-gradient-to-bl from-muted to-muted/40 rounded-lg border border-border"
+        />
+      ) : (
+        <div className="w-full h-full bg-gradient-to-bl from-muted to-muted/40 rounded-lg border border-border flex items-center justify-center">
+          <span className="text-muted-foreground">
+            <Trans>No image</Trans>
+          </span>
+        </div>
+      )}
+      {!isReadOnly && modelId && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <IconButton
+              aria-label={t`Regenerate thumbnail from the 3D model`}
+              icon={<LuRefreshCw />}
+              variant="secondary"
+              size="sm"
+              className="absolute top-2 right-2 bg-card opacity-100"
+              isLoading={isRegenerating}
+              isDisabled={isRegenerating}
+              onClick={onRegenerate}
+            />
+          </TooltipTrigger>
+          <TooltipContent>
+            <Trans>Regenerate thumbnail from the 3D model</Trans>
+          </TooltipContent>
+        </Tooltip>
+      )}
+      {!isReadOnly && (
+        <HStack className="absolute bottom-2 right-2">
+          {thumbnailPath && (
+            <Button
+              variant="secondary"
+              className="bg-card opacity-100"
+              size="sm"
+              onClick={onFileRemove}
+            >
+              <Trans>Remove</Trans>
+            </Button>
+          )}
+          <FileUpload
+            accept="image/*"
+            variant="secondary"
+            size="sm"
+            className="bg-card opacity-100"
+            onChange={onFileChange}
+          >
+            <Trans>Upload</Trans>
+          </FileUpload>
+        </HStack>
+      )}
+    </div>
+  );
+}

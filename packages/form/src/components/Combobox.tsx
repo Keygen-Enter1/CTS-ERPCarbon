@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { TermId } from "@carbon/content/glossary";
+import type { ComboboxProps as ComboboxBaseProps } from "@carbon/react";
+import {
+  Combobox as ComboboxBase,
+  FormControl,
+  FormErrorMessage,
+  FormHelperText,
+  FormLabel,
+  LabelWithHelp
+} from "@carbon/react";
+import type { ReactNode } from "react";
+import { useEffect } from "react";
+import { flushSync } from "react-dom";
+import { useControlField, useField } from "../hooks";
+import { useFormStateContext } from "../internal/formStateContext";
+
+export type ComboboxProps = Omit<ComboboxBaseProps, "onChange"> & {
+  name: string;
+  label?: string;
+  termId?: TermId;
+  isLoading?: boolean;
+  isOptional?: boolean;
+  isRequired?: boolean;
+  helperText?: string;
+  emptyMessage?: ReactNode;
+  onChange?: (
+    newValue: { value: string; label: string | React.ReactNode } | null
+  ) => void;
+  inline?: (
+    value: string,
+    options: {
+      value: string;
+      label: string | React.ReactNode;
+      helper?: string;
+    }[]
+  ) => React.ReactNode;
+};
+
+const Combobox = ({
+  name,
+  label,
+  termId,
+  isLoading = false,
+  isOptional,
+  isRequired,
+  helperText,
+  emptyMessage,
+  ...props
+}: ComboboxProps) => {
+  const { getInputProps, error, isOptional: fieldIsOptional } = useField(name);
+  const [value, setValue] = useControlField<string | undefined>(name);
+  const formState = useFormStateContext();
+  const isReadOnly =
+    formState.isReadOnly || formState.isDisabled || props.isReadOnly;
+  const resolvedIsOptional =
+    isOptional ?? (isRequired ? false : (fieldIsOptional ?? false));
+
+  useEffect(() => {
+    if (props.value !== null && props.value !== undefined)
+      setValue(props.value ?? "");
+  }, [props.value, setValue]);
+
+  const onChange = (value: string) => {
+    if (value) {
+      props?.onChange?.(props?.options.find((o) => o.value === value) ?? null);
+    } else {
+      props?.onChange?.(null);
+    }
+  };
+
+  return (
+    <FormControl isInvalid={!!error} isRequired={isRequired}>
+      {label && (
+        <FormLabel htmlFor={name} isOptional={resolvedIsOptional}>
+          <LabelWithHelp termId={termId}>{label}</LabelWithHelp>
+        </FormLabel>
+      )}
+      <input
+        {...getInputProps({
+          id: name,
+          value: value ?? ""
+        })}
+        type="hidden"
+        name={name}
+        id={name}
+      />
+      <ComboboxBase
+        {...props}
+        value={value}
+        onChange={(newValue) => {
+          flushSync(() => {
+            setValue(newValue?.replace(/"/g, '\\"') ?? "");
+          });
+          onChange(newValue?.replace(/"/g, '\\"') ?? "");
+        }}
+        isClearable={resolvedIsOptional && !isReadOnly}
+        isReadOnly={isReadOnly}
+        isLoading={isLoading}
+        emptyMessage={isLoading ? undefined : emptyMessage}
+        className="w-full"
+      />
+      {error ? (
+        <FormErrorMessage>{error}</FormErrorMessage>
+      ) : (
+        helperText && <FormHelperText>{helperText}</FormHelperText>
+      )}
+    </FormControl>
+  );
+};
+
+Combobox.displayName = "Combobox";
+
+export default Combobox;

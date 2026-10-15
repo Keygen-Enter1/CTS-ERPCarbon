@@ -1,0 +1,773 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { getSalesOrderLineTotal } from "@carbon/documents/utils";
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  cn,
+  Heading,
+  HStack,
+  Table,
+  Tbody,
+  Td,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  Tr,
+  TruncatedTooltipText,
+  useDisclosure,
+  useViewport,
+  VStack
+} from "@carbon/react";
+import type { SalesOrderForProductionCheck } from "@carbon/utils";
+import {
+  distinctItemText,
+  getSalesOrderJobStatus,
+  hasLinesRequiringJobs
+} from "@carbon/utils";
+import {
+  getLocalTimeZone,
+  isSameDay,
+  parseDate,
+  today
+} from "@internationalized/date";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useLocale } from "@react-aria/i18n";
+import { motion } from "motion/react";
+import { useMemo, useState } from "react";
+import {
+  LuChevronRight,
+  LuEllipsisVertical,
+  LuImage,
+  LuInfo,
+  LuTriangleAlert
+} from "react-icons/lu";
+import { Link, useParams } from "react-router";
+import {
+  CustomerAvatar,
+  DateTime,
+  Hyperlink,
+  MethodIcon,
+  MotionMoney
+} from "~/components";
+import { Confirm } from "~/components/Modals";
+import { SummaryLineList, SummaryLineRow } from "~/components/SummaryLineRow";
+import {
+  useCurrencyDecimals,
+  useCurrencyFormatter,
+  usePercentFormatter,
+  usePermissions,
+  useRouteData,
+  useUser
+} from "~/hooks";
+import JobStatus from "~/modules/production/ui/Jobs/JobStatus";
+import { getPrivateUrl, path } from "~/utils/path";
+import { isSalesOrderLocked } from "../../sales.models";
+import type {
+  Customer,
+  Quotation,
+  SalesOrder,
+  SalesOrderJob,
+  SalesOrderLine
+} from "../../types";
+import { SalesOrderJobItem } from "./SalesOrderLineJobs";
+
+const SalesOrderSummary = ({
+  onEditShippingCost
+}: {
+  onEditShippingCost: () => void;
+}) => {
+  const { t } = useLingui();
+  const { isPhone } = useViewport();
+  const { orderId } = useParams();
+  if (!orderId) throw new Error("Could not find orderId");
+
+  const routeData = useRouteData<{
+    salesOrder: SalesOrder;
+    lines: SalesOrderLine[];
+    customer: Customer;
+    quote: Quotation;
+    invoiceSummary: {
+      invoicedAmount: number;
+      paidAmount: number;
+      currencyMismatchCount: number;
+    };
+  }>(path.to.salesOrder(orderId));
+
+  const salesOrderToJobsModal = useDisclosure();
+
+  const { locale } = useLocale();
+  const { company } = useUser();
+  const baseCurrency = company?.baseCurrencyCode ?? "USD";
+  // Base currency: this formats `line.unitPrice`, a base-currency column. The
+  // order-currency figure is `convertedUnitPrice`, rendered above the badge.
+  const formatter = useCurrencyFormatter({ currency: baseCurrency });
+
+  const isEditable = !isSalesOrderLocked(routeData?.salesOrder?.status);
+  // Settlement money at the document currency's configured decimals.
+  const currencyDecimals = useCurrencyDecimals(
+    routeData?.salesOrder?.currencyCode ?? "USD"
+  );
+
+  // Calculate totals
+  const subtotal =
+    routeData?.lines?.reduce((acc, line) => {
+      const lineTotal =
+        (line.convertedUnitPrice ?? 0) * (line.saleQuantity ?? 0);
+      const addOns =
+        (line.convertedAddOnCost ?? 0) +
+        (line.convertedNonTaxableAddOnCost ?? 0) +
+        (line.convertedShippingCost ?? 0);
+      return acc + lineTotal + addOns;
+    }, 0) ?? 0;
+
+  const tax =
+    routeData?.lines?.reduce((acc, line) => {
+      const lineTotal =
+        (line.convertedUnitPrice ?? 0) * (line.saleQuantity ?? 0);
+      const taxableAddOns =
+        (line.convertedAddOnCost ?? 0) + (line.convertedShippingCost ?? 0);
+      return acc + (lineTotal + taxableAddOns) * (line.taxPercent ?? 0);
+    }, 0) ?? 0;
+
+  const convertedShippingCost =
+    (routeData?.salesOrder?.exchangeRate ?? 1) *
+    (routeData?.salesOrder?.shippingCost ?? 0);
+  const total = subtotal + tax + convertedShippingCost;
+  const permissions = usePermissions();
+
+  const linesRequireJobs = hasLinesRequiringJobs({
+    jobs: routeData?.salesOrder?.jobs as SalesOrderForProductionCheck["jobs"],
+    lines: routeData?.salesOrder?.lines as SalesOrderForProductionCheck["lines"]
+  });
+
+  // Services never ship, so an all-service order confirms straight to
+  // "To Invoice" (getSalesOrderStatus counts Service lines as shipped) and
+  // never passes through the "To Ship" states — but its Make to Order
+  // service lines still need jobs.
+  const hasMakeServiceItems =
+    routeData?.lines?.some(
+      (line) =>
+        line.methodType === "Make to Order" &&
+        line.salesOrderLineType === "Service"
+    ) ?? false;
+
+  const jobsCardStatusMatches =
+    ["To Ship and Invoice", "To Ship"].includes(
+      routeData?.salesOrder?.status ?? ""
+    ) ||
+    (routeData?.salesOrder?.status === "To Invoice" && hasMakeServiceItems);
+
+  return (
+    <>
+      {jobsCardStatusMatches &&
+        permissions.can("create", "production") &&
+        permissions.is("employee") &&
+        linesRequireJobs && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex flex-row gap-2">
+                <LuTriangleAlert /> <Trans>Jobs Required</Trans>
+              </CardTitle>
+              <CardDescription>
+                <Trans>
+                  This sales order has lines that require jobs to be created
+                </Trans>
+              </CardDescription>
+            </CardHeader>
+            <CardFooter>
+              <Button variant="primary" onClick={salesOrderToJobsModal.onOpen}>
+                <Trans>Create Jobs</Trans>
+              </Button>
+            </CardFooter>
+            {salesOrderToJobsModal.isOpen && (
+              <Confirm
+                title={t`Convert Lines to Jobs`}
+                text={t`Are you sure you want to create jobs for this sales order? This will create jobs for all lines that don't already have jobs.`}
+                confirmText={t`Create Jobs`}
+                onCancel={salesOrderToJobsModal.onClose}
+                onSubmit={salesOrderToJobsModal.onClose}
+                action={path.to.salesOrderLinesToJobs(orderId)}
+              />
+            )}
+          </Card>
+        )}
+      <Card>
+        <CardHeader>
+          <HStack className="justify-between items-center max-md:min-w-0">
+            <div className="flex flex-col gap-1 max-md:hidden">
+              <CardTitle>{routeData?.salesOrder.salesOrderId}</CardTitle>
+            </div>
+            <div className="flex flex-col gap-1 items-end max-md:w-full max-md:min-w-0 max-md:items-start max-md:[&>*]:max-w-full max-md:[&_span]:truncate">
+              <CustomerAvatar
+                customerId={routeData?.salesOrder.customerId ?? null}
+              />
+              {routeData?.salesOrder?.orderDate && (
+                <span className="text-xs text-muted-foreground tracking-tight">
+                  <Trans>Ordered</Trans>{" "}
+                  <DateTime
+                    value={routeData?.salesOrder.orderDate}
+                    variant="date"
+                  />
+                </span>
+              )}
+              {routeData?.quote?.digitalQuoteAcceptedBy && (
+                <span className="text-xs text-muted-foreground tracking-tight flex flex-row items-center gap-x-1">
+                  <Trans>via Digital Quote</Trans>
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <LuInfo className="size-4" />
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <div className="flex flex-col gap-y-0">
+                        <span>{routeData?.quote?.digitalQuoteAcceptedBy}</span>
+                        <span>
+                          {routeData?.quote?.digitalQuoteAcceptedByEmail}
+                        </span>
+                      </div>
+                    </TooltipContent>
+                  </Tooltip>
+                </span>
+              )}
+            </div>
+          </HStack>
+        </CardHeader>
+        <CardContent>
+          <LineItems
+            salesOrder={routeData?.salesOrder}
+            currencyCode={routeData?.salesOrder?.currencyCode ?? "USD"}
+            locale={locale}
+            formatter={formatter}
+            lines={routeData?.lines ?? []}
+          />
+
+          <VStack spacing={2} className="mt-8">
+            <HStack className="justify-between text-sm text-muted-foreground w-full">
+              <span>
+                <Trans>Subtotal:</Trans>
+              </span>
+              <MotionMoney
+                value={subtotal}
+                currency={routeData?.salesOrder?.currencyCode ?? "USD"}
+                decimalPlaces={currencyDecimals}
+              />
+            </HStack>
+            <HStack className="justify-between text-sm text-muted-foreground w-full">
+              <span>
+                <Trans>Tax:</Trans>
+              </span>
+              <MotionMoney
+                value={tax}
+                currency={routeData?.salesOrder?.currencyCode ?? "USD"}
+                decimalPlaces={currencyDecimals}
+              />
+            </HStack>
+            {isPhone ? (
+              // Phones: one tappable Shipping row in place of the Add / Edit
+              // Shipping links.
+              convertedShippingCost > 0 || isEditable ? (
+                <button
+                  type="button"
+                  className="flex min-h-11 w-full items-center justify-between text-sm text-muted-foreground"
+                  onClick={onEditShippingCost}
+                >
+                  <span>
+                    <Trans>Shipping:</Trans>
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <MotionMoney
+                      value={convertedShippingCost}
+                      currency={routeData?.salesOrder?.currencyCode ?? "USD"}
+                      decimalPlaces={currencyDecimals}
+                    />
+                    <LuChevronRight className="size-4" />
+                  </span>
+                </button>
+              ) : null
+            ) : (
+              <HStack className="justify-between text-sm text-muted-foreground w-full">
+                {convertedShippingCost > 0 ? (
+                  <>
+                    <VStack spacing={0}>
+                      <span>
+                        <Trans>Shipping:</Trans>
+                      </span>
+                      <Button
+                        variant="link"
+                        size="sm"
+                        className="text-muted-foreground"
+                        onClick={onEditShippingCost}
+                      >
+                        <Trans>Edit Shipping</Trans>
+                      </Button>
+                    </VStack>
+                    <MotionMoney
+                      value={convertedShippingCost}
+                      currency={routeData?.salesOrder?.currencyCode ?? "USD"}
+                      decimalPlaces={currencyDecimals}
+                    />
+                  </>
+                ) : isEditable ? (
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="text-primary"
+                    onClick={onEditShippingCost}
+                  >
+                    <Trans>Add Shipping</Trans>
+                  </Button>
+                ) : null}
+              </HStack>
+            )}
+            <HStack className="justify-between text-xl font-semibold w-full">
+              <span>
+                <Trans>Total:</Trans>
+              </span>
+              <MotionMoney
+                value={total}
+                currency={routeData?.salesOrder?.currencyCode ?? "USD"}
+                decimalPlaces={currencyDecimals}
+              />
+            </HStack>
+            <div className="h-px bg-border my-2 w-full" />
+            <HStack className="justify-between text-sm text-muted-foreground w-full">
+              <span>
+                <Trans>Invoiced Amount:</Trans>
+              </span>
+              <MotionMoney
+                value={routeData?.invoiceSummary?.invoicedAmount ?? 0}
+                currency={routeData?.salesOrder?.currencyCode ?? "USD"}
+                decimalPlaces={currencyDecimals}
+              />
+            </HStack>
+            <HStack className="justify-between text-sm text-muted-foreground w-full">
+              <span>
+                <Trans>Paid Amount:</Trans>
+              </span>
+              <MotionMoney
+                value={routeData?.invoiceSummary?.paidAmount ?? 0}
+                currency={routeData?.salesOrder?.currencyCode ?? "USD"}
+                decimalPlaces={currencyDecimals}
+              />
+            </HStack>
+            {(routeData?.invoiceSummary?.currencyMismatchCount ?? 0) > 0 && (
+              <span className="text-xs text-muted-foreground">
+                Excludes {routeData?.invoiceSummary?.currencyMismatchCount}{" "}
+                invoice
+                {(routeData?.invoiceSummary?.currencyMismatchCount ?? 0) > 1
+                  ? "s"
+                  : ""}{" "}
+                in a different currency.
+              </span>
+            )}
+          </VStack>
+        </CardContent>
+      </Card>
+    </>
+  );
+};
+
+function LineItems({
+  currencyCode,
+  locale,
+  formatter,
+  lines,
+  salesOrder
+}: {
+  currencyCode: string;
+  formatter: Intl.NumberFormat;
+  locale: string;
+  lines: SalesOrderLine[];
+  salesOrder?: SalesOrder;
+}) {
+  const { orderId } = useParams();
+  if (!orderId) throw new Error("Could not find orderId");
+
+  const { t } = useLingui();
+  const { isPhone } = useViewport();
+  const percentFormatter = usePercentFormatter();
+  // Settlement money at the document currency's configured decimals.
+  const currencyDecimals = useCurrencyDecimals(currencyCode);
+  const [openItems, setOpenItems] = useState<string[]>([]);
+  const todaysDate = useMemo(() => today(getLocalTimeZone()), []);
+
+  const toggleOpen = (id: string) => {
+    setOpenItems((prev) =>
+      prev.includes(id) ? prev.filter?.((item) => item !== id) : [...prev, id]
+    );
+  };
+
+  // Phones: one row per line that opens the line page (its Edit link, the
+  // badges and the breakdown stay on desktop).
+  if (isPhone) {
+    return (
+      <SummaryLineList>
+        {lines.map((line) =>
+          line.id ? (
+            <SummaryLineRow
+              key={line.id}
+              to={path.to.salesOrderLine(orderId, line.id)}
+              title={
+                line.salesOrderLineType === "Fixed Asset"
+                  ? line.assetReadableId || t`Fixed Asset`
+                  : line.itemReadableId
+              }
+              value={
+                <MotionMoney
+                  value={getSalesOrderLineTotal(line)}
+                  currency={currencyCode}
+                  decimalPlaces={currencyDecimals}
+                />
+              }
+              description={distinctItemText(
+                line.salesOrderLineType === "Fixed Asset"
+                  ? line.assetReadableId || t`Fixed Asset`
+                  : line.itemReadableId,
+                line.description
+              )}
+              meta={
+                <>
+                  {line.saleQuantity} × {formatter.format(line.unitPrice ?? 0)}{" "}
+                  {line.unitOfMeasureCode}
+                </>
+              }
+            />
+          ) : null
+        )}
+      </SummaryLineList>
+    );
+  }
+
+  return (
+    <VStack spacing={8} className="w-full overflow-hidden">
+      {lines.map((line) => {
+        if (!line.id) return null;
+
+        const isMade = line.methodType === "Make to Order";
+        const title =
+          line.salesOrderLineType === "Fixed Asset"
+            ? (line as any).assetReadableId || "Fixed Asset"
+            : line.itemReadableId;
+        const description = distinctItemText(title, line.description);
+
+        const isService = line.salesOrderLineType === "Service";
+        const { jobLabel, jobVariant, jobs } = getSalesOrderJobStatus(
+          // @ts-expect-error TS2345 - TODO: fix type
+          salesOrder?.jobs as SalesOrderJob[] | undefined,
+          line as any
+        );
+
+        return (
+          <motion.div
+            key={line.id}
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="border-b border-input py-6 w-full"
+          >
+            <HStack spacing={4} className="items-start">
+              {line.thumbnailPath ? (
+                <img
+                  alt={line.itemReadableId!}
+                  className="w-24 h-24 shrink-0 bg-gradient-to-bl from-muted to-muted/40 rounded-lg"
+                  src={getPrivateUrl(line.thumbnailPath)}
+                />
+              ) : (
+                <div className="w-24 h-24 shrink-0 bg-gradient-to-bl from-muted to-muted/40 rounded-lg p-4">
+                  <LuImage className="w-16 h-16 text-muted-foreground" />
+                </div>
+              )}
+
+              <VStack spacing={0} className="flex-1 min-w-0">
+                <div
+                  className="flex flex-col cursor-pointer w-full"
+                  onClick={() => toggleOpen(line.id!)}
+                >
+                  {/* The text column must shrink (flex-1 min-w-0) or a long
+                      description shoves the totals out of the card, and its
+                      children need w-full because VStack is items-start, which
+                      sizes each child to its own content and leaves truncate
+                      inert no matter how narrow the column gets. */}
+                  <div className="flex items-center justify-between w-full">
+                    <VStack spacing={0} className="flex-1 min-w-0">
+                      <HStack spacing={2} className="flex min-w-0 w-full">
+                        <Heading className="truncate">{title}</Heading>
+                        <Button
+                          asChild
+                          variant="link"
+                          size="sm"
+                          className="text-muted-foreground flex-shrink-0"
+                        >
+                          <Link to={path.to.salesOrderLine(orderId, line.id!)}>
+                            <Trans>Edit</Trans>
+                          </Link>
+                        </Button>
+                      </HStack>
+                      {description && (
+                        <TruncatedTooltipText
+                          className="text-muted-foreground text-sm truncate w-full"
+                          tooltip={description}
+                        >
+                          {description}
+                        </TruncatedTooltipText>
+                      )}
+                    </VStack>
+                    <VStack
+                      spacing={2}
+                      className="flex-shrink-0 items-end w-auto"
+                    >
+                      <HStack spacing={4}>
+                        <MotionMoney
+                          className="font-semibold text-xl whitespace-nowrap"
+                          value={getSalesOrderLineTotal(line)}
+                          currency={currencyCode}
+                          decimalPlaces={currencyDecimals}
+                        />
+                        <motion.div
+                          animate={{
+                            rotate: openItems.includes(line.id) ? 90 : 0
+                          }}
+                          transition={{ duration: 0.3 }}
+                        >
+                          <LuChevronRight size={24} />
+                        </motion.div>
+                      </HStack>
+                      <div className="flex items-center gap-2">
+                        <Badge
+                          variant="outline"
+                          className="flex items-center gap-2"
+                        >
+                          {line.saleQuantity}
+                          {line.salesOrderLineType !== "Fixed Asset" && (
+                            <MethodIcon
+                              type={line.methodType ?? "Pull from Inventory"}
+                            />
+                          )}
+                        </Badge>
+                        <Badge variant="green">
+                          {formatter.format(line.unitPrice ?? 0)}{" "}
+                          {line.unitOfMeasureCode}
+                        </Badge>
+                        {(line.taxPercent ?? 0) > 0 ? (
+                          <Badge variant="red">
+                            {percentFormatter.format(line.taxPercent ?? 0)} Tax
+                          </Badge>
+                        ) : null}
+                      </div>
+                    </VStack>
+                  </div>
+
+                  {isMade && (
+                    <div className="mt-2 flex flex-row items-end gap-x-2">
+                      <Badge variant={jobVariant}>{jobLabel}</Badge>
+                      {jobs.length > 0 && (
+                        <Tooltip>
+                          <TooltipTrigger>
+                            <Badge variant="secondary">
+                              {jobs.length} <Trans>Jobs</Trans>
+                              <LuEllipsisVertical className="w-3 h-3 ml-2" />
+                            </Badge>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <div className="flex flex-col w-full gap-4 text-sm">
+                              {jobs.map((job) => (
+                                <div
+                                  key={job.id}
+                                  className="flex items-center justify-between gap-2"
+                                >
+                                  <Hyperlink
+                                    to={path.to.jobDetails(job.id)}
+                                    className="flex items-center justify-start gap-1 min-w-[200px]"
+                                  >
+                                    {job.jobId}
+                                  </Hyperlink>
+                                  <HStack spacing={1}>
+                                    <JobStatus status={job.status} />
+                                    {[
+                                      "Draft",
+                                      "Planned",
+                                      "In Progress",
+                                      "Ready",
+                                      "Paused"
+                                    ].includes(job.status ?? "") && (
+                                      <>
+                                        {job.dueDate &&
+                                          isSameDay(
+                                            parseDate(job.dueDate),
+                                            todaysDate
+                                          ) && <JobStatus status="Due Today" />}
+                                        {job.dueDate &&
+                                          parseDate(job.dueDate) <
+                                            todaysDate && (
+                                            <JobStatus status="Overdue" />
+                                          )}
+                                      </>
+                                    )}
+                                  </HStack>
+                                </div>
+                              ))}
+                            </div>
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </VStack>
+            </HStack>
+
+            <motion.div
+              initial="collapsed"
+              animate={openItems.includes(line.id) ? "open" : "collapsed"}
+              variants={{
+                open: { opacity: 1, height: "auto", marginTop: 16 },
+                collapsed: { opacity: 0, height: 0, marginTop: 0 }
+              }}
+              transition={{ duration: 0.3 }}
+              className="w-full overflow-hidden"
+            >
+              <div className="flex flex-col gap-y-4 w-full">
+                <Table>
+                  <Tbody>
+                    <Tr>
+                      <Td>Quantity</Td>
+                      <Td className="text-right">{line.saleQuantity}</Td>
+                    </Tr>
+                    <Tr>
+                      <Td>Unit Price</Td>
+                      <Td className="text-right">
+                        <MotionMoney
+                          value={line.convertedUnitPrice ?? 0}
+                          currency={currencyCode}
+                          decimalPlaces={currencyDecimals}
+                          rate
+                        />
+                      </Td>
+                    </Tr>
+                    <Tr className="border-b border-border">
+                      <Td>Extended Price</Td>
+                      <Td className="text-right">
+                        <MotionMoney
+                          value={
+                            (line.convertedUnitPrice ?? 0) *
+                            (line.saleQuantity ?? 0)
+                          }
+                          currency={currencyCode}
+                          decimalPlaces={currencyDecimals}
+                        />
+                      </Td>
+                    </Tr>
+
+                    {Number(line.addOnCost ?? 0) > 0 && (
+                      <Tr>
+                        <Td>Additional Charges</Td>
+                        <Td className="text-right">
+                          <MotionMoney
+                            value={line.addOnCost ?? 0}
+                            currency={currencyCode}
+                            decimalPlaces={currencyDecimals}
+                          />
+                        </Td>
+                      </Tr>
+                    )}
+
+                    {Number(line.nonTaxableAddOnCost ?? 0) > 0 && (
+                      <Tr>
+                        <Td>Non-Taxable Charges</Td>
+                        <Td className="text-right">
+                          <MotionMoney
+                            value={line.nonTaxableAddOnCost ?? 0}
+                            currency={currencyCode}
+                            decimalPlaces={currencyDecimals}
+                          />
+                        </Td>
+                      </Tr>
+                    )}
+
+                    <Tr key="subtotal">
+                      <Td>Subtotal</Td>
+                      <Td className="text-right">
+                        <MotionMoney
+                          value={
+                            (line.convertedUnitPrice ?? 0) *
+                              (line.saleQuantity ?? 0) +
+                            (line.convertedAddOnCost ?? 0) +
+                            (line.convertedNonTaxableAddOnCost ?? 0) +
+                            (line.convertedShippingCost ?? 0)
+                          }
+                          currency={currencyCode}
+                          decimalPlaces={currencyDecimals}
+                        />
+                      </Td>
+                    </Tr>
+
+                    <Tr key="tax" className="border-b border-border">
+                      <Td>
+                        Tax ({percentFormatter.format(line.taxPercent ?? 0)})
+                      </Td>
+                      <Td className="text-right">
+                        <MotionMoney
+                          value={
+                            ((line.convertedUnitPrice ?? 0) *
+                              (line.saleQuantity ?? 0) +
+                              (line.convertedAddOnCost ?? 0) +
+                              (line.convertedShippingCost ?? 0)) *
+                            (line.taxPercent ?? 0)
+                          }
+                          currency={currencyCode}
+                          decimalPlaces={currencyDecimals}
+                        />
+                      </Td>
+                    </Tr>
+
+                    <Tr key="total" className="font-semibold">
+                      <Td>Total</Td>
+                      <Td className="text-right">
+                        <MotionMoney
+                          value={getSalesOrderLineTotal(line)}
+                          currency={currencyCode}
+                          decimalPlaces={currencyDecimals}
+                        />
+                      </Td>
+                    </Tr>
+                  </Tbody>
+                </Table>
+
+                {isMade && jobs.length > 0 && (
+                  <div className="border rounded-lg">
+                    {jobs
+                      .sort((a, b) =>
+                        (a.jobId ?? "").localeCompare(b.jobId ?? "")
+                      )
+                      .map((job, index) => (
+                        <div
+                          key={job.id}
+                          className={cn(
+                            "border-b p-6",
+                            index === jobs.length - 1 && "border-b-0"
+                          )}
+                        >
+                          {/* @ts-expect-error TS2739 */}
+                          <SalesOrderJobItem job={job} isService={isService} />
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        );
+      })}
+    </VStack>
+  );
+}
+
+export default SalesOrderSummary;

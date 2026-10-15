@@ -1,0 +1,931 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+import { Constants } from "@carbon/database";
+import { describe, expect, it } from "vitest";
+import {
+  type Catalog,
+  type ColumnInfo,
+  type CompanyBackup,
+  type ForeignKey,
+  isUserScopedIdentityTable,
+  READABLE_ID_TABLES,
+  STORAGE_PATH_COLUMNS,
+  selectWipeableTables,
+  type TableInfo
+} from "./company-backup";
+import {
+  assertReferentiallyClosed,
+  buildIdMaps,
+  buildRowTransforms,
+  findDanglingReferences,
+  mapCollidingRows,
+  matchableUniqueGroups,
+  referencedDroppedTables
+} from "./company-backup.transforms";
+
+// ── Tiny synthetic-catalog builders ─────────────────────────────────────────
+// The closure check is a pure function of (catalog, data), so these tests need
+// no database — they pin the ONE definition of "referentially closed" that the
+// restore preflight relies on, so a schema/data shape that would dangle a
+// restore fails here in CI instead of mid-load in production.
+
+function col(name: string, opts: { nullable?: boolean } = {}): ColumnInfo {
+  return {
+    name,
+    dataType: "text",
+    udtName: "text",
+    isNullable: opts.nullable ?? false,
+    isGenerated: false,
+    hasDefault: false
+  };
+}
+
+function table(
+  name: string,
+  columns: ColumnInfo[],
+  foreignKeys: ForeignKey[] = [],
+  opts: { pkColumns?: string[]; uniqueColumns?: string[] } = {}
+): TableInfo {
+  const pkColumns =
+    opts.pkColumns ?? (columns.some((c) => c.name === "id") ? ["id"] : []);
+  return {
+    name,
+    columns,
+    scope: { kind: "direct", column: "companyId" },
+    scopeColumn: "companyId",
+    pkColumns,
+    uniqueColumns: opts.uniqueColumns ?? pkColumns,
+    hasId: pkColumns.length === 1 && pkColumns[0] === "id",
+    foreignKeys
+  };
+}
+
+function fk(column: string, refTable: string): ForeignKey {
+  return { column, refTable, refColumn: "id" };
+}
+
+function catalog(tables: TableInfo[]): Catalog {
+  return { schemaVersion: "test", tables };
+}
+
+const ITEM = table("item", [col("id"), col("companyId")]);
+const NCI = table(
+  "nonConformanceItem",
+  [col("id"), col("itemId"), col("companyId")],
+  [fk("itemId", "item")]
+);
+
+describe("findDanglingReferences", () => {
+  it("returns nothing when every FK resolves within the backup", () => {
+    const result = findDanglingReferences(catalog([ITEM, NCI]), {
+      item: [{ id: "i1", companyId: "c1" }],
+      nonConformanceItem: [{ id: "nc1", itemId: "i1", companyId: "c1" }]
+    });
+    expect(result).toEqual([]);
+  });
+
+  it("flags a NOT-NULL FK pointing at a row the backup omits, aggregating count", () => {
+    const result = findDanglingReferences(catalog([ITEM, NCI]), {
+      item: [{ id: "i1", companyId: "c1" }],
+      nonConformanceItem: [
+        { id: "nc1", itemId: "i1", companyId: "c1" },
+        { id: "nc2", itemId: "missing-x", companyId: "c1" },
+        { id: "nc3", itemId: "missing-y", companyId: "c1" }
+      ]
+    });
+    expect(result).toEqual([
+      {
+        table: "nonConformanceItem",
+        column: "itemId",
+        refTable: "item",
+        fatal: true,
+        sampleValue: "missing-x",
+        count: 2
+      }
+    ]);
+  });
+
+  it("treats a missing NULLABLE FK as a non-fatal warning (restore nulls it)", () => {
+    const nciNullable = table(
+      "nonConformanceItem",
+      [col("id"), col("itemId", { nullable: true }), col("companyId")],
+      [fk("itemId", "item")]
+    );
+    const result = findDanglingReferences(catalog([ITEM, nciNullable]), {
+      item: [],
+      nonConformanceItem: [{ id: "nc1", itemId: "missing", companyId: "c1" }]
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.fatal).toBe(false);
+  });
+
+  it("resolves a NOT-NULL FK against target substrate ids (a global row the backup omits)", () => {
+    // A company's materialDimension points at a globally-seeded materialForm
+    // (companyId IS NULL) that the backup deliberately omits. With no knowledge
+    // of the target it reads as a gap; once the target is known to hold that
+    // global row (substrate), it resolves. No allow-list, no nullable-column
+    // heuristic — driven by the actual ids present in the target.
+    const materialForm = table("materialForm", [col("id"), col("companyId")]);
+    const materialDimension = table(
+      "materialDimension",
+      [col("id"), col("materialFormId"), col("companyId")],
+      [fk("materialFormId", "materialForm")]
+    );
+    const cat = catalog([materialForm, materialDimension]);
+    const data = {
+      materialForm: [], // global rows live in the target seed, not the backup
+      materialDimension: [
+        { id: "md1", materialFormId: "round-bar", companyId: "c1" }
+      ]
+    };
+    // Without target knowledge the omitted global ref looks like a gap…
+    expect(findDanglingReferences(cat, data)).toHaveLength(1);
+    // …but when the target is known to hold that global row, it resolves.
+    const substrate = new Map([
+      ["materialForm", new Set<unknown>(["round-bar"])]
+    ]);
+    expect(findDanglingReferences(cat, data, substrate)).toEqual([]);
+  });
+
+  it("resolves a FK into a composite-PK parent (`(id, companyId)`, hasId=false)", () => {
+    // ~25 Carbon tables key on a composite ("id", "companyId") PK (stockTransfer,
+    // supplierPart, …) so `hasId` is false. Their `id` is still the referenced
+    // column, so their rows MUST be tracked — gating on `hasId` left them
+    // untracked and falsely flagged every child as dangling, refusing the
+    // restore of an otherwise self-contained backup.
+    const stockTransfer = table(
+      "stockTransfer",
+      [col("id"), col("companyId")],
+      [],
+      { pkColumns: ["id", "companyId"] }
+    );
+    const stockTransferLine = table(
+      "stockTransferLine",
+      [col("id"), col("stockTransferId"), col("companyId")],
+      [fk("stockTransferId", "stockTransfer")],
+      { pkColumns: ["id", "companyId"] }
+    );
+    expect(stockTransfer.hasId).toBe(false);
+    const result = findDanglingReferences(
+      catalog([stockTransfer, stockTransferLine]),
+      {
+        stockTransfer: [{ id: "st1", companyId: "c1" }],
+        stockTransferLine: [
+          { id: "stl1", stockTransferId: "st1", companyId: "c1" }
+        ]
+      }
+    );
+    expect(result).toEqual([]);
+  });
+
+  it("ignores a secret table's rows referencing another stripped secret (old backup)", () => {
+    // apiKeyRateLimit joined SECRET_TABLES, but a backup made before that still
+    // carries its rows pointing at the always-stripped secret `apiKey`. Those
+    // rows are skipped on load, so the preflight must not report them as a gap.
+    const apiKey = table("apiKey", [col("id"), col("companyId")]);
+    const apiKeyRateLimit = table(
+      "apiKeyRateLimit",
+      [col("apiKeyId"), col("companyId")],
+      [fk("apiKeyId", "apiKey")],
+      { pkColumns: ["apiKeyId"] }
+    );
+    const result = findDanglingReferences(catalog([apiKey, apiKeyRateLimit]), {
+      apiKey: [], // secret → never exported
+      apiKeyRateLimit: [{ apiKeyId: "api_x", companyId: "c1" }]
+    });
+    expect(result).toEqual([]);
+  });
+
+  it("still flags a missing NOT-NULL FK into an ordinary company table (revert did not loosen general closure)", () => {
+    // A non-reference company table (item) is NOT in the deferral set, so a
+    // dangling NOT-NULL ref to it is a fatal closure gap, as before.
+    const result = findDanglingReferences(catalog([ITEM, NCI]), {
+      item: [],
+      nonConformanceItem: [{ id: "nc1", itemId: "gone", companyId: "c1" }]
+    });
+    expect(result).toEqual([
+      {
+        table: "nonConformanceItem",
+        column: "itemId",
+        refTable: "item",
+        fatal: true,
+        sampleValue: "gone",
+        count: 1
+      }
+    ]);
+  });
+
+  it("ignores a null FK value", () => {
+    const nciNullable = table(
+      "nonConformanceItem",
+      [col("id"), col("itemId", { nullable: true }), col("companyId")],
+      [fk("itemId", "item")]
+    );
+    const result = findDanglingReferences(catalog([ITEM, nciNullable]), {
+      item: [],
+      nonConformanceItem: [{ id: "nc1", itemId: null, companyId: "c1" }]
+    });
+    expect(result).toEqual([]);
+  });
+
+  it("ignores FKs to retained tables (user/employee/company/companyGroup)", () => {
+    const withUserFk = table(
+      "trainingCompletion",
+      [col("id"), col("employeeId"), col("companyId")],
+      [fk("employeeId", "user")]
+    );
+    const result = findDanglingReferences(catalog([withUserFk]), {
+      trainingCompletion: [
+        { id: "t1", employeeId: "some-user-not-in-backup", companyId: "c1" }
+      ]
+    });
+    expect(result).toEqual([]);
+  });
+
+  it("ignores FKs to non-scoped global tables absent from the catalog", () => {
+    const withGlobalFk = table(
+      "part",
+      [col("id"), col("unitOfMeasureCode"), col("companyId")],
+      [fk("unitOfMeasureCode", "unitOfMeasure")] // not in catalog → stable global
+    );
+    const result = findDanglingReferences(catalog([withGlobalFk]), {
+      part: [{ id: "p1", unitOfMeasureCode: "EA", companyId: "c1" }]
+    });
+    expect(result).toEqual([]);
+  });
+});
+
+describe("assertReferentiallyClosed", () => {
+  const backup = (
+    data: Record<string, Array<Record<string, unknown>>>
+  ): CompanyBackup => ({ manifest: {} as CompanyBackup["manifest"], data });
+
+  it("is ok for a self-contained backup", () => {
+    const result = assertReferentiallyClosed(
+      catalog([ITEM, NCI]),
+      backup({
+        item: [{ id: "i1", companyId: "c1" }],
+        nonConformanceItem: [{ id: "nc1", itemId: "i1", companyId: "c1" }]
+      })
+    );
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("fails and names every fatal gap when the backup is not closed", () => {
+    const result = assertReferentiallyClosed(
+      catalog([ITEM, NCI]),
+      backup({
+        item: [],
+        nonConformanceItem: [{ id: "nc1", itemId: "ghost", companyId: "c1" }]
+      })
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("nonConformanceItem.itemId → item");
+      expect(result.reason).toContain("ghost");
+    }
+  });
+});
+
+// Foreign-restore re-stamping — pins the bugs that crashed real restores:
+// int/serial ids dereffing an undefined idMap, and the user-collapse / dangling-FK
+// resolution rules. These only run on remap=true, which the own-restore E2E can't
+// exercise — so they live here as a regression net.
+describe("buildRowTransforms", () => {
+  type RestampCtx = Parameters<typeof buildRowTransforms>[2];
+  const ctx = (over: Partial<RestampCtx> = {}): RestampCtx => ({
+    remap: true,
+    companyId: "target-co",
+    userId: "importer",
+    targetGroupId: "target-grp",
+    sourceCompanyId: "src-co",
+    idMaps: new Map<string, Map<string, string>>(),
+    idRewrite: new Map<string, string>(),
+    ...over
+  });
+
+  function apply(
+    t: TableInfo,
+    row: Record<string, unknown>,
+    c: RestampCtx
+  ): Record<string, unknown> {
+    const transforms = buildRowTransforms(t, t.columns, c);
+    const out: Record<string, unknown> = {};
+    t.columns.forEach((c2, i) => {
+      out[c2.name] = transforms[i]!(row[c2.name]);
+    });
+    return out;
+  }
+
+  it("copies every column verbatim when remap=false (own restore)", () => {
+    const t = table("part", [col("id"), col("companyId"), col("name")]);
+    const out = apply(
+      t,
+      { id: "p1", companyId: "src-co", name: "Widget" },
+      ctx({ remap: false })
+    );
+    expect(out).toEqual({ id: "p1", companyId: "src-co", name: "Widget" });
+  });
+
+  it("does NOT crash on an int/serial-id table absent from idMaps — keeps id verbatim", () => {
+    // Regression: journal/trainingCompletion have a serial `id` and no idMap entry.
+    // The pre-fix code dereffed an undefined map here and threw at apply time.
+    const t = table("journal", [col("id"), col("companyId")]);
+    const out = apply(t, { id: 42, companyId: "src-co" }, ctx());
+    expect(out).toEqual({ id: 42, companyId: "target-co" });
+  });
+
+  it("remaps a text id present in idMaps and re-stamps companyId", () => {
+    const t = table("item", [col("id"), col("companyId")]);
+    const idMaps = new Map([["item", new Map([["old", "new"]])]]);
+    const out = apply(t, { id: "old", companyId: "src-co" }, ctx({ idMaps }));
+    expect(out).toEqual({ id: "new", companyId: "target-co" });
+  });
+
+  it("collapses a user/employee FK to the importing user", () => {
+    const t = table(
+      "salesOrder",
+      [col("id"), col("companyId"), col("assignee", { nullable: true })],
+      [fk("assignee", "user")]
+    );
+    const out = apply(
+      t,
+      { id: "s1", companyId: "src-co", assignee: "someone-else" },
+      ctx()
+    );
+    expect(out.assignee).toBe("importer");
+  });
+
+  it("nulls a nullable FK to a scoped row missing from the backup", () => {
+    const t = table(
+      "job",
+      [col("id"), col("companyId"), col("parentId", { nullable: true })],
+      [fk("parentId", "job")]
+    );
+    const idMaps = new Map([["job", new Map([["j1", "jX"]])]]);
+    const out = apply(
+      t,
+      { id: "j1", companyId: "src-co", parentId: "missing" },
+      ctx({ idMaps })
+    );
+    expect(out.parentId).toBeNull();
+  });
+
+  it("throws on a NOT-NULL FK to a row in neither the backup nor the target", () => {
+    const t = table(
+      "nonConformanceItem",
+      [col("id"), col("companyId"), col("itemId")],
+      [fk("itemId", "item")]
+    );
+    const idMaps = new Map([
+      ["nonConformanceItem", new Map([["nc1", "ncX"]])],
+      ["item", new Map([["i1", "iX"]])]
+    ]);
+    expect(() =>
+      apply(
+        t,
+        { id: "nc1", companyId: "src-co", itemId: "ghost" },
+        ctx({ idMaps })
+      )
+    ).toThrow(/isn't in the backup or the target/);
+  });
+
+  it("keeps a NOT-NULL FK to a target substrate id (a global row the backup omits)", () => {
+    // materialDimension → a globally-seeded materialForm (companyId IS NULL) the
+    // backup doesn't carry. Its stable id is present in the target, so the remap
+    // keeps it verbatim instead of treating it as a dangling gap.
+    const t = table(
+      "materialDimension",
+      [col("id"), col("companyId"), col("materialFormId")],
+      [fk("materialFormId", "materialForm")]
+    );
+    const idMaps = new Map([
+      ["materialDimension", new Map([["md1", "mdX"]])],
+      ["materialForm", new Map([["co-form", "co-formX"]])] // company forms remap
+    ]);
+    const substrateIds = new Map([
+      ["materialForm", new Set<unknown>(["angle"])] // global form present in target
+    ]);
+    const out = apply(
+      t,
+      { id: "md1", companyId: "src-co", materialFormId: "angle" },
+      ctx({ idMaps, substrateIds })
+    );
+    expect(out.materialFormId).toBe("angle");
+  });
+
+  it("remaps a company-singleton's id to the target company (its id IS the company)", () => {
+    const t = table(
+      "companySettings",
+      [col("id"), col("companyId"), col("useMetric")],
+      [fk("id", "company")]
+    );
+    const out = apply(
+      t,
+      { id: "src-co", companyId: "src-co", useMetric: true },
+      ctx()
+    );
+    expect(out).toEqual({
+      id: "target-co",
+      companyId: "target-co",
+      useMetric: true
+    });
+  });
+
+  it("rewrites a storage path to the shared template prefix when templateIndustryId is set", () => {
+    const t = table("modelUpload", [
+      col("id"),
+      col("companyId"),
+      col("thumbnailPath", { nullable: true })
+    ]);
+    const out = apply(
+      t,
+      {
+        id: "i1",
+        companyId: "src-co",
+        thumbnailPath: "src-co/thumbnails/x.png"
+      },
+      ctx({ templateIndustryId: "metal" })
+    );
+    expect(out.thumbnailPath).toBe("_templates/metal/thumbnails/x.png");
+  });
+
+  it("nulls a nullable FK into a skipped (not-imported) table", () => {
+    const t = table(
+      "thing",
+      [col("id"), col("companyId"), col("inviteId", { nullable: true })],
+      [fk("inviteId", "invite")]
+    );
+    const out = apply(
+      t,
+      { id: "t1", companyId: "src-co", inviteId: "inv1" },
+      ctx({ skippedRefTables: new Set(["invite"]) })
+    );
+    expect(out.inviteId).toBeNull();
+  });
+
+  it("soft-records a non-nullable FK to a tenant table not imported, keeping the value", () => {
+    const recorded: string[] = [];
+    const t = table(
+      "thing",
+      [col("id"), col("companyId"), col("locationId")],
+      [fk("locationId", "location")]
+    );
+    const out = apply(
+      t,
+      { id: "t1", companyId: "src-co", locationId: "loc1" },
+      ctx({
+        catalogTableNames: new Set(["location"]),
+        onUnresolvedRef: (d) => recorded.push(d)
+      })
+    );
+    expect(out.locationId).toBe("loc1");
+    expect(recorded).toEqual(["thing.locationId -> location"]);
+  });
+
+  it("keeps a FK to a global-reference table verbatim (stable ids, not in catalog)", () => {
+    const t = table(
+      "item",
+      [col("id"), col("companyId"), col("uomCode")],
+      [fk("uomCode", "unitOfMeasure")]
+    );
+    const out = apply(
+      t,
+      { id: "i1", companyId: "src-co", uomCode: "EA" },
+      ctx()
+    );
+    expect(out.uomCode).toBe("EA");
+  });
+
+  it("scrubs an email column via the scrubEmail hook", () => {
+    const t = table("contact", [
+      col("id"),
+      col("companyId"),
+      col("email", { nullable: true })
+    ]);
+    const out = apply(
+      t,
+      { id: "c1", companyId: "src-co", email: "real@person.com" },
+      ctx({ scrubEmail: () => "redacted@example.test" })
+    );
+    expect(out.email).toBe("redacted@example.test");
+  });
+
+  it("rewrites a FK-less id ref through idRewrite (inspection.sourceDocumentLineId)", () => {
+    // The source company's inspection still holds ("Receipt", "line-old"); a
+    // verbatim copy collides on the cross-company unique index.
+    const t = table("inspection", [
+      col("id"),
+      col("companyId"),
+      col("sourceDocumentId"),
+      col("sourceDocumentLineId", { nullable: true })
+    ]);
+    const idRewrite = new Map([
+      ["receipt-old", "receipt-new"],
+      ["line-old", "line-new"]
+    ]);
+    const out = apply(
+      t,
+      {
+        id: "i1",
+        companyId: "src-co",
+        sourceDocumentId: "receipt-old",
+        sourceDocumentLineId: "line-old"
+      },
+      ctx({ idRewrite })
+    );
+    expect(out.sourceDocumentId).toBe("receipt-new");
+    expect(out.sourceDocumentLineId).toBe("line-new");
+  });
+
+  it("rewrites each element of a FK-less id-array ref, keeping unmapped values", () => {
+    const t = table("pricingRule", [
+      col("id"),
+      col("companyId"),
+      col("itemIds", { nullable: true })
+    ]);
+    const out = apply(
+      t,
+      { id: "r1", companyId: "src-co", itemIds: ["a-old", "global-1"] },
+      ctx({ idRewrite: new Map([["a-old", "a-new"]]) })
+    );
+    expect(out.itemIds).toEqual(["a-new", "global-1"]);
+  });
+
+  it("leaves an id ref verbatim on an own restore (remap=false)", () => {
+    const t = table("inspection", [col("id"), col("sourceDocumentLineId")]);
+    const out = apply(
+      t,
+      { id: "i1", sourceDocumentLineId: "line-old" },
+      ctx({ remap: false, idRewrite: new Map([["line-old", "line-new"]]) })
+    );
+    expect(out.sourceDocumentLineId).toBe("line-old");
+  });
+});
+
+describe("buildIdMaps", () => {
+  it("remaps a composite-PK table — the cross-company id collision", () => {
+    // changeOrderRequiredAction keys on ("id", "companyId") but carries a global
+    // UNIQUE(id) so children can FK to it. Gating on `hasId` left its source ids
+    // in place, so a cross-company restore collided with the SOURCE company's
+    // still-live rows and rolled the whole restore back.
+    const t = table(
+      "changeOrderRequiredAction",
+      [col("id"), col("companyId"), col("name")],
+      [],
+      { pkColumns: ["id", "companyId"], uniqueColumns: ["id"] }
+    );
+    expect(t.hasId).toBe(false);
+    const maps = buildIdMaps([t], {
+      changeOrderRequiredAction: [{ id: "cora_1", companyId: "src-co" }]
+    });
+    expect(maps.get("changeOrderRequiredAction")?.get("cora_1")).toBeTypeOf(
+      "string"
+    );
+    expect(maps.get("changeOrderRequiredAction")?.get("cora_1")).not.toBe(
+      "cora_1"
+    );
+  });
+
+  it("gives a 1:1 extension table its PARENT's map, not a second id", () => {
+    const parent = table("purchaseOrder", [col("id"), col("companyId")]);
+    const child = table(
+      "purchaseOrderDelivery",
+      [col("id"), col("companyId")],
+      [fk("id", "purchaseOrder")]
+    );
+    const maps = buildIdMaps([parent, child], {
+      purchaseOrder: [{ id: "po1", companyId: "src-co" }],
+      purchaseOrderDelivery: [{ id: "po1", companyId: "src-co" }]
+    });
+    expect(maps.get("purchaseOrderDelivery")?.get("po1")).toBe(
+      maps.get("purchaseOrder")?.get("po1")
+    );
+  });
+
+  it("leaves an id-FK table unmapped when its parent has no map", () => {
+    // `terms.id -> company`: the id follows the company, via a column transform.
+    const t = table(
+      "terms",
+      [col("id"), col("companyId")],
+      [fk("id", "company")]
+    );
+    expect(buildIdMaps([t], { terms: [{ id: "src-co" }] }).has("terms")).toBe(
+      false
+    );
+  });
+
+  it("skips an int/serial id (a nanoid doesn't fit)", () => {
+    const idCol: ColumnInfo = {
+      ...col("id"),
+      dataType: "integer",
+      udtName: "int4"
+    };
+    const t = table("journal", [idCol, col("companyId")]);
+    expect(buildIdMaps([t], { journal: [{ id: 7 }] }).has("journal")).toBe(
+      false
+    );
+  });
+});
+
+describe("isUserScopedIdentityTable", () => {
+  it("true when a user FK is in the PRIMARY KEY (employee shape)", () => {
+    const t = table(
+      "employee",
+      [col("id"), col("companyId")],
+      [fk("id", "user")],
+      {
+        pkColumns: ["id", "companyId"],
+        uniqueColumns: ["id", "companyId"]
+      }
+    );
+    expect(isUserScopedIdentityTable(t)).toBe(true);
+  });
+
+  it("true when a user FK is in a UNIQUE INDEX but not the PK (trainingCompletion shape)", () => {
+    const t = table(
+      "trainingCompletion",
+      [
+        col("id"),
+        col("trainingAssignmentId"),
+        col("employeeId"),
+        col("companyId")
+      ],
+      [fk("employeeId", "user")],
+      {
+        pkColumns: ["id"],
+        uniqueColumns: ["trainingAssignmentId", "employeeId", "period"]
+      }
+    );
+    expect(isUserScopedIdentityTable(t)).toBe(true);
+  });
+
+  it("false when the user FK is in no uniqueness constraint (assignee column)", () => {
+    const t = table(
+      "salesOrder",
+      [col("id"), col("companyId"), col("assignee")],
+      [fk("assignee", "user")],
+      { pkColumns: ["id"], uniqueColumns: ["id"] }
+    );
+    expect(isUserScopedIdentityTable(t)).toBe(false);
+  });
+});
+
+describe("selectWipeableTables (identity tables vs foreign restore)", () => {
+  // customerAccount is identity (NOT-NULL customerId in its PK → user-keyed); on a
+  // foreign restore its parent `customer` is remapped, and CASCADE won't clear it
+  // under replica mode, so it must be WIPED (but never reloaded) to avoid dangling.
+  const normal = table("customer", [col("id"), col("companyId")]);
+  const identity = table(
+    "customerAccount",
+    [col("id"), col("companyId")],
+    [fk("id", "user")],
+    { pkColumns: ["id"], uniqueColumns: ["id"] }
+  );
+  const cat = catalog([normal, identity]);
+
+  it("own restore keeps identity tables OUT of the wipe set", () => {
+    const names = selectWipeableTables(cat).map((t) => t.name);
+    expect(names).toContain("customer");
+    expect(names).not.toContain("customerAccount");
+  });
+
+  it("foreign restore (remap) WIPES identity tables so they can't dangle", () => {
+    const names = selectWipeableTables(cat, { remap: true }).map((t) => t.name);
+    expect(names).toContain("customer");
+    expect(names).toContain("customerAccount");
+  });
+});
+
+describe("referencedDroppedTables (reseed re-inclusion)", () => {
+  // The bug this pins: onboarding inserts one "Headquarters" location, so the
+  // reseed dropped the backup's `location` table as "already populated" — and
+  // every workCenter/job locationId was then nulled or left dangling.
+  const LOCATION = table("location", [col("id"), col("companyId")]);
+  const WORK_CENTER = table(
+    "workCenter",
+    [col("id"), col("locationId", { nullable: true }), col("companyId")],
+    [fk("locationId", "location")]
+  );
+
+  it("re-adds a dropped table that kept rows reference", () => {
+    const result = referencedDroppedTables([WORK_CENTER], [LOCATION]);
+    expect(result.map((t) => t.name)).toEqual(["location"]);
+  });
+
+  it("does not resurrect a dropped table nothing references", () => {
+    const SEQUENCE = table("sequence", [col("id"), col("companyId")]);
+    const result = referencedDroppedTables([WORK_CENTER], [LOCATION, SEQUENCE]);
+    expect(result.map((t) => t.name)).toEqual(["location"]);
+  });
+
+  it("follows a re-added table's own references transitively", () => {
+    const ADDRESS = table("address", [col("id"), col("companyId")]);
+    const SITE = table(
+      "site",
+      [col("id"), col("addressId"), col("companyId")],
+      [fk("addressId", "address")]
+    );
+    const PLANT = table(
+      "plant",
+      [col("id"), col("siteId"), col("companyId")],
+      [fk("siteId", "site")]
+    );
+    const result = referencedDroppedTables([PLANT], [SITE, ADDRESS]);
+    expect(result.map((t) => t.name).sort()).toEqual(["address", "site"]);
+  });
+
+  it("ignores non-id FK references", () => {
+    const REF = table("ref", [col("id"), col("code"), col("companyId")]);
+    const USER_OF_CODE = table(
+      "userOfCode",
+      [col("id"), col("refCode"), col("companyId")],
+      [{ column: "refCode", refTable: "ref", refColumn: "code" }]
+    );
+    expect(referencedDroppedTables([USER_OF_CODE], [REF])).toEqual([]);
+  });
+});
+
+describe("matchableUniqueGroups", () => {
+  const LOCATION = table(
+    "location",
+    [col("id"), col("name"), col("companyId")],
+    [],
+    { uniqueColumns: ["name", "companyId"] }
+  );
+
+  it("drops the scope column and keeps the natural key", () => {
+    expect(matchableUniqueGroups([["name", "companyId"]], LOCATION)).toEqual([
+      ["name"]
+    ]);
+  });
+
+  it("rejects a group containing id or a remapped FK column", () => {
+    const T = table(
+      "t",
+      [col("id"), col("parentId"), col("code"), col("companyId")],
+      [fk("parentId", "parent")]
+    );
+    expect(
+      matchableUniqueGroups([["id"], ["parentId", "code"], ["companyId"]], T)
+    ).toEqual([]);
+  });
+});
+
+describe("mapCollidingRows", () => {
+  const groups = [["name"]];
+
+  it("maps a colliding backup row onto the existing target row", () => {
+    const { skippedSourceIds, overrides } = mapCollidingRows(
+      groups,
+      [
+        { id: "src-hq", name: "Headquarters" },
+        { id: "src-plant", name: "Manufacturing Plant" }
+      ],
+      [{ id: "tgt-hq", name: "Headquarters" }]
+    );
+    expect([...skippedSourceIds]).toEqual(["src-hq"]);
+    expect(overrides.get("src-hq")).toBe("tgt-hq");
+    expect(overrides.has("src-plant")).toBe(false);
+  });
+
+  it("never matches on NULL (Postgres unique treats NULLs as distinct)", () => {
+    const { skippedSourceIds } = mapCollidingRows(
+      groups,
+      [{ id: "src", name: null }],
+      [{ id: "tgt", name: null }]
+    );
+    expect(skippedSourceIds.size).toBe(0);
+  });
+});
+
+// ── Cross-company restore: readable ids and storage paths ────────────────────
+// Both guards pin a hardcoded list that a future schema change can silently
+// invalidate. Each list went stale exactly once already and produced a restore
+// that looked successful and was not: the Items pages rendered empty
+// (readable ids rewritten) and assemblies would not load (path columns left
+// pointing at the source company).
+describe("cross-company restore invariants", () => {
+  // Composite-PK tables backed by a global UNIQUE (id). Their ids MUST be
+  // remapped or a cross-company restore collides with the source company's
+  // still-live rows. Verified against pg_index on 2026-09-18.
+  const GLOBAL_UNIQUE_ID_TABLES = [
+    "balloon",
+    "changeOrderRequiredAction",
+    "demandProjection",
+    "inspectionDocument",
+    "inspectionFeature"
+  ];
+
+  // Every `modelUpload` column whose name ends in `Path`, typed against the
+  // GENERATED row type: `satisfies` makes this list fail to COMPILE if a column
+  // is renamed or removed, and the `Exclude` below fails to compile if a new
+  // `*Path` column is added and not listed. The runtime assertion then checks
+  // STORAGE_PATH_COLUMNS covers them all.
+  type ModelUploadPathColumn = Extract<
+    keyof Database["public"]["Tables"]["modelUpload"]["Row"],
+    `${string}Path`
+  >;
+  const MODEL_UPLOAD_PATH_COLUMNS = [
+    "modelPath",
+    "thumbnailPath",
+    "originalPath",
+    "optimizedModelPath",
+    "glbPath",
+    "graphPath"
+  ] as const satisfies readonly ModelUploadPathColumn[];
+  // Fails to compile when a new `*Path` column exists that the list omits.
+  type _EveryPathColumnListed =
+    Exclude<
+      ModelUploadPathColumn,
+      (typeof MODEL_UPLOAD_PATH_COLUMNS)[number]
+    > extends never
+      ? true
+      : [
+          "unlisted modelUpload *Path column",
+          Exclude<
+            ModelUploadPathColumn,
+            (typeof MODEL_UPLOAD_PATH_COLUMNS)[number]
+          >
+        ];
+  const _pathColumnsExhaustive: _EveryPathColumnListed = true;
+  void _pathColumnsExhaustive;
+
+  it("keeps a readable-id table out of the id maps, but maps a normal table", () => {
+    const part = table("part", [col("id"), col("companyId"), col("name")], [], {
+      pkColumns: ["id", "companyId"]
+    });
+    const workflow = table("workflow", [col("id"), col("companyId")], [], {
+      pkColumns: ["id", "companyId"]
+    });
+    const idMaps = buildIdMaps([part, workflow], {
+      part: [{ id: "ADCS-001", companyId: "src-co", name: "Widget" }],
+      workflow: [{ id: "wf_1", companyId: "src-co" }]
+    });
+    expect(idMaps.has("part")).toBe(false);
+    expect(idMaps.get("workflow")?.get("wf_1")).toBeTypeOf("string");
+    expect(idMaps.get("workflow")?.get("wf_1")).not.toBe("wf_1");
+  });
+
+  it("preserves a part number verbatim through a cross-company restamp", () => {
+    // The `parts` view inner-joins part.id = item."readableId"; a rewritten id
+    // matches nothing and the Parts page renders empty against a full table.
+    const part = table("part", [col("id"), col("companyId"), col("name")], [], {
+      pkColumns: ["id", "companyId"]
+    });
+    const idMaps = buildIdMaps([part], {
+      part: [{ id: "ADCS-001", companyId: "src-co", name: "Widget" }]
+    });
+    const transforms = buildRowTransforms(part, part.columns, {
+      remap: true,
+      companyId: "target-co",
+      userId: "importer",
+      targetGroupId: "target-grp",
+      sourceCompanyId: "src-co",
+      idMaps,
+      idRewrite: new Map<string, string>()
+    });
+    const row: Record<string, unknown> = {
+      id: "ADCS-001",
+      companyId: "src-co",
+      name: "Widget"
+    };
+    const out: Record<string, unknown> = {};
+    part.columns.forEach((c, i) => {
+      out[c.name] = transforms[i]!(row[c.name]);
+    });
+    expect(out).toEqual({
+      id: "ADCS-001",
+      companyId: "target-co",
+      name: "Widget"
+    });
+  });
+
+  it("exempts the child table of every item type", () => {
+    // Derived from the GENERATED enum, not a hand-copied list: adding an
+    // itemType member ships a new child table keyed on the same readable id,
+    // and `fixture` is unpopulated in every local database, so a data-driven
+    // sweep cannot see it. Regenerating types is what makes this test fail.
+    const missing = Constants.public.Enums.itemType
+      .map((t) => t.toLowerCase())
+      .filter((t) => !READABLE_ID_TABLES.has(t));
+    expect(missing).toEqual([]);
+  });
+
+  it("never exempts a table that needs a fresh id to avoid a unique collision", () => {
+    const overlap = GLOBAL_UNIQUE_ID_TABLES.filter((t) =>
+      READABLE_ID_TABLES.has(t)
+    );
+    expect(overlap).toEqual([]);
+  });
+
+  it("covers every modelUpload artifact column in STORAGE_PATH_COLUMNS", () => {
+    const missing = MODEL_UPLOAD_PATH_COLUMNS.filter(
+      (c) => !STORAGE_PATH_COLUMNS.has(c)
+    );
+    expect(missing).toEqual([]);
+  });
+});

@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ValidatedForm } from "@carbon/form";
+import {
+  cn,
+  HStack,
+  ModalCard,
+  ModalCardBody,
+  ModalCardContent,
+  ModalCardDescription,
+  ModalCardFooter,
+  ModalCardHeader,
+  ModalCardProvider,
+  ModalCardTitle,
+  toast
+} from "@carbon/react";
+import { INPUT_FORMAT, INPUT_STEP } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { useEffect, useRef } from "react";
+import { useFetcher } from "react-router";
+import type { z } from "zod";
+import {
+  Currency,
+  CustomerContact,
+  CustomerStatus,
+  CustomerType,
+  CustomFormFields,
+  Employee,
+  Hidden,
+  Input,
+  Number,
+  SequenceOrCustomId,
+  Submit
+} from "~/components/Form";
+import { useCompanySettings, usePermissions } from "~/hooks";
+import { upsertIntoListStore, useCustomers } from "~/stores";
+import { path } from "~/utils/path";
+import { customerValidator } from "../../sales.models";
+import type { Customer } from "../../types";
+
+type CustomerFormProps = {
+  initialValues: z.infer<typeof customerValidator>;
+  type?: "card" | "modal";
+  onClose?: () => void;
+};
+
+const CustomerForm = ({
+  initialValues,
+  type = "card",
+  onClose
+}: CustomerFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const companySettings = useCompanySettings();
+  const showCustomerReadableId =
+    companySettings?.showCustomerReadableId ?? false;
+  const fetcher = useFetcher<PostgrestResponse<Customer>>();
+  const [, setCustomers] = useCustomers();
+  // Appending to the store below re-renders the parent, changing the inline
+  // `onClose` identity and re-running this effect. Guard so the success
+  // side-effects run exactly once — otherwise `onClose`'s trigger.click() fires
+  // twice and toggles the reopened dropdown shut.
+  const handledSuccessRef = useRef(false);
+
+  useEffect(() => {
+    if (type !== "modal") return;
+
+    if (fetcher.state === "loading" && fetcher.data?.data) {
+      if (handledSuccessRef.current) return;
+      handledSuccessRef.current = true;
+      const createdCustomer = (Array.isArray(fetcher.data.data)
+        ? fetcher.data.data[0]
+        : fetcher.data.data) as unknown as {
+        id: string;
+        name: string;
+        website?: string | null;
+        readableId?: string | null;
+      } | null;
+      // Add the new customer to the store immediately rather than waiting for the
+      // Supabase Realtime INSERT event, which is best-effort and can be missed —
+      // leaving the just-created customer absent from the select. Dedupe by id so
+      // a late realtime event doesn't double-add it.
+      if (createdCustomer?.id) {
+        setCustomers((prev) =>
+          upsertIntoListStore(prev, {
+            id: createdCustomer.id,
+            name: createdCustomer.name,
+            website: createdCustomer.website ?? undefined,
+            readableId: createdCustomer.readableId ?? undefined
+          })
+        );
+      }
+      onClose?.();
+      toast.success(
+        t`Created customer: ${createdCustomer?.name ?? t`Customer`}`
+      );
+    } else if (fetcher.state === "idle" && fetcher.data?.error) {
+      toast.error(t`Failed to create customer: ${fetcher.data.error.message}`);
+    }
+  }, [fetcher.data, fetcher.state, onClose, t, type, setCustomers]);
+
+  const isEditing = initialValues.id !== undefined;
+  const isDisabled = isEditing
+    ? !permissions.can("update", "sales")
+    : !permissions.can("create", "sales");
+
+  return (
+    <div>
+      <ModalCardProvider type={type}>
+        <ModalCard onClose={onClose}>
+          <ModalCardContent size="medium">
+            <ValidatedForm
+              method="post"
+              action={isEditing ? undefined : path.to.newCustomer}
+              validator={customerValidator}
+              defaultValues={initialValues}
+              fetcher={fetcher}
+            >
+              <ModalCardHeader>
+                <ModalCardTitle>
+                  {isEditing ? (
+                    <Trans>Customer Overview</Trans>
+                  ) : (
+                    <Trans>New Customer</Trans>
+                  )}
+                </ModalCardTitle>
+                {!isEditing && (
+                  <ModalCardDescription>
+                    <Trans>
+                      A customer is a business or person who buys your parts or
+                      services.
+                    </Trans>
+                  </ModalCardDescription>
+                )}
+              </ModalCardHeader>
+              <ModalCardBody>
+                <Hidden name="id" />
+                <Hidden name="type" value={type} />
+                <div
+                  className={cn(
+                    "grid w-full gap-x-8 gap-y-4",
+                    type === "modal"
+                      ? "grid-cols-1"
+                      : isEditing
+                        ? "grid-cols-1 lg:grid-cols-3"
+                        : "grid-cols-1 md:grid-cols-2"
+                  )}
+                >
+                  {showCustomerReadableId &&
+                    (isEditing ? (
+                      <Input
+                        name="readableId"
+                        label={t`Customer ID`}
+                        isReadOnly
+                        helperText={t`Customer ID cannot be changed after creation`}
+                      />
+                    ) : (
+                      <SequenceOrCustomId
+                        name="readableId"
+                        label={t`Customer ID`}
+                        table="customer"
+                      />
+                    ))}
+                  <Input name="name" label={t`Name`} autoFocus={!isEditing} />
+
+                  <CustomerStatus
+                    name="customerStatusId"
+                    label={t`Customer Status`}
+                    termId="customer-status"
+                    placeholder={t`Select Customer Status`}
+                  />
+                  <CustomerType
+                    name="customerTypeId"
+                    label={t`Customer Type`}
+                    termId="customer-type-field"
+                    placeholder={t`Select Customer Type`}
+                  />
+                  <Employee
+                    name="accountManagerId"
+                    label={t`Account Manager`}
+                    termId="customer-account-manager"
+                  />
+                  {isEditing && (
+                    <>
+                      <CustomerContact
+                        customer={initialValues.id}
+                        name="salesContactId"
+                        label={t`Sales Contact`}
+                      />
+                    </>
+                  )}
+                  <Currency name="currencyCode" label={t`Currency`} />
+
+                  <Number
+                    name="taxPercent"
+                    label={t`Tax Percent`}
+                    termId="customer-default-tax-percent"
+                    minValue={0}
+                    maxValue={1}
+                    step={INPUT_STEP.percent}
+                    formatOptions={INPUT_FORMAT.percent}
+                  />
+
+                  <Input name="website" label={t`Website`} />
+
+                  {/* <EmailRecipients name="defaultCc" label="Default CC" /> */}
+                  <CustomFormFields table="customer" />
+                </div>
+              </ModalCardBody>
+              <ModalCardFooter sticky={type === "card" && !isEditing}>
+                <HStack>
+                  <Submit isDisabled={isDisabled}>
+                    <Trans>Save</Trans>
+                  </Submit>
+                </HStack>
+              </ModalCardFooter>
+            </ValidatedForm>
+          </ModalCardContent>
+        </ModalCard>
+      </ModalCardProvider>
+    </div>
+  );
+};
+
+export default CustomerForm;

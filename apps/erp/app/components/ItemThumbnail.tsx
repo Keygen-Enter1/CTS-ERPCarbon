@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { cn } from "@carbon/react";
+import { cva } from "class-variance-authority";
+import { useState } from "react";
+import { LuBlocks } from "react-icons/lu";
+import type { ItemType } from "~/modules/shared";
+import { getPrivateUrl } from "~/utils/path";
+import { MethodItemTypeIcon } from "./Icons";
+
+interface ItemThumbnailProps {
+  thumbnailPath?: string | null;
+  type?: ItemType;
+  size?: "sm" | "md" | "lg" | "xl";
+}
+
+const itemVariants = cva(
+  "bg-muted rounded-lg flex items-center justify-center flex-shrink-0",
+  {
+    variants: {
+      size: {
+        sm: "w-8 h-8",
+        md: "w-10 h-10",
+        lg: "w-11 h-11 bg-gradient-to-bl from-muted to-muted/40",
+        xl: "w-16 h-16 bg-gradient-to-bl from-muted to-muted/40"
+      },
+      withPadding: {
+        true: "",
+        false: "p-0"
+      }
+    },
+    compoundVariants: [
+      {
+        withPadding: true,
+        size: "sm",
+        class: "p-1"
+      },
+      {
+        withPadding: true,
+        size: "md",
+        class: "p-1.5"
+      },
+      {
+        withPadding: true,
+        size: "lg",
+        class: "p-2"
+      },
+      {
+        withPadding: true,
+        size: "xl",
+        class: "p-2.5"
+      }
+    ],
+    defaultVariants: {
+      size: "md",
+      withPadding: true
+    }
+  }
+);
+
+const iconVariants = cva("text-[#AAAAAA] dark:text-[#444]", {
+  variants: {
+    size: {
+      sm: "w-4 h-4",
+      md: "w-5 h-5",
+      lg: "w-6 h-6",
+      xl: "w-11 h-11"
+    }
+  },
+  defaultVariants: {
+    size: "md"
+  }
+});
+
+const ItemThumbnail = ({
+  thumbnailPath,
+  type,
+  size = "md"
+}: ItemThumbnailProps) => {
+  // Keyed by path, not a bare boolean — a virtualized row reused for another
+  // item would otherwise stay stuck on the fallback.
+  const [failedPath, setFailedPath] = useState<string | null>(null);
+
+  return thumbnailPath && failedPath !== thumbnailPath ? (
+    <img
+      loading="lazy"
+      decoding="async"
+      alt="thumbnail"
+      data-thumbnail={size}
+      className={itemVariants({ size, withPadding: false })}
+      key={thumbnailPath}
+      onError={() => setFailedPath(thumbnailPath)}
+      src={getPrivateUrl(thumbnailPath)}
+    />
+  ) : (
+    <div data-thumbnail={size} className={cn(itemVariants({ size }))}>
+      {type ? (
+        <MethodItemTypeIcon className={iconVariants({ size })} type={type} />
+      ) : (
+        <LuBlocks className={iconVariants({ size })} />
+      )}
+    </div>
+  );
+};
+
+export default ItemThumbnail;

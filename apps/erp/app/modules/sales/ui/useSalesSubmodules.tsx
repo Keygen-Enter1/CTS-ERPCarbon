@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useLingui } from "@lingui/react/macro";
+import {
+  LuBan,
+  LuGlobe,
+  LuKeyRound,
+  LuList,
+  LuPercent,
+  LuSection,
+  LuShapes,
+  LuShieldCheck,
+  LuSquareUser,
+  LuStar,
+  LuUndo2
+} from "react-icons/lu";
+import {
+  RiProgress2Line,
+  RiProgress4Line,
+  RiProgress8Line
+} from "react-icons/ri";
+import { usePermissions } from "~/hooks";
+import { useSavedViews } from "~/hooks/useSavedViews";
+import type { AuthenticatedRouteGroup } from "~/types";
+import { path } from "~/utils/path";
+
+export default function useSalesSubmodules() {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const { addSavedViewsToRoutes } = useSavedViews();
+  const salesRoutes: AuthenticatedRouteGroup[] = [
+    {
+      name: t`Customers`,
+      routes: [
+        {
+          name: t`Customers`,
+          to: path.to.customers,
+          icon: <LuSquareUser />,
+          table: "customer"
+        },
+        {
+          name: t`Portals`,
+          to: path.to.customerPortals,
+          role: "employee",
+          icon: <LuGlobe />
+        }
+      ]
+    },
+    {
+      name: t`Quoting`,
+      routes: [
+        {
+          name: t`RFQs`,
+          to: path.to.salesRfqs,
+          icon: <RiProgress2Line />,
+          table: "salesRfq"
+        },
+        {
+          name: t`Quotes`,
+          to: path.to.quotes,
+          icon: <RiProgress4Line />,
+          table: "quote"
+        }
+      ]
+    },
+    {
+      name: t`Orders`,
+      routes: [
+        {
+          name: t`Sales Orders`,
+          to: path.to.salesOrders,
+          icon: <RiProgress8Line />,
+          table: "salesOrder"
+        },
+        {
+          name: t`Returns`,
+          to: path.to.salesReturnOrders,
+          icon: <LuUndo2 />,
+          table: "salesReturnOrder"
+        }
+      ]
+    },
+    {
+      name: t`Agreements`,
+      routes: [
+        {
+          name: t`Service Contracts`,
+          to: path.to.contracts,
+          icon: <LuSection />,
+          table: "customerContract"
+        },
+        {
+          name: t`Rental Agreements`,
+          to: path.to.rentalAgreements,
+          icon: <LuKeyRound />,
+          table: "rentalAgreement"
+        }
+      ]
+    },
+    {
+      name: t`Pricing`,
+      routes: [
+        {
+          name: t`Price Lists`,
+          to: path.to.salesPriceList,
+          role: "employee",
+          icon: <LuList />
+        },
+        {
+          name: t`Pricing Rules`,
+          to: path.to.salesPricingRules,
+          role: "employee",
+          icon: <LuPercent />
+        }
+      ]
+    },
+    {
+      name: t`Configure`,
+      routes: [
+        {
+          name: t`Sales Rules`,
+          to: path.to.salesRules,
+          role: "employee",
+          icon: <LuShieldCheck />
+        },
+        {
+          name: t`No Quote Reasons`,
+          to: path.to.noQuoteReasons,
+          role: "employee",
+          icon: <LuBan />
+        },
+        {
+          name: t`Return Reasons`,
+          to: path.to.returnReasons,
+          role: "employee",
+          icon: <LuUndo2 />
+        },
+        {
+          name: t`Statuses`,
+          to: path.to.customerStatuses,
+          role: "employee",
+          icon: <LuStar />
+        },
+        {
+          name: t`Types`,
+          to: path.to.customerTypes,
+          role: "employee",
+          icon: <LuShapes />
+        }
+      ]
+    }
+  ];
+
+  return {
+    groups: salesRoutes
+      .filter((group) => {
+        const filteredRoutes = group.routes.filter((route) => {
+          if (route.role) {
+            return permissions.is(route.role);
+          } else {
+            return true;
+          }
+        });
+
+        return filteredRoutes.length > 0;
+      })
+      .map((group) => ({
+        ...group,
+        routes: group.routes
+          .filter((route) => {
+            if (route.role) {
+              return permissions.is(route.role);
+            } else if (route.permission) {
+              return permissions.can("view", route.permission);
+            } else {
+              return true;
+            }
+          })
+          .map(addSavedViewsToRoutes)
+      }))
+  };
+}

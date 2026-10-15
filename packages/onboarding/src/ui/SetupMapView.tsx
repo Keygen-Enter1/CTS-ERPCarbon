@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { Button, IconButton } from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useEffect, useState } from "react";
+import {
+  LuArrowUpRight,
+  LuCheckCheck,
+  LuFileText,
+  LuPlay,
+  LuTrash
+} from "react-icons/lu";
+import { COLLECTIONS, PAGE_COPY } from "../content";
+import { setupGroupKey } from "../content/board";
+import { SETUP_GROUPS } from "../content/setup";
+import { filterByModule, flagKey, setupAnchorId } from "../logic";
+import type { CustomDataPayload, ImplementationRowData } from "../types";
+import { ProgressPill } from "./ProgressPill";
+import {
+  CustomRowSection,
+  EditableInput,
+  LearnLink,
+  PageHeader,
+  Section,
+  SectionList,
+  StatusToggle
+} from "./primitives";
+import {
+  useCanEdit,
+  useCheckMap,
+  useExclusions,
+  useHubActions,
+  useResolveScreenUrl
+} from "./state";
+
+// Docs/Video badges for a whole module, shown on the group header — the same
+// two-button pattern the Plan page uses for its phase resources. Carbon's docs
+// and academy are organised per module, so the links live at the group level.
+function GroupLearnLinks({
+  docsUrl,
+  academyUrl
+}: {
+  docsUrl?: string;
+  academyUrl?: string;
+}) {
+  if (!docsUrl && !academyUrl) return null;
+  return (
+    <div className="flex items-center gap-2 text-xs">
+      {docsUrl ? (
+        <LearnLink href={docsUrl} icon={<LuFileText className="size-3" />}>
+          <Trans>Docs</Trans>
+        </LearnLink>
+      ) : null}
+      {academyUrl ? (
+        <LearnLink href={academyUrl} icon={<LuPlay className="size-3" />}>
+          <Trans>Video</Trans>
+        </LearnLink>
+      ) : null}
+    </div>
+  );
+}
+
+const DEF = COLLECTIONS.setup;
+const FLAG = DEF.flag!;
+
+const configuredKey = (id: string) => flagKey(`setup.${id}`);
+
+export function SetupMapView() {
+  const { t, i18n } = useLingui();
+  const exclusions = useExclusions();
+  const map = useCheckMap();
+  const { toggleFlag, toggleFlags } = useHubActions();
+  const resolveScreenUrl = useResolveScreenUrl();
+
+  // Groups whose module is excluded drop out entirely (e.g. Accounting when the
+  // company has no accounting). The badge number is the group's position among
+  // the *visible* groups — deriving it here keeps the list reading 1, 2, 3… with
+  // no gaps. `group.n` stays the stable identity (anchor + board-task key), which
+  // must NOT be positional or excluding a module would reshuffle every key.
+  const visibleGroups = SETUP_GROUPS.map((group) => ({
+    group,
+    rows: filterByModule(group.rows, exclusions.modules)
+  })).filter(({ rows }) => rows.length > 0);
+  const visibleRows = visibleGroups.flatMap(({ rows }) => rows);
+  const configured = visibleRows.filter(
+    (r) => map.get(configuredKey(r.key)) === "1"
+  ).length;
+
+  return (
+    <div className="w-full max-w-3xl mx-auto flex flex-col gap-6">
+      <PageHeader
+        title={i18n._(PAGE_COPY.setup.title)}
+        lead={i18n._(PAGE_COPY.setup.lead)}
+        aside={
+          <ProgressPill
+            done={configured}
+            total={visibleRows.length}
+            label={t`configured`}
+          />
+        }
+      />
+
+      {visibleGroups.map(({ group, rows }, index) => {
+        const allConfigured = rows.every(
+          (r) => map.get(configuredKey(r.key)) === "1"
+        );
+        return (
+          <Section
+            key={group.n}
+            id={setupAnchorId(setupGroupKey(group.n))}
+            className="scroll-mt-6"
+            number={index + 1}
+            title={i18n._(group.title)}
+            subtitle={i18n._(group.desc)}
+            aside={
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <GroupLearnLinks
+                  docsUrl={group.docsUrl}
+                  academyUrl={group.academyUrl}
+                />
+                {/* Speed lane: one click configures the whole group (one
+                    batched write). Hidden once there's nothing left to mark. */}
+                {allConfigured ? null : (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    leftIcon={<LuCheckCheck />}
+                    onClick={() =>
+                      toggleFlags(
+                        rows.map((r) => configuredKey(r.key)),
+                        "scopeFlag",
+                        true
+                      )
+                    }
+                  >
+                    <Trans>Mark all as configured</Trans>
+                  </Button>
+                )}
+              </div>
+            }
+          >
+            <SectionList>
+              {rows.map((row) => {
+                const key = configuredKey(row.key);
+                const url = resolveScreenUrl(row.key);
+                return (
+                  <li
+                    key={row.key}
+                    className="flex items-center gap-4 px-5 py-3"
+                  >
+                    <div className="flex-1 min-w-0">
+                      {url ? (
+                        // New tab (the ↗ arrow signals it): the ERP screen opens
+                        // alongside the map so the user keeps their place here.
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="group inline-flex items-center gap-1 text-sm font-medium hover:text-primary transition-colors"
+                        >
+                          {i18n._(row.object)}
+                          <LuArrowUpRight className="size-3.5 shrink-0 text-muted-foreground/50 transition group-hover:text-primary group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+                        </a>
+                      ) : (
+                        <div className="text-sm font-medium">
+                          {i18n._(row.object)}
+                        </div>
+                      )}
+                      <div className="text-xs text-muted-foreground">
+                        {i18n._(row.detail)}
+                      </div>
+                    </div>
+                    <StatusToggle
+                      active={map.get(key) === "1"}
+                      activeLabel={i18n._(FLAG.active)}
+                      inactiveLabel={i18n._(FLAG.inactive)}
+                      onToggle={() =>
+                        toggleFlag(key, "scopeFlag", map.get(key) !== "1")
+                      }
+                    />
+                  </li>
+                );
+              })}
+            </SectionList>
+          </Section>
+        );
+      })}
+
+      <CustomRowSection collection="setup">
+        {(row) => <CustomSetupRow row={row} />}
+      </CustomRowSection>
+    </div>
+  );
+}
+
+function CustomSetupRow({ row }: { row: ImplementationRowData }) {
+  const { t, i18n } = useLingui();
+  const canEdit = useCanEdit();
+  const map = useCheckMap();
+  const { toggleFlag, updateRow, deleteRow } = useHubActions();
+
+  const payload: CustomDataPayload = {
+    object: typeof row.payload.object === "string" ? row.payload.object : "",
+    today: typeof row.payload.today === "string" ? row.payload.today : "",
+    url: typeof row.payload.url === "string" ? row.payload.url : undefined
+  };
+  const key = configuredKey(row.id);
+  const configured = map.get(key) === "1";
+
+  const [object, setObject] = useState(payload.object);
+  const [today, setToday] = useState(payload.today);
+  const [url, setUrl] = useState(payload.url ?? "");
+  useEffect(() => setObject(payload.object), [payload.object]);
+  useEffect(() => setToday(payload.today), [payload.today]);
+  useEffect(() => setUrl(payload.url ?? ""), [payload.url]);
+
+  // Merge all three cells on every commit (never send a stale sibling). An empty
+  // URL is dropped so the row falls back to plain text.
+  const commit = (next: Partial<CustomDataPayload>) => {
+    const merged = { object, today, url: url || undefined, ...next };
+    if (!merged.url) merged.url = undefined;
+    updateRow(row.id, merged);
+  };
+
+  return (
+    <li className="flex items-center gap-4 px-5 py-3">
+      <div className="flex-1 min-w-0 flex flex-col gap-1">
+        {canEdit ? (
+          <>
+            <EditableInput
+              value={object}
+              placeholder={t`What to set up`}
+              onCommit={(next) => {
+                setObject(next);
+                commit({ object: next });
+              }}
+            />
+            <EditableInput
+              value={today}
+              placeholder={t`What it is`}
+              variant="muted"
+              onCommit={(next) => {
+                setToday(next);
+                commit({ today: next });
+              }}
+            />
+            <EditableInput
+              value={url}
+              placeholder={t`Link (optional) — e.g. /x/settings/…`}
+              variant="muted"
+              onCommit={(next) => {
+                setUrl(next);
+                commit({ url: next || undefined });
+              }}
+            />
+          </>
+        ) : (
+          <>
+            {payload.url ? (
+              <a
+                href={payload.url}
+                target="_blank"
+                rel="noreferrer"
+                className="group inline-flex items-center gap-1 text-sm font-medium hover:text-primary transition-colors"
+              >
+                {payload.object}
+                <LuArrowUpRight className="size-3.5 shrink-0 text-muted-foreground/50 transition group-hover:text-primary group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+              </a>
+            ) : (
+              <div className="text-sm font-medium">{payload.object}</div>
+            )}
+            <div className="text-xs text-muted-foreground">{payload.today}</div>
+          </>
+        )}
+      </div>
+      <StatusToggle
+        active={configured}
+        activeLabel={i18n._(FLAG.active)}
+        inactiveLabel={i18n._(FLAG.inactive)}
+        onToggle={() => toggleFlag(key, "scopeFlag", !configured)}
+      />
+      {canEdit ? (
+        <IconButton
+          aria-label={t`Delete row`}
+          icon={<LuTrash />}
+          variant="ghost"
+          size="sm"
+          className="text-muted-foreground shrink-0"
+          onClick={() => deleteRow(row.id)}
+        />
+      ) : null}
+    </li>
+  );
+}

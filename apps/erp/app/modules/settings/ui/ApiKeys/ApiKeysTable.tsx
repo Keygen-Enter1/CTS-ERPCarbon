@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Badge,
+  Button,
+  HStack,
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo } from "react";
+import {
+  LuCalendar,
+  LuCode,
+  LuGauge,
+  LuKey,
+  LuPencil,
+  LuShield,
+  LuTag,
+  LuTrash,
+  LuUser
+} from "react-icons/lu";
+import { Outlet, useNavigate } from "react-router";
+import { DateTime, EmployeeAvatar, Hyperlink, New, Table } from "~/components";
+import { usePermissions, useUrlParams } from "~/hooks";
+import type { ApiKey } from "~/modules/settings";
+import { usePeople } from "~/stores";
+import { path } from "~/utils/path";
+
+type ApiKeysTableProps = {
+  data: ApiKey[];
+  count: number;
+};
+
+// `apiKey.scopes` is a `Json` column; narrow it to the scope map shape once so
+// the cell and the CSV export read it the same way without an `as any` cast.
+function getScopes(apiKey: ApiKey): Record<string, string[]> | null {
+  const { scopes } = apiKey;
+  return scopes && typeof scopes === "object" && !Array.isArray(scopes)
+    ? (scopes as Record<string, string[]>)
+    : null;
+}
+
+function getScopeCount(scopes: Record<string, string[]> | null): number {
+  if (!scopes) return 0;
+  return Object.keys(scopes).length;
+}
+
+function formatRateLimit(limit: number, window: string): string {
+  const windowLabels: Record<string, string> = {
+    "1m": "/min",
+    "1h": "/hr",
+    "1d": "/day"
+  };
+  return `${limit}${windowLabels[window] ?? "/hr"}`;
+}
+
+const ApiKeysTable = memo(({ data, count }: ApiKeysTableProps) => {
+  const { t } = useLingui();
+  const navigate = useNavigate();
+  const [params] = useUrlParams();
+  const permissions = usePermissions();
+  const [people] = usePeople();
+
+  const columns = useMemo<ColumnDef<ApiKey>[]>(() => {
+    return [
+      {
+        accessorKey: "name",
+        header: t`Name`,
+        cell: ({ row }) => (
+          <Hyperlink to={row.original.id!}>{row.original.name}</Hyperlink>
+        ),
+        meta: {
+          mobile: "P1",
+          icon: <LuTag />
+        }
+      },
+      {
+        id: "keyPreview",
+        header: t`Key`,
+        cell: ({ row }) => {
+          const preview = (row.original as any).keyPreview as string | null;
+          return (
+            <span className="font-mono text-sm text-muted-foreground">
+              {preview ? `crbn_•••${preview}` : "crbn_•••••"}
+            </span>
+          );
+        },
+        meta: {
+          icon: <LuKey />
+        }
+      },
+      {
+        id: "scopes",
+        header: t`Scopes`,
+        cell: ({ row }) => {
+          const scopeCount = getScopeCount(getScopes(row.original));
+          return (
+            <Badge variant="secondary">
+              {scopeCount === 0 ? t`No Access` : t`${scopeCount} permissions`}
+            </Badge>
+          );
+        },
+        meta: {
+          icon: <LuShield />,
+          exportValue: (row) => {
+            const scopeCount = getScopeCount(getScopes(row));
+            return scopeCount === 0
+              ? t`No Access`
+              : t`${scopeCount} permissions`;
+          }
+        }
+      },
+      {
+        id: "rateLimit",
+        header: t`Rate Limit`,
+        cell: ({ row }) => {
+          const limit = (row.original as any).rateLimit as number;
+          const window = (row.original as any).rateLimitWindow as string;
+          return (
+            <span className="text-sm text-muted-foreground">
+              {formatRateLimit(limit ?? 60, window ?? "1m")}
+            </span>
+          );
+        },
+        meta: {
+          icon: <LuGauge />
+        }
+      },
+      {
+        id: "createdBy",
+        header: t`Created By`,
+        cell: ({ row }) => {
+          return <EmployeeAvatar employeeId={row.original.createdBy} />;
+        },
+        meta: {
+          mobile: "P3",
+          icon: <LuUser />,
+          filter: {
+            type: "static",
+            options: people.map((employee) => ({
+              value: employee.id,
+              label: employee.name
+            }))
+          }
+        }
+      },
+      {
+        id: "expiresAt",
+        header: t`Expires`,
+        cell: ({ row }) => {
+          const expiresAt = (row.original as any).expiresAt as string | null;
+          if (!expiresAt)
+            return (
+              <span className="text-muted-foreground">
+                <Trans>Never</Trans>
+              </span>
+            );
+          const isExpired = new Date(expiresAt) < new Date();
+          return (
+            <Badge variant={isExpired ? "destructive" : "secondary"}>
+              {isExpired ? (
+                t`Expired`
+              ) : (
+                <DateTime value={expiresAt} variant="date" />
+              )}
+            </Badge>
+          );
+        },
+        meta: {
+          mobile: "P2",
+          icon: <LuCalendar />
+        }
+      },
+      {
+        accessorKey: "createdAt",
+        header: t`Created At`,
+        cell: (item) => (
+          <DateTime value={item.getValue<string>()} variant="date" />
+        ),
+        meta: {
+          icon: <LuCalendar />
+        }
+      }
+    ];
+  }, [people, t]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  const renderContextMenu = useCallback(
+    (row: (typeof data)[number]) => {
+      return (
+        <>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.edit}
+            onClick={() => {
+              navigate(`${path.to.apiKey(row.id!)}?${params?.toString()}`);
+            }}
+          >
+            <MenuIcon icon={<LuPencil />} />
+            <Trans>Edit API Key</Trans>
+          </MenuItem>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.delete}
+            destructive
+            onClick={() => {
+              navigate(
+                `${path.to.deleteApiKey(row.id!)}?${params?.toString()}`
+              );
+            }}
+          >
+            <MenuIcon icon={<LuTrash />} />
+            <Trans>Delete API Key</Trans>
+          </MenuItem>
+        </>
+      );
+    },
+
+    [navigate, params, permissions]
+  );
+
+  return (
+    <>
+      <Table<ApiKey>
+        data={data}
+        columns={columns}
+        count={count ?? 0}
+        primaryAction={
+          <HStack>
+            {permissions.can("update", "users") && (
+              <New
+                label={t`API Key`}
+                to={`${path.to.newApiKey}?${params.toString()}`}
+              />
+            )}
+            <Button leftIcon={<LuCode />} variant="secondary" asChild>
+              <a href={path.to.apiDocs} target="_blank" rel="noreferrer">
+                <Trans>API Docs</Trans>
+              </a>
+            </Button>
+          </HStack>
+        }
+        renderContextMenu={renderContextMenu}
+        title={t`API Keys`}
+      />
+      <Outlet />
+    </>
+  );
+});
+
+ApiKeysTable.displayName = "ApiKeysTable";
+export default ApiKeysTable;

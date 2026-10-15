@@ -1,0 +1,244 @@
+@import "tailwindcss";
+@import "non.geist";
+@import "non.geist/mono";
+@import "../../../../packages/config/tailwind/theme.css";
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-old(root) {
+  z-index: 0;
+}
+
+::view-transition-new(root) {
+  z-index: 1;
+}
+
+html.mode-transitioning,
+html.mode-transitioning *,
+html.mode-transitioning *::before,
+html.mode-transitioning *::after {
+  transition-property: none !important;
+  transition-duration: 0s !important;
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+}
+
+@layer base {
+  *::-webkit-scrollbar {
+    width: 5px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 5px;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  :root {
+    --topbar-height: 49px;
+    --header-height: 50px;
+    --filters-height: 38px;
+    /* Vertical space the inset app-shell panel gives up to its gutters
+       (md:mt-2 + md:mb-2 in x+/_layout.tsx). Full-bleed below md → 0.
+       Full-screen pages subtract this from their 100dvh height calcs so
+       bottom-pinned content isn't clipped by the panel. */
+    --content-inset: 0px;
+
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+    --chart-1: 12 76% 61%;
+    --chart-2: 173 58% 39%;
+    --chart-3: 197 37% 24%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 27 87% 67%;
+    --chart-6: 262 83% 58%;
+
+    --success: 142 70% 45%;
+    --success-foreground: 0 0% 98%;
+
+    --base-shadow-color: rgb(0 0 0 / 0.05);
+
+    --button-drop-shadow: rgb(0 0 0 / 0);
+    --button-shadow: inset 0px 1px 0px 0px rgb(255 255 255 / 1),
+      0px 0px 0px 1px rgb(0 0 0 / 0.06), 0px 1px 0px 0px rgb(0 0 0 / 0.08),
+      0px 2px 2px 0px rgb(0 0 0 / 0.04), 0px 3px 3px 0px rgb(0 0 0 / 0.02),
+      0px 4px 4px 0px rgb(0 0 0 / 0.01);
+    --popover-shadow: 0px 0px 3.6px rgba(0, 0, 0, 0.04),
+      0px 0px 10px rgba(0, 0, 0, 0.04), 0px 0px 24.1px rgba(0, 0, 0, 0.05),
+      0px 0px 80px rgba(0, 0, 0, 0.08);
+    --dropdown-item-shadow: inset 0px 1px 0px rgb(255 255 255 / 0.02),
+      inset 0px 0px 0px 1px rgb(255 255 255 / 0.02),
+      0px 1px 2px rgb(0 0 0 / 0.12), 0px 2px 4px rgb(0 0 0 / 0.08),
+      0px 0px 0px 0.5px rgb(0 0 0 / 0.24);
+    --button-base-shadow: 0px 1px 1px -1px rgb(0 0 0 / 0.08),
+      0px 2px 2px -1px rgb(0 0 0 / 0.08), 0px 0px 0px 1px rgb(0 0 0 / 0.06),
+      inset 0px 1px 0px #fff, inset 0px 1px 2px 1px #fff,
+      inset 0px 1px 2px rgb(0 0 0 / 0.06);
+  }
+
+  .dark {
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+    --chart-1: 220 70% 50%;
+    --chart-2: 160 60% 45%;
+    --chart-3: 30 80% 55%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 75% 55%;
+    /* violet — safety-stock threshold (brighter for contrast on dark bg) */
+    --chart-6: 262 90% 74%;
+
+    --success: 142 70% 45%;
+    --success-foreground: 0 0% 98%;
+
+    --button-drop-shadow: rgb(0 0 0 / 0.4);
+    --danger-drop-shadow: rgb(127 29 29 / 0.8);
+    --button-shadow: 0px -1px 0px 0px rgb(255 255 255 / 0.04),
+      0px 0px 0px 1px rgb(255 255 255 / 0.12), 0px 0px 1px 0px rgb(0 0 0 / 0.04),
+      0px 2px 2px 0px rgb(0 0 0 / 0.04), 0px 4px 2px 0px rgb(0 0 0 / 0.04),
+      0px 6px 3px 0px rgb(0 0 0 / 0.04);
+    --popover-shadow: 0px 0px 4px rgba(0, 0, 0, 0.08),
+      0px 0px 10px rgba(0, 0, 0, 0.12), 0px 0px 24px rgba(0, 0, 0, 0.16),
+      0px 0px 80px rgba(0, 0, 0, 0.2);
+    --button-base-shadow: 0px 0px 0px 0.5px rgb(0 0 0 / 0.4),
+      0px 1px 1px -1px rgb(0 0 0 / 0.12), 0px 2px 2px -1px rgb(0 0 0 / 0.12),
+      inset 0px 0.5px 0px rgb(255 255 255 / 0.06),
+      inset 0px 0px 1px 0px rgb(255 255 255 / 0.16),
+      inset 0px -6px 12px -4px rgb(0 0 0 / 0.16);
+    --button-primary-shadow: 0px 1px 1px -1px rgb(0 0 0 / 0.08),
+      0px 2px 2px -1px rgb(0 0 0 / 0.08), 0px 0px 0px 1px rgb(0 0 0 / 0.06),
+      inset 0px 1px 0px #fff, inset 0px 0px 2px 1px #fff,
+      inset 0px 1px 2px rgb(0 0 0 / 0.06),
+      inset 0px -4px 8px -4px rgb(0 0 0 / 0.06);
+  }
+
+  /* The inset app-shell panel gains 8px top + 8px bottom gutters at md+. */
+  @media (min-width: 768px) {
+    :root {
+      --content-inset: 1rem;
+    }
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+canvas#viewer {
+  border-radius: var(--radius);
+}
+
+p.is-editor-empty:first-child:before {
+  color: var(--muted-foreground);
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+
+.tiptap.ProseMirror-focused div[data-video-embed],
+.tiptap.ProseMirror-selectedNode div[data-video-embed] {
+  @apply ring-2 ring-primary cursor-move p-2 rounded-lg;
+}
+
+.mention {
+  @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-400;
+}
+
+@keyframes thinking-spin-outer {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes thinking-spin-inner {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(-720deg);
+  }
+}
+
+@keyframes loading {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.loading-dot {
+  animation: loading 1.4s ease-in-out infinite;
+  opacity: 0;
+}
+.loading-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.loading-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes spinner-fade {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.15;
+  }
+}
+
+.animate-spinner {
+  animation: spinner-fade 1.2s linear infinite;
+}
+
+/*
+ * ERP phone chrome (< 768px).
+ * - The app bar is 52px, so frames sized from --topbar-height still fit.
+ * - Toasts sit above the bottom chrome (bottom bar or floating dock) at
+ *   every phone width; Sonner's own mobileOffset only applies up to 600px.
+ */
+@media (width < 48rem) {
+  :root {
+    --topbar-height: calc(52px + env(safe-area-inset-top));
+  }
+
+  [data-sonner-toaster][data-y-position="bottom"] {
+    bottom: calc(var(--content-inset, 0px) + var(--dock-height, 0px) + 16px);
+  }
+}

@@ -1,0 +1,155 @@
+---
+paths:
+  - "apps/erp/app/modules/items/**"
+  - "apps/erp/app/routes/x+/items+/revisions.new.tsx"
+  - "packages/database/supabase/migrations/*revisions*.sql"
+  - "packages/database/supabase/migrations/*make-method-version*.sql"
+---
+
+# Revision System
+
+Carbon lets multiple **revisions** of the same item (Part, Material, Tool,
+Consumable, Service) coexist. A revision is just another `item` row sharing the
+same `readableId` + `companyId` + `type`, distinguished by its `revision` string.
+Introduced in `20250519122022_revisions.sql`; ordering/filtering refined through
+`20260515120000_fix-item-details-revisions-filter-by-type.sql` (read the newest).
+
+## Data model (verified)
+
+- A revision **is** a full `item` row. There is no separate revision table. The
+  type tables (`part`/`material`/`tool`/`consumable`/`service`) hold properties
+  shared across revisions; the `item` row holds per-revision data.
+- **Item linkage is positional**, not a FK: `part.id` (and `material.id`,
+  `tool.id`, …) equals the item's **`readableId`**. The old `*.itemId` FK columns
+  were dropped in `20250519122022`. Join via `item.readableId = <typeTable>.id AND item.companyId = <typeTable>.companyId`. So one type row ↔ many item revisions.
+- `item.revision` TEXT DEFAULT `'0'` (the initial/unnamed revision). Named
+  revisions are arbitrary strings (`A`, `B`, …).
+- `item.readableIdWithRevision` is a **STORED generated column**:
+  `readableId` when `revision` is `'0'`/empty, else `readableId || '.' || revision`
+  (e.g. `P000123` → `P000123.A`). TS mirror: `getReadableIdWithRevision(readableId, revision?)`
+  in `apps/erp/app/utils/string.ts`.
+- Uniqueness: `item_unique UNIQUE ("readableId", "revision", "companyId", "type")`.
+  The `type` in the key means a Part and a Consumable **can legally share a
+  `readableId`** — which is why the detail RPCs must filter revisions by type
+  (see Gotchas).
+
+## Which revision is shown
+
+There is **no `activeRevision` flag** on items. The list views (`parts`,
+`materials`, `tools`, `consumables`, `services`) collapse to **one row per
+`(readableId, companyId)`** via a `latest_items` CTE
+(`DISTINCT ON ... ORDER BY`). Current ordering
+(`20260325073453_fix-latest-revision-ordering.sql`) **prefers named revisions
+over the `'0'`/empty initial revision**, then `createdAt DESC` as tiebreaker — so
+the most-recent *named* revision is the default surfaced. Each view row also
+carries a `revisions` JSON array (all siblings) for the version switcher.
+
+Detail pages route by the specific item **`id` (UUID)**, so the URL pins the exact
+revision. The `get_<type>_details(item_id)` RPCs return that revision's data plus
+the type-scoped `revisions` array.
+
+## Creating a revision
+
+- Validator: `revisionValidator` in `apps/erp/app/modules/items/items.models.ts`
+  — `{ id?, type, copyFromId?, revision }`; requires `id` **or** `copyFromId`.
+- Route: `apps/erp/app/routes/x+/items+/revisions.new.tsx` (action). For a **new**
+  revision it requires `copyFromId`, loads that item via `getItem`, then calls
+  `createRevision(getCarbonServiceRole(), getDatabaseClient(), { item, revision, createdBy })`.
+  Redirects to the new revision's detail page by type. URL: `path.to.newRevision`.
+- Service: `createRevision(client, db, args)` (`items.service.ts`). In ONE Kysely
+  transaction it inserts a new `item` row copying the source's core fields (same
+  `readableId`, new `revision`, `active: true`) and copies the source's planning
+  and purchasing setup onto it (next bullet), so a revision with default planning
+  and no suppliers is never visible and a failure leaves no row holding the
+  revision label. After the commit, if `replenishmentSystem !== "Buy"`, it calls
+  the `get-method` server function (`@carbon/server-functions/get-method`,
+  `type: "itemToItem"`) to copy the method/BOM from source to the new revision.
+  That call runs its own transaction, so it cannot join this one: a failure is
+  logged and the revision stands (the method can be copied again). Three callers, one behaviour: the New Revision
+  route, material sizes (`upsertMaterial`), and a change notice's Revision draft
+  (`createChangeNoticeDraftMethod`, `active: false`).
+- **Authorization.** Kysely bypasses RLS, so before the transaction
+  `createRevision` calls `assert_company_access(companyId, 'parts_create')`
+  through the caller's `client` (`requireCompanyPermission`, shared with the
+  delete paths below) — the same predicate as the `item` INSERT policy
+  (`inCompany("companyId", "parts_create")`), and a no-op for a service-role
+  client. It matters: two change-notice routes (`$id.affected`,
+  `…change-type`) only require `parts_update`, so without the gate a user who
+  cannot create parts could mint a revision there. A refused caller gets the
+  function's error and nothing is written. A taken revision label comes back as
+  `{ code: "23505" }`.
+- **What a revision inherits** (`copyItemPlanningAndPurchasing(trx, …)`, inside
+  that transaction, every statement scoped to the company on both sides). The
+  item interceptor runs with the insert, so the new item's `itemReplenishment` /
+  `itemPlanning` / `itemCost` rows already exist with defaults and are updated
+  in place:
+  - `itemReplenishment`: `lotSize` (Batch Size), `scrapPercentage`, `leadTime`,
+    `preferredSupplierId`, and with it `purchasingUnitOfMeasureCode` +
+    `conversionFactor` (both derived from the preferred supplier's supplier part).
+  - `itemPlanning`, per location: `reorderingPolicy` and its sizing parameters
+    (accumulation period, safety stock, reorder point and quantity, maximum
+    inventory, min/max order quantity, order multiple). A policy without its
+    parameters is invalid, so they travel together. The two other fields on the
+    planning form, `planningHorizonDays` and `responsibleEmployee`, are NOT
+    copied (`copyItemPlanningAndPurchasing`, `items.service.ts`).
+  - `itemCost.itemPostingGroupId` (the item group).
+  - `supplierPart` rows and their `supplierPartPrice` price breaks, paired by
+    `supplierId` (unique per item).
+  NOT copied: costs, `itemUnitSalePrice`, `requiresConfiguration` and the
+  blocked flags, `minimumReserveQuantity`, supersession, pick method, shelf life,
+  `itemPlanning.planningHorizonDays`, `itemPlanning.responsibleEmployee`.
+- **Deleting an item deletes its price breaks first.** `supplierPart.itemId`
+  cascades from `item`, but `supplierPartPrice → supplierPart` is
+  `ON DELETE RESTRICT`, and every revision of an item with price breaks now
+  carries them. `deleteItemsWithPriceBreaks(trx, { itemIds, companyId })` deletes
+  the price breaks and then the items, scoped to the company, inside the
+  caller's Kysely transaction — so an item delete Postgres refuses (ledger
+  history, tracked entities) leaves the price breaks in place. Two callers, both
+  gated by `assert_company_access(companyId, 'parts_delete')` (the `item` /
+  `makeMethod` DELETE rule):
+  - `deleteItem(client, db, id, companyId)` — the Item Master delete. A refusal
+    keeps its SQLSTATE (`23503`), which the route maps to its message.
+  - `discardChangeNoticeDrafts(client, db, drafts, companyId)` — every draft of
+    the call (draft items, and Version draft methods) in ONE transaction, and it
+    returns the error. `removeChangeNoticeAffectedItem` and `deleteChangeNotice`
+    stop on it, so the affected row / notice is never removed while its draft
+    survives; `updateChangeNoticeAffectedItemChangeType` checks `parts_delete`
+    before it creates the replacement draft, and reports a late failure.
+  Deleting a single **supplier part** that has price breaks
+  (`deleteSupplierPart`) is still refused by the same constraint.
+- UI form: `RevisionForm.tsx`; version switcher menus ("Versions" submenu) live in
+  the type tables (`PartsTable.tsx`, etc.), shown only when `revisions.length > 1`,
+  linking each sibling by its item id. Badge component: `ItemWithRevision.tsx`.
+
+## Make methods vs. revisions (distinct concepts)
+
+A **make method** is the manufacturing recipe for a Part/Tool item; a `makeMethod`
+row is auto-created per item via the `create_make_method_related_records` AFTER
+INSERT trigger (so **each revision gets its own makeMethod**).
+
+Make methods are independently **versioned** (`20250603011801_make-method-version.sql`):
+- `makeMethod.version` NUMERIC DEFAULT 1, `makeMethod.status` enum `makeMethodStatus`
+  = `Draft | Active | Archived`. Unique `(itemId, version)`.
+- View `activeMakeMethods` ranks per `itemId`, preferring `status='Active'` then
+  `version DESC` (excludes `Archived`) — picks the one current method per item.
+- `activateMethodVersion` (`items.service.ts`) calls the `convert` server function
+  (`type: "methodVersionToActive"`). Route: `x+/items+/methods+/versions.activate.$id.tsx`.
+- `jobMakeMethod.version` / `quoteMakeMethod.version` denormalize the method version
+  at job/quote creation. Don't conflate method `version` (per-item recipe) with item
+  `revision` (a sibling item row).
+
+## Gotchas
+
+- **Detail-RPC revisions are type-scoped.** `get_part_details` /
+  `get_tool_details` / `get_material_details` / `get_consumable_details` filter the
+  `item_revisions` CTE by `i."type" = '<Type>'`
+  (`20260515120000_fix-item-details-revisions-filter-by-type.sql`). A pre-fix RPC
+  leaked a Consumable into a Part's revisions list because they shared a `readableId`.
+  Keep the type filter when editing these functions.
+- **`'0'`/`''`/NULL are all the initial revision.** The view ordering and the
+  generated column all special-case them together — handle all three.
+- **No `itemId` FK on type tables**; join on `readableId` + `companyId`. Adding an
+  `itemReadableId` column is explicitly disallowed by the DB conventions.
+- The detail RPCs no longer select `i."requiresInspection"` — that column was dropped
+  2026-07-26 and the RPCs recreated without it (older RPC bodies in migrations between
+  `20260419094132` and the drop still select it; newest wins).

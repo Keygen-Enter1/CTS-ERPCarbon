@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { join, resolve } from "node:path";
+
+/**
+ * The single owner of the loop artifact layout. Every loop path is constructed
+ * here — nothing else in the harness should hardcode `.ai/runs/...`.
+ *
+ *   .ai/runs/<id>/        one loop run's artifacts
+ *     binding.loop.md     the binding the run was driven from          — COMMITTED
+ *     ledger.jsonl        append-only per-iteration record             — COMMITTED
+ *     outcome.json        the final LoopOutcome (machine-readable)     — COMMITTED
+ *     run.log.jsonl       full event log (verbose, ephemeral)          — GITIGNORED
+ *     screenshots/        behavior-gate captures (ephemeral)           — GITIGNORED
+ *
+ * Durable files (binding, ledger, outcome) are committed back to main after
+ * each build so any agent can inspect history and resume partial work without
+ * needing the original worktree. Volatile files (run.log, screenshots) are
+ * gitignored to keep the product tree clean.
+ *
+ * `.ai/runs/` also holds committed markdown run logs from the plan/execute
+ * skills — `pruneRuns` (see runs.ts) has one place to GC.
+ */
+
+/** Repo-relative root for ephemeral per-run artifacts (directories gitignored). */
+export const RUNS_DIR = ".ai/runs";
+
+/** Absolute dir holding one run's artifacts. */
+export function runDir(cwd: string, id: string): string {
+  return resolve(cwd, RUNS_DIR, id);
+}
+
+/** The binding the run was driven from (persisted for inspection / re-entry). */
+export function bindingPath(cwd: string, id: string): string {
+  return join(runDir(cwd, id), "binding.loop.md");
+}
+
+/** Append-only per-iteration ledger. */
+export function ledgerPath(cwd: string, id: string): string {
+  return join(runDir(cwd, id), "ledger.jsonl");
+}
+
+/** Full event log (every stdout line, mirrored to disk). */
+export function logPath(cwd: string, id: string): string {
+  return join(runDir(cwd, id), "run.log.jsonl");
+}
+
+/** The final LoopOutcome — what an external orchestrator reads instead of stdout. */
+export function outcomePath(cwd: string, id: string): string {
+  return join(runDir(cwd, id), "outcome.json");
+}
+
+/** Local dir the behavior gate captures screenshots into. */
+export function screenshotsDir(cwd: string, id: string): string {
+  return join(runDir(cwd, id), "screenshots");
+}
+
+/**
+ * Repo-relative path a screenshot is hosted at on the shared `loop-artifacts`
+ * branch (NOT the product tree). Mirrors the runtime layout so the hosted path
+ * is stable and unique per run.
+ */
+export function hostedScreenshotPath(id: string, name: string): string {
+  return `${RUNS_DIR}/${id}/screenshots/${name}`;
+}

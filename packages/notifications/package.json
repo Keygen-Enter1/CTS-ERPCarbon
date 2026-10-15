@@ -1,0 +1,24 @@
+{
+  "devDependencies": {
+    "@carbon/config": "workspace:*",
+    "@types/node": "20.19.39",
+    "sst": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "name": "@carbon/notifications",
+  "private": true,
+  "scripts": {
+    "clean": "rimraf .turbo node_modules dist",
+    "dev": "tsup --watch",
+    "lint": "biome lint --write ",
+    "test": "vitest run",
+    "typecheck": "tsgo --noEmit"
+  },
+  "sideEffects": false,
+  "type": "module",
+  "version": "0.0.0"
+}

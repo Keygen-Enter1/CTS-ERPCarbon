@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import "./zod.client";
+import { CONTROLLED_ENVIRONMENT, error, getBrowserEnv } from "@carbon/auth";
+import { flashClientMiddleware } from "@carbon/auth/middleware/flash.client";
+import {
+  flashHeadersContext,
+  flashMiddleware,
+  flashResultContext
+} from "@carbon/auth/middleware/flash.server";
+import { formBodyMiddleware } from "@carbon/auth/middleware/form-body.server";
+import { securityMiddleware } from "@carbon/auth/middleware/security.server";
+import { validator } from "@carbon/form";
+import { LocaleProvider, resolveLanguage } from "@carbon/locale";
+import { requestMiddleware } from "@carbon/logger/middleware.server";
+import { timedMiddleware } from "@carbon/logger/tracing.server";
+import { createInvalidationMiddleware } from "@carbon/query/cache";
+import {
+  OperatingSystemContextProvider,
+  Toaster,
+  TooltipProvider,
+  useMode,
+  ViewportProvider
+} from "@carbon/react";
+import { RootErrorBoundary } from "@carbon/react/ErrorBoundary";
+import type { Theme } from "@carbon/utils";
+import {
+  colorSchemeHintScript,
+  getPreferenceHeaders,
+  getViewportHint,
+  isSearchParamOnlyNavigation,
+  modeValidator,
+  prefetchCacheMiddleware,
+  themeColorValidator,
+  themes
+} from "@carbon/utils";
+import { faviconLinks } from "@carbon/utils/favicon";
+import { I18nProvider } from "@react-aria/i18n";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+import { Analytics } from "@vercel/analytics/react";
+import type React from "react";
+import { useContext, useState } from "react";
+import type {
+  ActionFunctionArgs,
+  LoaderFunctionArgs,
+  MetaFunction,
+  ShouldRevalidateFunction
+} from "react-router";
+import {
+  data,
+  Links,
+  Meta,
+  Outlet,
+  Scripts,
+  ScrollRestoration,
+  UNSAFE_FrameworkContext,
+  useLoaderData
+} from "react-router";
+import SonnerStyle from "sonner/dist/styles.css?url";
+import { preloadCatalog, useCatalog } from "~/services/lingui";
+import { getMode, setMode } from "~/services/mode.server";
+import Background from "~/styles/background.css?url";
+import NProgress from "~/styles/nprogress.css?url";
+import Tailwind from "~/styles/tailwind.css?url";
+import { path } from "~/utils/path";
+import "@carbon/lib/shims";
+import { MotionConfig } from "motion/react";
+import type { Route } from "./+types/root";
+import { getTheme, setTheme } from "./services/theme.server";
+
+export const middleware = timedMiddleware({
+  // First: the request scope (context, request id, access log).
+  request: requestMiddleware,
+  security: securityMiddleware,
+  formBody: formBodyMiddleware,
+  flash: flashMiddleware,
+  prefetchCache: prefetchCacheMiddleware
+});
+export const clientMiddleware = [
+  flashClientMiddleware,
+  createInvalidationMiddleware({
+    getCache: () => window.clientCache,
+    skipPaths: [path.to.refreshSession]
+  })
+];
+
+export const links: Route.LinksFunction = () => [
+  { rel: "stylesheet", href: Tailwind },
+  { rel: "stylesheet", href: SonnerStyle },
+  { rel: "stylesheet", href: Background },
+  { rel: "stylesheet", href: NProgress },
+  ...faviconLinks
+];
+
+export const meta: MetaFunction = () => {
+  return [
+    {
+      title: "Carbon | MES"
+    }
+  ];
+};
+
+// Root data is cookies + env + the flash result. A same-pathname GET (table
+// filter, sort, page, useRevalidator from realtime hooks) can change none of
+// it; actions still revalidate so the flash toast is surfaced.
+export const shouldRevalidate: ShouldRevalidateFunction = (args) =>
+  isSearchParamOnlyNavigation(args) ? false : args.defaultShouldRevalidate;
+
+export async function loader({ request, context }: LoaderFunctionArgs) {
+  const {
+    AUTH_PROVIDERS,
+    CARBON_EDITION,
+    CARBON_API_URL,
+    CARBON_SLACK_ENABLED,
+    CONTROLLED_ENVIRONMENT,
+    ERP_URL,
+    LOG_LEVEL,
+    MES_URL,
+    NODE_ENV,
+    POSTHOG_API_HOST,
+    POSTHOG_PROJECT_PUBLIC_KEY,
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    VERCEL_ENV,
+    VERCEL_URL
+  } = getBrowserEnv();
+
+  const preferences = getPreferenceHeaders(request);
+  const appLanguage = resolveLanguage(preferences.locale);
+  await preloadCatalog(appLanguage);
+
+  return data(
+    {
+      env: {
+        AUTH_PROVIDERS,
+        CARBON_EDITION,
+        CARBON_API_URL,
+        CARBON_SLACK_ENABLED,
+        CONTROLLED_ENVIRONMENT,
+        ERP_URL,
+        LOG_LEVEL,
+        MES_URL,
+        NODE_ENV,
+        POSTHOG_API_HOST,
+        POSTHOG_PROJECT_PUBLIC_KEY,
+        SUPABASE_URL,
+        SUPABASE_ANON_KEY,
+        VERCEL_ENV,
+        VERCEL_URL
+      },
+      ...getMode(request),
+      viewport: getViewportHint(request),
+      theme: getTheme(request),
+      preferences,
+      result: context.get(flashResultContext)
+    },
+    {
+      headers: context.get(flashHeadersContext) ?? undefined
+    }
+  );
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (
+    !contentType.includes("multipart/form-data") &&
+    !contentType.includes("application/x-www-form-urlencoded")
+  ) {
+    return data({ error: "Invalid content type" }, { status: 400 });
+  }
+
+  const formData = await request.formData();
+
+  // The account settings Appearance pane posts its theme color here too.
+  if (formData.has("theme")) {
+    const themeValidation =
+      await validator(themeColorValidator).validate(formData);
+    if (themeValidation.error) {
+      return data(error(themeValidation.error, "Invalid theme"), {
+        status: 400
+      });
+    }
+    return data(
+      {},
+      {
+        headers: { "Set-Cookie": setTheme(themeValidation.data.theme) }
+      }
+    );
+  }
+
+  const validation = await validator(modeValidator).validate(formData);
+
+  if (validation.error) {
+    return data(error(validation.error, "Invalid mode"), {
+      status: 400
+    });
+  }
+
+  return data(
+    {},
+    {
+      headers: { "Set-Cookie": setMode(validation.data.mode) }
+    }
+  );
+}
+
+function Document({
+  children,
+  title = "Carbon",
+  lang = "en",
+  mode = "light",
+  theme = "zinc",
+  env
+}: {
+  children: React.ReactNode;
+  title?: string;
+  lang?: string;
+  mode?: "light" | "dark";
+  theme?: string;
+  env?: Record<string, unknown>;
+}) {
+  const nonce = useContext(UNSAFE_FrameworkContext)?.nonce;
+  const selectedTheme = themes.find((t) => t.name === theme) as
+    | Theme
+    | undefined;
+
+  // Create style objects for both light and dark modes
+  const lightVars: Record<string, string> = {};
+  const darkVars: Record<string, string> = {};
+
+  if (selectedTheme) {
+    // Set light mode variables
+    Object.entries(selectedTheme.cssVars.light).forEach(([key, value]) => {
+      const cssKey = `--${key}`;
+      lightVars[cssKey] = `${value}`;
+    });
+
+    // Set dark mode variables
+    Object.entries(selectedTheme.cssVars.dark).forEach(([key, value]) => {
+      const cssKey = `--${key}`;
+      darkVars[cssKey] = `${value}`;
+    });
+  }
+
+  // Combine the styles with proper selectors
+  const themeStyle = {
+    ...(mode === "dark" ? darkVars : lightVars),
+    "--radius": "0.4375rem"
+  } as React.CSSProperties;
+
+  return (
+    <html
+      lang={lang}
+      className={`${mode} h-full overflow-x-hidden`}
+      style={themeStyle}
+    >
+      <head>
+        <meta charSet="utf-8" />
+        <meta
+          name="viewport"
+          content="width=device-width, initial-scale=1, viewport-fit=cover"
+        />
+        {/* Before any paint: records the OS color scheme for a `system` user
+            and reloads once if the server rendered the wrong mode. */}
+        <script
+          nonce={nonce}
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: colorSchemeHintScript }}
+        />
+        <Meta />
+        <title>{title}</title>
+        <Links />
+      </head>
+      <body className="h-full bg-background antialiased selection:bg-primary/10 selection:text-primary">
+        {children}
+        {/* Injected before <Scripts /> so `window.env` is populated before the
+            client entry module loads. Rendered here (not in <App />) so error
+            pages get it too — the client Supabase client reads SUPABASE_URL from
+            window.env at module load and otherwise crashes hydration. */}
+        {env ? (
+          <script
+            // Server render only: on the client the nonce is undefined (and browsers hide it).
+            nonce={nonce}
+            suppressHydrationWarning
+            dangerouslySetInnerHTML={{
+              __html: `window.env = ${JSON.stringify(env)};`
+            }}
+          />
+        ) : null}
+        <Toaster position="bottom-left" visibleToasts={5} />
+        <ScrollRestoration />
+        <Scripts />
+        {!CONTROLLED_ENVIRONMENT && import.meta.env.PROD && <Analytics />}
+      </body>
+    </html>
+  );
+}
+
+export default function App() {
+  const loaderData = useLoaderData<typeof loader>();
+  const env = loaderData?.env ?? {};
+  const theme = loaderData?.theme ?? "zinc";
+  const prefs = loaderData?.preferences;
+  const appLanguage = resolveLanguage(prefs.locale);
+  const catalog = useCatalog(appLanguage);
+
+  /* Dark/Light Mode */
+  const mode = useMode();
+
+  // One client for hook-based useQuery and for code outside React (the live
+  // lists, the invalidation middleware), which reaches it as window.clientCache.
+  const [queryClient] = useState(() => {
+    if (typeof window !== "undefined" && window.clientCache) {
+      return window.clientCache;
+    }
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false }
+      }
+    });
+    if (typeof window !== "undefined") {
+      window.clientCache = client;
+    }
+    return client;
+  });
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <OperatingSystemContextProvider platform={prefs.platform}>
+        <ViewportProvider initialViewport={loaderData?.viewport ?? "desktop"}>
+          <LocaleProvider locale={appLanguage} catalog={catalog}>
+            <I18nProvider locale={prefs.locale}>
+              <TooltipProvider>
+                <MotionConfig reducedMotion="user">
+                  <Document
+                    mode={mode}
+                    theme={theme}
+                    lang={appLanguage}
+                    env={env}
+                  >
+                    <Outlet />
+                    {/* Renders nothing outside development; the package strips itself. */}
+                    <ReactQueryDevtools buttonPosition="bottom-right" />
+                  </Document>
+                </MotionConfig>
+              </TooltipProvider>
+            </I18nProvider>
+          </LocaleProvider>
+        </ViewportProvider>
+      </OperatingSystemContextProvider>
+    </QueryClientProvider>
+  );
+}
+
+export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
+  // The ErrorBoundary renders in place of <App />, so it needs its own
+  // <Document> shell (html/head/scripts + theme vars). The VOID//SYS screen is
+  // dark by design, so force dark mode regardless of the user's preference.
+  // Inject `window.env` (via getBrowserEnv, not root loader data which is
+  // undefined in a no-match boundary) so the client can hydrate — otherwise the
+  // Supabase client throws "supabaseUrl is required" at module load and the
+  // boundary never becomes interactive.
+  return (
+    <Document mode="dark" title="Error" env={getBrowserEnv()}>
+      <RootErrorBoundary error={error} />
+    </Document>
+  );
+}

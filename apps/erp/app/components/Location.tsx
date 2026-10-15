@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  ActionMenu,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  VStack
+} from "@carbon/react";
+import { formatAddressLines, formatCityStatePostalCode } from "@carbon/utils";
+import { LuMapPin } from "react-icons/lu";
+import type { Action } from "~/types";
+
+type LocationProps = {
+  location: {
+    name: string;
+    address: {
+      addressLine1: string | null;
+      addressLine2: string | null;
+      city: string | null;
+      stateProvince: string | null;
+      postalCode: string | null;
+      country: {
+        alpha2: string;
+        name: string;
+      } | null;
+    } | null;
+  };
+  actions: Action[];
+};
+
+const Location = ({ location, actions }: LocationProps) => {
+  if (!location.address) {
+    return null;
+  }
+
+  const locationName = location.name;
+  const addressLines = formatAddressLines(
+    location.address.addressLine1,
+    location.address.addressLine2
+  );
+  const cityStatePostalCode = formatCityStatePostalCode(
+    location.address.city,
+    location.address.stateProvince,
+    location.address.postalCode
+  );
+  return (
+    <div className="grid w-full gap-4 grid-cols-[auto_1fr_auto]">
+      <LuMapPin className="size-5 mt-2" />
+      <VStack spacing={0}>
+        <p className="font-bold line-clamp-1 max-md:font-semibold">
+          {locationName}
+        </p>
+        <p className="text-sm text-muted-foreground line-clamp-1">
+          {addressLines}
+        </p>
+        <p className="text-sm text-muted-foreground line-clamp-1">
+          {cityStatePostalCode}
+        </p>
+        {location.address.country && (
+          <p className="text-sm text-muted-foreground line-clamp-1">
+            {location.address.country.name}
+          </p>
+        )}
+      </VStack>
+      {actions.length > 0 && (
+        <ActionMenu>
+          {actions.map((action) => (
+            <DropdownMenuItem key={action.label} onClick={action.onClick}>
+              {action.icon && <DropdownMenuIcon icon={action.icon} />}
+              {action.label}
+            </DropdownMenuItem>
+          ))}
+        </ActionMenu>
+      )}
+    </div>
+  );
+};
+
+export default Location;

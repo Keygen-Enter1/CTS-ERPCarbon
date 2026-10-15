@@ -1,0 +1,4567 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database, Json } from "@carbon/database";
+import { fetchAllFromTable, getCompanyTimeZone } from "@carbon/database";
+import type { Kysely, KyselyDatabase } from "@carbon/database/client";
+import {
+  type InvoiceDocumentIds,
+  loadDepositScope,
+  loadSalesInvoiceDocumentIds
+} from "@carbon/database/deposit-scope";
+import { getLogger } from "@carbon/logger";
+import { serverFns } from "@carbon/server-functions";
+import {
+  allocatePaymentFunding,
+  applyRate,
+  assertCurrencyDecimals,
+  assertExchangeRate,
+  calculateDueDate,
+  chunkArray,
+  datetime,
+  type FundingConsumptionRow,
+  type FundingPaymentRow,
+  type FundingRequest,
+  type FundingScope,
+  type FundingSource,
+  fundingScopeOf,
+  invoiceRemainingAmounts,
+  isEffectiveSettlement,
+  PAYABLE_POSTING_DESCRIPTIONS,
+  RECEIVABLE_POSTING_DESCRIPTIONS,
+  REIMBURSEMENT_PAYABLE_POSTING_DESCRIPTION,
+  reduceInvoiceSettlements,
+  remainingFundingSources,
+  round,
+  type SettlementBalanceRow,
+  toBaseAmount,
+  toDocumentAmount
+} from "@carbon/utils";
+import { endOfMonth, parseDate } from "@internationalized/date";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { z } from "zod";
+import {
+  getSupplierPayment,
+  getSupplierShipping,
+  insertSupplierInteraction
+} from "~/modules/purchasing";
+import type { GenericQueryFilters } from "~/utils/query";
+import { LIST_COUNT, setGenericQueryFilters } from "~/utils/query";
+import { sanitize } from "~/utils/supabase";
+import { getExchangeRate } from "../accounting/accounting.service";
+import { getEmployeeJob } from "../people/people.service";
+import {
+  getCustomerPayment,
+  getCustomerShipping
+} from "../sales/sales.service";
+import { updateSortOrder } from "../shared/sort-order";
+import type {
+  ChargeStatusType,
+  ChargeType,
+  invoiceSettlementValidator,
+  memoValidator,
+  PaymentStatusType,
+  paymentValidator,
+  purchaseInvoiceDeliveryValidator,
+  purchaseInvoiceLineValidator,
+  purchaseInvoiceValidator,
+  ReimbursementStatusType,
+  reimbursementLineValidator,
+  reimbursementUpdateValidator,
+  salesInvoiceLineValidator,
+  salesInvoiceShipmentValidator,
+  salesInvoiceValidator
+} from "./invoicing.models";
+
+const logger = getLogger("erp", "invoicing");
+
+const PURCHASE_INVOICES_LIST_COLUMNS =
+  "id,invoiceId,supplierId,invoiceSupplierId,supplierReference,postingDate,dateIssued,dateDue,datePaid,balance,assignee,createdBy,createdAt,updatedBy,updatedAt,customFields,companyId,thumbnailPath,itemType,orderTotal,status,paymentTermName" as const;
+
+const SALES_INVOICES_LIST_COLUMNS =
+  "id,invoiceId,status,customerId,customerReference,invoiceCustomerId,postingDate,dateIssued,dateDue,datePaid,balance,assignee,companyId,customFields,createdAt,createdBy,updatedAt,updatedBy,thumbnailPath,itemType,invoiceTotal,paymentTermName,needsReview,automationHoldReason,sendError,sentAt" as const;
+
+/**
+ * Compute an invoice's Due Date from its Issue Date and Payment Term.
+ * Returns null only when the issue date is missing or can't be parsed — callers
+ * fall back to a plain field update in that case. A missing payment term is NOT
+ * a missing due date: an unset paymentTermId, or one whose row genuinely
+ * doesn't exist for the company, falls back to `DEFAULT_PAYMENT_TERM` (Net 30).
+ * A payment-term *query failure* is different: it throws, so callers abort
+ * instead of writing the invoice with a stale dateDue. The read is scoped by
+ * companyId for tenant isolation (defense in depth alongside RLS) and uses
+ * maybeSingle so an absent row is data: null (not an error) — keeping "missing"
+ * distinguishable from "failed".
+ *
+ * The date arithmetic is `calculateDueDate` (@carbon/utils), the same one
+ * invoice posting uses.
+ * @mcp read
+ */
+export async function computeInvoiceDateDue(
+  client: SupabaseClient<Database>,
+  args: {
+    dateIssued: string | null | undefined;
+    paymentTermId: string | null | undefined;
+    companyId: string;
+  }
+): Promise<string | null> {
+  const { dateIssued, paymentTermId, companyId } = args;
+  if (!dateIssued) return null;
+
+  const paymentTerm = paymentTermId
+    ? await client
+        .from("paymentTerm")
+        .select("daysDue, calculationMethod")
+        .eq("id", paymentTermId)
+        .eq("companyId", companyId)
+        .maybeSingle()
+    : null;
+
+  if (paymentTerm?.error) {
+    throw new Error(
+      `Failed to load payment term ${paymentTermId} while recomputing invoice due date: ${paymentTerm.error.message}`
+    );
+  }
+
+  return calculateDueDate(dateIssued, paymentTerm?.data);
+}
+
+/**
+ * Early-payment (cash) discount per invoice, for seeding a payment's
+ * applications. A discount only applies when the payment lands within the
+ * term's discount window (e.g. "2/10 net 30" → 2% only if paid within 10 days
+ * of the issue date). Returns a Map keyed by invoice id; invoices with no term,
+ * a zero discount percentage, a missing issue date, or a payment date past the
+ * window map to 0.
+ *
+ * The discount is a settlement amount, so it rounds to the currency's decimals
+ * via `applyRate` (`discountPercentage` is stored as points, e.g. 2 → 0.02).
+ * The deadline uses the same calculationMethod anchoring as the due date (see
+ * computeInvoiceDateDue) but with `daysDiscount` instead of `daysDue`. Terms are
+ * batch-loaded in one query — never per invoice (N+1).
+ * @mcp read
+ */
+export async function computeEarlyPaymentDiscounts(
+  client: SupabaseClient<Database>,
+  args: {
+    companyId: string;
+    asOfDate: string;
+    currencyDecimals: number;
+    invoices: {
+      id: string;
+      balance: number;
+      dateIssued: string | null;
+      paymentTermId: string | null;
+    }[];
+  }
+): Promise<Map<string, number>> {
+  const { companyId, asOfDate, currencyDecimals, invoices } = args;
+  const result = new Map<string, number>(invoices.map((inv) => [inv.id, 0]));
+
+  const termIds = [
+    ...new Set(
+      invoices
+        .map((inv) => inv.paymentTermId)
+        .filter((id): id is string => Boolean(id))
+    )
+  ];
+  if (termIds.length === 0) return result;
+
+  const terms = await client
+    .from("paymentTerm")
+    .select("id, daysDiscount, discountPercentage, calculationMethod")
+    .in("id", termIds)
+    .eq("companyId", companyId);
+  if (terms.error) {
+    throw new Error(
+      `Failed to load payment terms while computing early-payment discounts: ${terms.error.message}`
+    );
+  }
+  const termById = new Map((terms.data ?? []).map((term) => [term.id, term]));
+
+  let asOf: ReturnType<typeof parseDate>;
+  try {
+    asOf = parseDate(asOfDate);
+  } catch {
+    return result;
+  }
+
+  for (const inv of invoices) {
+    if (!inv.paymentTermId || !inv.dateIssued) continue;
+    const term = termById.get(inv.paymentTermId);
+    if (!term) continue;
+    const pct = Number(term.discountPercentage ?? 0);
+    const days = Number(term.daysDiscount ?? 0);
+    if (pct <= 0) continue;
+
+    let issued: ReturnType<typeof parseDate>;
+    try {
+      issued = parseDate(inv.dateIssued);
+    } catch {
+      continue;
+    }
+
+    let deadline: ReturnType<typeof parseDate>;
+    switch (term.calculationMethod) {
+      case "End of Month":
+        deadline = endOfMonth(issued).add({ days });
+        break;
+      case "Day of Month": {
+        const sameMonth = issued.set({ day: days });
+        deadline =
+          sameMonth.compare(issued) >= 0
+            ? sameMonth
+            : issued.add({ months: 1 }).set({ day: days });
+        break;
+      }
+      default:
+        deadline = issued.add({ days });
+    }
+
+    // Past the discount window → the early-payment discount is no longer offered.
+    if (asOf.compare(deadline) > 0) continue;
+
+    result.set(
+      inv.id,
+      applyRate(Number(inv.balance), pct / 100, currencyDecimals)
+    );
+  }
+
+  return result;
+}
+
+/** @mcp create */
+export async function createPurchaseInvoiceFromPurchaseOrder(
+  client: SupabaseClient<Database>,
+  db: Kysely<KyselyDatabase>,
+  purchaseOrderId: string,
+  companyId: string,
+  userId: string
+) {
+  return serverFns.as({ client, db, companyId, userId }).invoke("convert", {
+    type: "purchaseOrderToPurchaseInvoice",
+    id: purchaseOrderId
+  });
+}
+
+/** @mcp create */
+export async function createSalesInvoiceFromSalesOrder(
+  client: SupabaseClient<Database>,
+  db: Kysely<KyselyDatabase>,
+  salesOrderId: string,
+  companyId: string,
+  userId: string
+) {
+  return serverFns.as({ client, db, companyId, userId }).invoke("convert", {
+    type: "salesOrderToSalesInvoice",
+    id: salesOrderId
+  });
+}
+
+/** @mcp create */
+export async function createSalesInvoiceFromShipment(
+  client: SupabaseClient<Database>,
+  db: Kysely<KyselyDatabase>,
+  shipmentId: string,
+  companyId: string,
+  userId: string
+) {
+  return serverFns.as({ client, db, companyId, userId }).invoke("convert", {
+    type: "shipmentToSalesInvoice",
+    id: shipmentId
+  });
+}
+
+/** @mcp delete */
+export async function deletePurchaseInvoice(
+  client: SupabaseClient<Database>,
+  purchaseInvoiceId: string
+) {
+  // Check if invoice is in Draft status before deleting
+  const invoice = await client
+    .from("purchaseInvoice")
+    .select("id, status")
+    .eq("id", purchaseInvoiceId)
+    .single();
+
+  if (invoice.error) {
+    return invoice;
+  }
+
+  if (invoice.data.status !== "Draft") {
+    return {
+      data: null,
+      error: {
+        message: `Cannot delete purchase invoice with status "${invoice.data.status}". Only Draft invoices can be deleted.`,
+        code: "INVOICE_NOT_DRAFT"
+      }
+    };
+  }
+
+  return client.from("purchaseInvoice").delete().eq("id", purchaseInvoiceId);
+}
+
+/** @mcp delete */
+export async function deletePurchaseInvoiceLine(
+  client: SupabaseClient<Database>,
+  purchaseInvoiceLineId: string
+) {
+  return client
+    .from("purchaseInvoiceLine")
+    .delete()
+    .eq("id", purchaseInvoiceLineId);
+}
+
+/** @mcp delete */
+export async function deleteSalesInvoice(
+  client: SupabaseClient<Database>,
+  salesInvoiceId: string
+) {
+  // Check if invoice is in Draft status before deleting
+  const invoice = await client
+    .from("salesInvoice")
+    .select("id, status")
+    .eq("id", salesInvoiceId)
+    .single();
+
+  if (invoice.error) {
+    return invoice;
+  }
+
+  if (invoice.data.status !== "Draft") {
+    return {
+      data: null,
+      error: {
+        message: `Cannot delete sales invoice with status "${invoice.data.status}". Only Draft invoices can be deleted.`,
+        code: "INVOICE_NOT_DRAFT"
+      }
+    };
+  }
+
+  return client.from("salesInvoice").delete().eq("id", salesInvoiceId);
+}
+
+/** @mcp delete */
+export async function deleteSalesInvoiceLine(
+  client: SupabaseClient<Database>,
+  salesInvoiceLineId: string
+) {
+  return client.from("salesInvoiceLine").delete().eq("id", salesInvoiceLineId);
+}
+
+/** @mcp read */
+export async function getPurchaseInvoice(
+  client: SupabaseClient<Database>,
+  purchaseInvoiceId: string
+) {
+  return client
+    .from("purchaseInvoices")
+    .select("*")
+    .eq("id", purchaseInvoiceId)
+    .single();
+}
+
+/** @mcp read */
+export async function getPurchaseInvoices(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+    supplierId: string | null;
+  }
+) {
+  let query = client
+    .from("purchaseInvoices")
+    .select(PURCHASE_INVOICES_LIST_COLUMNS, { count: LIST_COUNT })
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.ilike("invoiceId", `%${args.search}%`);
+  }
+
+  if (args.supplierId) {
+    query = query.eq("supplierId", args.supplierId);
+  }
+
+  query = setGenericQueryFilters(query, args, [
+    { column: "invoiceId", ascending: false }
+  ]);
+  return query;
+}
+
+/** @mcp read */
+export async function getPurchaseInvoiceDelivery(
+  client: SupabaseClient<Database>,
+  purchaseInvoiceId: string
+) {
+  return client
+    .from("purchaseInvoiceDelivery")
+    .select("*")
+    .eq("id", purchaseInvoiceId)
+    .single();
+}
+
+/** @mcp read */
+export async function getPurchaseInvoiceLines(
+  client: SupabaseClient<Database>,
+  purchaseInvoiceId: string
+) {
+  return client
+    .from("purchaseInvoiceLines")
+    .select("*")
+    .eq("invoiceId", purchaseInvoiceId)
+    .order("sortOrder", { ascending: true })
+    .order("createdAt", { ascending: true });
+}
+
+/** @mcp read */
+export async function getPurchaseInvoiceLine(
+  client: SupabaseClient<Database>,
+  purchaseInvoiceLineId: string
+) {
+  // The view: the line plus its asset's and lease's readable ids.
+  return client
+    .from("purchaseInvoiceLines")
+    .select("*")
+    .eq("id", purchaseInvoiceLineId)
+    .single();
+}
+
+/** @mcp read */
+export async function getSalesInvoice(
+  client: SupabaseClient<Database>,
+  salesInvoiceId: string
+) {
+  return client
+    .from("salesInvoices")
+    .select("*")
+    .eq("id", salesInvoiceId)
+    .single();
+}
+
+/** @mcp read */
+export async function getSalesInvoiceCustomerDetails(
+  client: SupabaseClient<Database>,
+  salesInvoiceId: string
+) {
+  return client
+    .from("salesInvoiceLocations")
+    .select("*")
+    .eq("id", salesInvoiceId)
+    .single();
+}
+
+/** @mcp read */
+export async function getSalesInvoices(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+    customerId: string | null;
+  }
+) {
+  let query = client
+    .from("salesInvoices")
+    .select(SALES_INVOICES_LIST_COLUMNS, { count: LIST_COUNT })
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.ilike("invoiceId", `%${args.search}%`);
+  }
+
+  if (args.customerId) {
+    query = query.eq("customerId", args.customerId);
+  }
+
+  query = setGenericQueryFilters(query, args, [
+    { column: "invoiceId", ascending: false }
+  ]);
+  return query;
+}
+
+/** @mcp read */
+export async function getSalesInvoiceShipment(
+  client: SupabaseClient<Database>,
+  salesInvoiceId: string
+) {
+  return client
+    .from("salesInvoiceShipment")
+    .select("*")
+    .eq("id", salesInvoiceId)
+    .single();
+}
+
+/** @mcp read */
+export async function getSalesInvoiceLines(
+  client: SupabaseClient<Database>,
+  salesInvoiceId: string
+) {
+  return client
+    .from("salesInvoiceLines")
+    .select("*")
+    .eq("invoiceId", salesInvoiceId)
+    .order("sortOrder", { ascending: true })
+    .order("createdAt", { ascending: true });
+}
+
+/** @mcp read */
+export async function getSalesInvoiceLine(
+  client: SupabaseClient<Database>,
+  salesInvoiceLineId: string
+) {
+  return client
+    .from("salesInvoiceLine")
+    .select("*")
+    .eq("id", salesInvoiceLineId)
+    .single();
+}
+
+/** @mcp update */
+export async function updatePurchaseInvoiceExchangeRate(
+  client: SupabaseClient<Database>,
+  data: {
+    id: string;
+    exchangeRate: number;
+    updatedBy: string;
+  }
+) {
+  const update = {
+    id: data.id,
+    exchangeRate: data.exchangeRate,
+    exchangeRateUpdatedAt: new Date().toISOString(),
+    updatedBy: data.updatedBy,
+    updatedAt: new Date().toISOString()
+  };
+
+  return client.from("purchaseInvoice").update(update).eq("id", update.id);
+}
+
+/** @mcp update */
+export async function updateSalesInvoiceExchangeRate(
+  client: SupabaseClient<Database>,
+  data: {
+    id: string;
+    exchangeRate: number;
+    updatedBy: string;
+  }
+) {
+  const update = {
+    id: data.id,
+    exchangeRate: data.exchangeRate,
+    exchangeRateUpdatedAt: new Date().toISOString(),
+    updatedBy: data.updatedBy,
+    updatedAt: new Date().toISOString()
+  };
+
+  return client.from("salesInvoice").update(update).eq("id", update.id);
+}
+
+/** @mcp create destructive */
+export async function insertPurchaseInvoice(
+  client: SupabaseClient<Database>,
+  input: {
+    supplierId: string;
+    companyId: string;
+    companyGroupId: string;
+    createdBy: string;
+    invoiceId?: string;
+    supplierReference?: string;
+    paymentTermId?: string;
+    currencyCode?: string;
+    locationId?: string;
+    invoiceSupplierId?: string;
+    invoiceSupplierContactId?: string;
+    invoiceSupplierLocationId?: string;
+    dateIssued?: string;
+    dateDue?: string;
+    exchangeRate?: number;
+    exchangeRateUpdatedAt?: string;
+    supplierShippingCost?: number;
+    customFields?: Json;
+  }
+): Promise<{
+  data: { id: string; invoiceId: string } | null;
+  error: import("@supabase/supabase-js").PostgrestError | null;
+}> {
+  let invoiceId: string;
+  if (input.invoiceId) {
+    invoiceId = input.invoiceId;
+  } else {
+    const seq = await client.rpc("get_next_sequence", {
+      sequence_name: "purchaseInvoice",
+      company_id: input.companyId
+    });
+    if (seq.error || !seq.data) {
+      return {
+        data: null,
+        error:
+          seq.error ??
+          ({
+            message: "Failed to generate purchaseInvoice sequence"
+          } as import("@supabase/supabase-js").PostgrestError)
+      };
+    }
+    invoiceId = seq.data;
+  }
+
+  const [supplierInteraction, supplierPayment, supplierShipping, purchaser] =
+    await Promise.all([
+      insertSupplierInteraction(client, input.companyId, input.supplierId),
+      getSupplierPayment(client, input.supplierId),
+      getSupplierShipping(client, input.supplierId),
+      getEmployeeJob(client, input.createdBy, input.companyId)
+    ]);
+
+  if (supplierInteraction.error)
+    return { data: null, error: supplierInteraction.error };
+  if (supplierPayment.error)
+    return { data: null, error: supplierPayment.error };
+  if (supplierShipping.error)
+    return { data: null, error: supplierShipping.error };
+
+  const { paymentTermId, invoiceSupplierId } = supplierPayment.data;
+  const { shippingMethodId, shippingTermId, incoterm, incotermLocation } =
+    supplierShipping.data;
+
+  let exchangeRate = input.exchangeRate;
+  let exchangeRateUpdatedAt =
+    input.exchangeRateUpdatedAt ?? new Date().toISOString();
+
+  if (input.currencyCode) {
+    const rate = await getExchangeRate(
+      client,
+      input.companyId,
+      input.currencyCode
+    );
+    if (rate.error) return { data: null, error: rate.error };
+    exchangeRate = rate.data;
+    exchangeRateUpdatedAt = new Date().toISOString();
+  }
+
+  const locationId = input.locationId ?? purchaser?.data?.locationId ?? null;
+
+  const invoice = await client
+    .from("purchaseInvoice")
+    .insert({
+      invoiceId,
+      supplierId: input.supplierId,
+      supplierReference: input.supplierReference ?? null,
+      invoiceSupplierId:
+        input.invoiceSupplierId ?? invoiceSupplierId ?? input.supplierId,
+      invoiceSupplierContactId: input.invoiceSupplierContactId ?? null,
+      invoiceSupplierLocationId: input.invoiceSupplierLocationId ?? null,
+      supplierInteractionId: supplierInteraction.data?.id,
+      currencyCode: input.currencyCode ?? "USD",
+      exchangeRate,
+      exchangeRateUpdatedAt,
+      paymentTermId: input.paymentTermId ?? paymentTermId,
+      dateIssued:
+        input.dateIssued ??
+        datetime
+          .today(await getCompanyTimeZone(client, input.companyId))
+          .toString(),
+      dateDue: input.dateDue ?? null,
+      locationId,
+      customFields: input.customFields,
+      companyId: input.companyId,
+      createdBy: input.createdBy,
+      updatedBy: input.createdBy
+    })
+    .select("id, invoiceId")
+    .single();
+
+  if (invoice.error) return { data: null, error: invoice.error };
+
+  const delivery = await client.from("purchaseInvoiceDelivery").insert({
+    id: invoice.data.id,
+    locationId,
+    shippingMethodId,
+    shippingTermId,
+    incoterm,
+    incotermLocation,
+    supplierShippingCost: input.supplierShippingCost ?? 0,
+    companyId: input.companyId
+  });
+
+  if (delivery.error) {
+    await client.from("purchaseInvoice").delete().eq("id", invoice.data.id);
+    return { data: null, error: delivery.error };
+  }
+
+  return {
+    data: { id: invoice.data.id, invoiceId: invoice.data.invoiceId },
+    error: null
+  };
+}
+
+/** @mcp update */
+export async function updatePurchaseInvoice(
+  client: SupabaseClient<Database>,
+  input: {
+    id: string;
+    updatedBy: string;
+    invoiceId?: string;
+    supplierId?: string;
+    supplierReference?: string | null;
+    paymentTermId?: string | null;
+    currencyCode?: string;
+    locationId?: string;
+    invoiceSupplierId?: string | null;
+    invoiceSupplierContactId?: string | null;
+    invoiceSupplierLocationId?: string | null;
+    dateIssued?: string | null;
+    dateDue?: string | null;
+    exchangeRate?: number;
+    exchangeRateUpdatedAt?: string;
+    customFields?: Json;
+  }
+): Promise<{
+  data: { id: string } | null;
+  error: import("@supabase/supabase-js").PostgrestError | null;
+}> {
+  const { id, ...rest } = input;
+  const result = await client
+    .from("purchaseInvoice")
+    .update({
+      ...sanitize(rest),
+      updatedAt: datetime.timestamp()
+    })
+    .eq("id", id)
+    .select("id")
+    .single();
+
+  if (result.error) return { data: null, error: result.error };
+  return { data: { id: result.data.id }, error: null };
+}
+
+/** @deprecated Use insertPurchaseInvoice for new invoices, updatePurchaseInvoice for existing invoices */
+export async function upsertPurchaseInvoice(
+  client: SupabaseClient<Database>,
+  purchaseInvoice:
+    | (Omit<z.infer<typeof purchaseInvoiceValidator>, "id" | "invoiceId"> & {
+        invoiceId: string;
+        companyId: string;
+        companyGroupId: string;
+        createdBy: string;
+        customFields?: Json;
+      })
+    | (Omit<z.infer<typeof purchaseInvoiceValidator>, "id" | "invoiceId"> & {
+        id: string;
+        invoiceId: string;
+        updatedBy: string;
+        customFields?: Json;
+      })
+) {
+  // Shipping cost belongs to purchaseInvoiceDelivery, not the invoice row.
+  if ("id" in purchaseInvoice) {
+    const { supplierShippingCost: _shipping, ...invoiceUpdate } =
+      purchaseInvoice;
+    return client
+      .from("purchaseInvoice")
+      .update({
+        ...sanitize(invoiceUpdate),
+        updatedAt: datetime.timestamp()
+      })
+      .eq("id", purchaseInvoice.id)
+      .select("id, invoiceId");
+  }
+
+  const [supplierInteraction, supplierPayment, supplierShipping, purchaser] =
+    await Promise.all([
+      insertSupplierInteraction(
+        client,
+        purchaseInvoice.companyId,
+        purchaseInvoice.supplierId
+      ),
+      getSupplierPayment(client, purchaseInvoice.supplierId),
+      getSupplierShipping(client, purchaseInvoice.supplierId),
+      getEmployeeJob(
+        client,
+        purchaseInvoice.createdBy,
+        purchaseInvoice.companyId
+      )
+    ]);
+
+  if (supplierInteraction.error) return supplierInteraction;
+  if (supplierPayment.error) return supplierPayment;
+  if (supplierShipping.error) return supplierShipping;
+
+  const { paymentTermId, invoiceSupplierId } = supplierPayment.data;
+
+  const { shippingMethodId, shippingTermId, incoterm, incotermLocation } =
+    supplierShipping.data;
+
+  if (purchaseInvoice.currencyCode) {
+    const rate = await getExchangeRate(
+      client,
+      purchaseInvoice.companyId,
+      purchaseInvoice.currencyCode
+    );
+    if (rate.error) return rate;
+    purchaseInvoice.exchangeRate = rate.data;
+    purchaseInvoice.exchangeRateUpdatedAt = new Date().toISOString();
+  } else {
+    purchaseInvoice.exchangeRate = 1;
+    purchaseInvoice.exchangeRateUpdatedAt = new Date().toISOString();
+  }
+
+  const locationId =
+    purchaseInvoice.locationId ?? purchaser?.data?.locationId ?? null;
+
+  const {
+    companyGroupId: _companyGroupId,
+    supplierShippingCost: _shipping,
+    ...purchaseInvoiceData
+  } = purchaseInvoice;
+
+  const invoice = await client
+    .from("purchaseInvoice")
+    .insert([
+      {
+        ...purchaseInvoiceData,
+        invoiceSupplierId: invoiceSupplierId ?? purchaseInvoice.supplierId,
+        supplierInteractionId: supplierInteraction.data?.id,
+        currencyCode: purchaseInvoice.currencyCode ?? "USD",
+        paymentTermId: purchaseInvoice.paymentTermId ?? paymentTermId
+      }
+    ])
+    .select("id, invoiceId");
+
+  if (invoice.error) return invoice;
+
+  const invoiceId = invoice.data[0].id;
+
+  const delivery = await client.from("purchaseInvoiceDelivery").insert([
+    {
+      id: invoiceId,
+      locationId: locationId,
+      shippingMethodId: shippingMethodId,
+      shippingTermId: shippingTermId,
+      incoterm: incoterm,
+      incotermLocation: incotermLocation,
+      companyId: purchaseInvoice.companyId
+    }
+  ]);
+
+  if (delivery.error) {
+    await client.from("purchaseInvoice").delete().eq("id", invoiceId);
+    return delivery;
+  }
+
+  return invoice;
+}
+
+/**
+ * Updates an invoice's delivery. The row is created with the invoice and
+ * shares its id, so there is nothing to insert here.
+ * @mcp update
+ */
+export async function upsertPurchaseInvoiceDelivery(
+  client: SupabaseClient<Database>,
+  purchaseInvoiceDelivery: z.infer<typeof purchaseInvoiceDeliveryValidator> & {
+    companyId: string;
+    updatedBy: string;
+    customFields?: Json;
+  }
+) {
+  // The company scopes the row; it is never written to it.
+  const { companyId, ...delivery } = purchaseInvoiceDelivery;
+  return client
+    .from("purchaseInvoiceDelivery")
+    .update(sanitize(delivery))
+    .eq("id", delivery.id)
+    .eq("companyId", companyId)
+    .select("id")
+    .single();
+}
+
+/** @mcp upsert */
+export async function upsertPurchaseInvoiceLine(
+  client: SupabaseClient<Database>,
+  purchaseInvoiceLine:
+    | (Omit<z.infer<typeof purchaseInvoiceLineValidator>, "id"> & {
+        companyId: string;
+        createdBy: string;
+        customFields?: Json;
+      })
+    | (Omit<z.infer<typeof purchaseInvoiceLineValidator>, "id"> & {
+        id: string;
+        updatedBy: string;
+        customFields?: Json;
+      })
+) {
+  // Only `create-lease-invoices` links a line to a lease payment row, when
+  // it bills the row; a caller cannot claim one (the row would stay Pending
+  // and be billed again), and an edit keeps the stored link.
+  const { leasePaymentId: _leasePaymentId, ...line } = purchaseInvoiceLine;
+  if ("id" in line) {
+    return client
+      .from("purchaseInvoiceLine")
+      .update(sanitize(line))
+      .eq("id", line.id)
+      .select("id")
+      .single();
+  }
+
+  const existing = await client
+    .from("purchaseInvoiceLine")
+    .select("sortOrder")
+    .eq("invoiceId", line.invoiceId);
+
+  const maxSortOrder = (existing.data ?? []).reduce(
+    (max, row) => Math.max(max, row.sortOrder ?? 0),
+    0
+  );
+
+  return client
+    .from("purchaseInvoiceLine")
+    .insert([{ ...line, sortOrder: maxSortOrder + 1 }])
+    .select("id")
+    .single();
+}
+
+/** @mcp update */
+export async function updatePurchaseInvoiceLineOrder(
+  db: Kysely<KyselyDatabase>,
+  companyId: string,
+  userId: string,
+  invoiceId: string,
+  updates: { id: string; sortOrder: number }[]
+) {
+  return updateSortOrder(db, {
+    table: "purchaseInvoiceLine",
+    column: "sortOrder",
+    companyId,
+    userId,
+    parent: { column: "invoiceId", id: invoiceId },
+    updates
+  });
+}
+
+/** @mcp create destructive */
+export async function insertSalesInvoice(
+  client: SupabaseClient<Database>,
+  input: {
+    customerId: string;
+    companyId: string;
+    companyGroupId: string;
+    createdBy: string;
+    invoiceId?: string;
+    customerReference?: string;
+    paymentTermId?: string;
+    currencyCode?: string;
+    locationId?: string;
+    invoiceCustomerId?: string;
+    invoiceCustomerContactId?: string;
+    invoiceCustomerLocationId?: string;
+    dateIssued?: string;
+    dateDue?: string;
+    exchangeRate?: number;
+    exchangeRateUpdatedAt?: string;
+    customFields?: Json;
+  }
+): Promise<{
+  data: { id: string; invoiceId: string } | null;
+  error: import("@supabase/supabase-js").PostgrestError | null;
+}> {
+  let invoiceId: string;
+  if (input.invoiceId) {
+    invoiceId = input.invoiceId;
+  } else {
+    const seq = await client.rpc("get_next_sequence", {
+      sequence_name: "salesInvoice",
+      company_id: input.companyId
+    });
+    if (seq.error || !seq.data) {
+      return {
+        data: null,
+        error:
+          seq.error ??
+          ({
+            message: "Failed to generate salesInvoice sequence"
+          } as import("@supabase/supabase-js").PostgrestError)
+      };
+    }
+    invoiceId = seq.data;
+  }
+
+  const [opportunity, customerPayment, customerShipping, salesPerson] =
+    await Promise.all([
+      client
+        .from("opportunity")
+        .insert({
+          companyId: input.companyId,
+          customerId: input.customerId
+        })
+        .select("id")
+        .single(),
+      getCustomerPayment(client, input.customerId),
+      getCustomerShipping(client, input.customerId),
+      getEmployeeJob(client, input.createdBy, input.companyId)
+    ]);
+
+  if (opportunity.error) return { data: null, error: opportunity.error };
+  if (customerPayment.error)
+    return { data: null, error: customerPayment.error };
+  if (customerShipping.error)
+    return { data: null, error: customerShipping.error };
+
+  const { paymentTermId, invoiceCustomerId } = customerPayment.data;
+  const { shippingMethodId, shippingTermId, incoterm, incotermLocation } =
+    customerShipping.data;
+
+  let exchangeRate = input.exchangeRate;
+  let exchangeRateUpdatedAt =
+    input.exchangeRateUpdatedAt ?? new Date().toISOString();
+
+  if (input.currencyCode) {
+    const rate = await getExchangeRate(
+      client,
+      input.companyId,
+      input.currencyCode
+    );
+    if (rate.error) return { data: null, error: rate.error };
+    exchangeRate = rate.data;
+    exchangeRateUpdatedAt = new Date().toISOString();
+  }
+
+  const locationId = input.locationId ?? salesPerson?.data?.locationId ?? null;
+
+  const invoice = await client
+    .from("salesInvoice")
+    .insert({
+      invoiceId,
+      customerId: input.customerId,
+      customerReference: input.customerReference ?? null,
+      invoiceCustomerId:
+        input.invoiceCustomerId ?? invoiceCustomerId ?? input.customerId,
+      invoiceCustomerContactId: input.invoiceCustomerContactId ?? null,
+      invoiceCustomerLocationId: input.invoiceCustomerLocationId ?? null,
+      opportunityId: opportunity.data?.id,
+      currencyCode: input.currencyCode ?? "USD",
+      exchangeRate,
+      exchangeRateUpdatedAt,
+      paymentTermId: input.paymentTermId ?? paymentTermId,
+      dateIssued:
+        input.dateIssued ??
+        datetime
+          .today(await getCompanyTimeZone(client, input.companyId))
+          .toString(),
+      dateDue: input.dateDue ?? null,
+      locationId,
+      customFields: input.customFields,
+      companyId: input.companyId,
+      createdBy: input.createdBy,
+      updatedBy: input.createdBy
+    })
+    .select("id, invoiceId")
+    .single();
+
+  if (invoice.error) return { data: null, error: invoice.error };
+
+  const delivery = await client.from("salesInvoiceShipment").insert({
+    id: invoice.data.id,
+    locationId,
+    shippingMethodId,
+    shippingTermId,
+    incoterm,
+    incotermLocation,
+    companyId: input.companyId,
+    createdBy: input.createdBy
+  });
+
+  if (delivery.error) {
+    await client.from("salesInvoice").delete().eq("id", invoice.data.id);
+    return { data: null, error: delivery.error };
+  }
+
+  return {
+    data: { id: invoice.data.id, invoiceId: invoice.data.invoiceId },
+    error: null
+  };
+}
+
+/** @mcp update */
+export async function updateSalesInvoice(
+  client: SupabaseClient<Database>,
+  input: {
+    id: string;
+    updatedBy: string;
+    invoiceId?: string;
+    customerId?: string;
+    customerReference?: string | null;
+    paymentTermId?: string | null;
+    currencyCode?: string;
+    locationId?: string;
+    invoiceCustomerId?: string | null;
+    invoiceCustomerContactId?: string | null;
+    invoiceCustomerLocationId?: string | null;
+    dateIssued?: string | null;
+    dateDue?: string | null;
+    exchangeRate?: number;
+    exchangeRateUpdatedAt?: string;
+    customFields?: Json;
+  }
+): Promise<{
+  data: { id: string } | null;
+  error: import("@supabase/supabase-js").PostgrestError | null;
+}> {
+  const { id, ...rest } = input;
+  const result = await client
+    .from("salesInvoice")
+    .update({
+      ...sanitize(rest),
+      updatedAt: datetime.timestamp()
+    })
+    .eq("id", id)
+    .select("id")
+    .single();
+
+  if (result.error) return { data: null, error: result.error };
+  return { data: { id: result.data.id }, error: null };
+}
+
+/** @deprecated Use insertSalesInvoice for new invoices, updateSalesInvoice for existing invoices */
+export async function upsertSalesInvoice(
+  client: SupabaseClient<Database>,
+  salesInvoice:
+    | (Omit<z.infer<typeof salesInvoiceValidator>, "id" | "invoiceId"> & {
+        invoiceId: string;
+        companyId: string;
+        companyGroupId: string;
+        createdBy: string;
+        customFields?: Json;
+      })
+    | (Omit<z.infer<typeof salesInvoiceValidator>, "id" | "invoiceId"> & {
+        id: string;
+        invoiceId: string;
+        updatedBy: string;
+        customFields?: Json;
+      })
+) {
+  if ("id" in salesInvoice) {
+    const { supplierShippingCost: _shipping, ...invoiceUpdate } = salesInvoice;
+    return client
+      .from("salesInvoice")
+      .update({
+        ...sanitize(invoiceUpdate),
+        updatedAt: datetime.timestamp()
+      })
+      .eq("id", salesInvoice.id)
+      .select("id, invoiceId");
+  }
+
+  const [opportunity, customerPayment, customerShipping, salesPerson] =
+    await Promise.all([
+      client
+        .from("opportunity")
+        .insert([
+          {
+            companyId: salesInvoice.companyId,
+            customerId: salesInvoice.customerId
+          }
+        ])
+        .select("id")
+        .single(),
+      getCustomerPayment(client, salesInvoice.customerId),
+      getCustomerShipping(client, salesInvoice.customerId),
+      getEmployeeJob(client, salesInvoice.createdBy, salesInvoice.companyId)
+    ]);
+
+  if (opportunity.error) return opportunity;
+  if (customerPayment.error) return customerPayment;
+  if (customerShipping.error) return customerShipping;
+
+  const { paymentTermId, invoiceCustomerId } = customerPayment.data;
+  const { shippingMethodId, shippingTermId, incoterm, incotermLocation } =
+    customerShipping.data;
+
+  if (salesInvoice.currencyCode) {
+    const rate = await getExchangeRate(
+      client,
+      salesInvoice.companyId,
+      salesInvoice.currencyCode
+    );
+    if (rate.error) return rate;
+    salesInvoice.exchangeRate = rate.data;
+    salesInvoice.exchangeRateUpdatedAt = new Date().toISOString();
+  } else {
+    salesInvoice.exchangeRate = 1;
+    salesInvoice.exchangeRateUpdatedAt = new Date().toISOString();
+  }
+
+  const locationId =
+    salesInvoice.locationId ?? salesPerson?.data?.locationId ?? null;
+
+  const {
+    companyGroupId: _companyGroupId,
+    supplierShippingCost: _shipping,
+    ...salesInvoiceData
+  } = salesInvoice;
+
+  const invoice = await client
+    .from("salesInvoice")
+    .insert([
+      {
+        ...salesInvoiceData,
+        invoiceCustomerId: invoiceCustomerId ?? salesInvoice.customerId,
+        opportunityId: opportunity.data?.id,
+        currencyCode: salesInvoice.currencyCode ?? "USD",
+        paymentTermId: salesInvoice.paymentTermId ?? paymentTermId
+      }
+    ])
+    .select("id, invoiceId");
+
+  if (invoice.error) return invoice;
+
+  const invoiceId = invoice.data[0].id;
+
+  const delivery = await client.from("salesInvoiceShipment").insert([
+    {
+      id: invoiceId,
+      locationId: locationId,
+      shippingMethodId: shippingMethodId,
+      shippingTermId: shippingTermId,
+      incoterm: incoterm,
+      incotermLocation: incotermLocation,
+      companyId: salesInvoice.companyId,
+      createdBy: salesInvoice.createdBy
+    }
+  ]);
+
+  if (delivery.error) {
+    await client.from("salesInvoice").delete().eq("id", invoiceId);
+    return delivery;
+  }
+
+  return invoice;
+}
+
+/**
+ * Updates an invoice's shipment. The row is created with the invoice and
+ * shares its id, so there is nothing to insert here.
+ * @mcp update
+ */
+export async function upsertSalesInvoiceShipment(
+  client: SupabaseClient<Database>,
+  salesInvoiceShipment: z.infer<typeof salesInvoiceShipmentValidator> & {
+    companyId: string;
+    updatedBy: string;
+    customFields?: Json;
+  }
+) {
+  // The company scopes the row; it is never written to it.
+  const { companyId, ...shipment } = salesInvoiceShipment;
+  return client
+    .from("salesInvoiceShipment")
+    .update(sanitize(shipment))
+    .eq("id", shipment.id)
+    .eq("companyId", companyId)
+    .select("id")
+    .single();
+}
+
+/** @mcp upsert */
+export async function upsertSalesInvoiceLine(
+  client: SupabaseClient<Database>,
+  salesInvoiceLine:
+    | (Omit<z.infer<typeof salesInvoiceLineValidator>, "id"> & {
+        companyId: string;
+        createdBy: string;
+        customFields?: Json;
+      })
+    | (Omit<z.infer<typeof salesInvoiceLineValidator>, "id"> & {
+        id: string;
+        updatedBy: string;
+        customFields?: Json;
+      })
+) {
+  // salesInvoiceLine has no purchase order columns.
+  const {
+    purchaseOrderId: _purchaseOrderId,
+    purchaseOrderLineId: _purchaseOrderLineId,
+    ...line
+  } = salesInvoiceLine;
+
+  // Only a Service line has a service period (a Rental line carries its
+  // billing period) — every other item type is a physical good, earned when it
+  // ships. A cleared DatePicker posts "", which a DATE column rejects, so both
+  // collapse to null.
+  const hasServicePeriod =
+    line.invoiceLineType === "Service" || line.invoiceLineType === "Rental";
+  const servicePeriod = {
+    serviceStartDate: (hasServicePeriod && line.serviceStartDate) || null,
+    serviceEndDate: (hasServicePeriod && line.serviceEndDate) || null
+  };
+
+  if ("id" in line) {
+    return client
+      .from("salesInvoiceLine")
+      .update(
+        sanitize({
+          ...line,
+          ...servicePeriod
+        })
+      )
+      .eq("id", line.id)
+      .select("id")
+      .single();
+  }
+
+  const existing = await client
+    .from("salesInvoiceLine")
+    .select("sortOrder")
+    .eq("invoiceId", line.invoiceId);
+
+  const maxSortOrder = (existing.data ?? []).reduce(
+    (max, row) => Math.max(max, row.sortOrder ?? 0),
+    0
+  );
+
+  return client
+    .from("salesInvoiceLine")
+    .insert([{ ...line, ...servicePeriod, sortOrder: maxSortOrder + 1 }])
+    .select("id")
+    .single();
+}
+
+/** @mcp update */
+export async function updateSalesInvoiceLineOrder(
+  db: Kysely<KyselyDatabase>,
+  companyId: string,
+  userId: string,
+  invoiceId: string,
+  updates: { id: string; sortOrder: number }[]
+) {
+  return updateSortOrder(db, {
+    table: "salesInvoiceLine",
+    column: "sortOrder",
+    companyId,
+    userId,
+    parent: { column: "invoiceId", id: invoiceId },
+    updates
+  });
+}
+
+// ======================================================================
+// Payments (AR receipts + AP disbursements + applications)
+// ======================================================================
+
+/** @mcp read */
+export async function getPayment(
+  client: SupabaseClient<Database>,
+  id: string,
+  companyId?: string
+) {
+  let query = client.from("payment").select("*").eq("id", id);
+  if (companyId) query = query.eq("companyId", companyId);
+  return query.single();
+}
+
+/** @mcp read */
+export async function getPayments(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+    paymentType: "Receipt" | "Disbursement" | null;
+    status: PaymentStatusType | null;
+    customerId: string | null;
+    supplierId: string | null;
+    // Combined counterparty filter (customer OR supplier ids) from the table's
+    // "Counterparty" filter, which sources options from both stores.
+    counterpartyIds?: string[] | null;
+  }
+) {
+  let query = client
+    .from("payment")
+    .select("*", { count: LIST_COUNT })
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.ilike("paymentId", `%${args.search}%`);
+  }
+  if (args.paymentType) {
+    query = query.eq("paymentType", args.paymentType);
+  }
+  if (args.status) {
+    query = query.eq("status", args.status);
+  }
+  if (args.customerId) {
+    query = query.eq("customerId", args.customerId);
+  }
+  if (args.supplierId) {
+    query = query.eq("supplierId", args.supplierId);
+  }
+  if (args.counterpartyIds && args.counterpartyIds.length > 0) {
+    // A payment carries either customerId or supplierId; match the selected
+    // ids against both columns (customer/supplier id spaces don't overlap).
+    const csv = args.counterpartyIds.join(",");
+    query = query.or(`customerId.in.(${csv}),supplierId.in.(${csv})`);
+  }
+
+  // Default to newest first by the sequential paymentId (PAY-yyyy-mm-NNNNNN),
+  // matching the sales/purchase invoice lists (invoiceId desc) and guaranteeing
+  // the most recently created payment is at the top (paymentDate ties otherwise).
+  query = setGenericQueryFilters(query, args, [
+    { column: "paymentId", ascending: false }
+  ]);
+  return query;
+}
+
+/** @mcp read */
+export async function getCharge(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  id: string
+) {
+  return client
+    .from("charge")
+    .select("*, chargeLine(*)")
+    .eq("id", id)
+    .eq("companyId", companyId)
+    .single();
+}
+
+/** @mcp read */
+export async function getCharges(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+    type: ChargeType | null;
+    status: ChargeStatusType | null;
+  }
+) {
+  let query = client
+    .from("charge")
+    .select("*", { count: LIST_COUNT })
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.or(
+      `chargeId.ilike.%${args.search}%,merchantName.ilike.%${args.search}%`
+    );
+  }
+  if (args.type) {
+    query = query.eq("type", args.type);
+  }
+  if (args.status) {
+    query = query.eq("status", args.status);
+  }
+
+  // Default to newest first by the sequential chargeId
+  // (CHG-yyyy-mm-NNNNNN), mirroring getPayments' paymentId desc default.
+  query = setGenericQueryFilters(query, args, [
+    { column: "chargeId", ascending: false }
+  ]);
+  return query;
+}
+
+/** @mcp read */
+export async function getReimbursement(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  id: string
+) {
+  // Embed the generic dimension rows with the lines — the editor and the
+  // read-mode badges both need them, and a per-line query would be an N+1.
+  return client
+    .from("reimbursement")
+    .select("*, reimbursementLine(*, reimbursementLineDimension(*))")
+    .eq("id", id)
+    .eq("companyId", companyId)
+    .single();
+}
+
+/** @mcp read */
+export async function getReimbursements(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+    status: ReimbursementStatusType | null;
+    employeeId: string | null;
+  }
+) {
+  let query = client
+    .from("reimbursement")
+    .select("*", { count: LIST_COUNT })
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.or(
+      `reimbursementId.ilike.%${args.search}%,reference.ilike.%${args.search}%`
+    );
+  }
+  if (args.status) {
+    query = query.eq("status", args.status);
+  }
+  if (args.employeeId) {
+    query = query.eq("employeeId", args.employeeId);
+  }
+
+  // Newest first by the sequential reimbursementId (REIMB-yyyy-mm-NNNNNN),
+  // mirroring getCharges' chargeId desc default.
+  query = setGenericQueryFilters(query, args, [
+    { column: "reimbursementId", ascending: false }
+  ]);
+  return query;
+}
+
+/**
+ * The payments that settle a reimbursement, for its Documents panel. One read
+ * of its settlement rows with the payment embedded — a reimbursement is only
+ * ever settled by an employee payment, never by a memo — de-duplicated, since
+ * one payment can carry several settlement rows.
+ * @mcp read
+ */
+export async function getReimbursementRelatedItems(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  reimbursementId: string
+) {
+  type Payment = Pick<
+    Database["public"]["Tables"]["payment"]["Row"],
+    "id" | "paymentId" | "status" | "paymentDate"
+  >;
+  const settlements = await fetchAllFromTable<{ payment: Payment | null }>(
+    client,
+    "invoiceSettlement",
+    "payment:payment!invoiceSettlement_paymentId_fkey(id, paymentId, status, paymentDate)",
+    (query) =>
+      query
+        .eq("companyId", companyId)
+        .eq("targetReimbursementId", reimbursementId)
+        .not("paymentId", "is", null)
+        .order("appliedDate")
+        .order("id")
+  );
+  if (settlements.error) {
+    logger.error("Failed to get reimbursement settlements", {
+      companyId,
+      reimbursementId,
+      error: settlements.error
+    });
+  }
+
+  const payments = new Map<string, Payment>();
+  for (const settlement of settlements.data ?? []) {
+    const payment = settlement.payment;
+    if (payment && !payments.has(payment.id)) payments.set(payment.id, payment);
+  }
+
+  return { payments: [...payments.values()] };
+}
+
+/**
+ * Header edit. `.eq("status", "Draft")` is defence in depth alongside the
+ * RLS UPDATE policy and the reimbursement_draft_guard trigger — a Posted
+ * document is immutable, and a caller that tries gets zero rows rather than
+ * a silent partial write. There is deliberately no insert branch: the Ramp
+ * sync is the only thing that creates a reimbursement.
+ * @mcp update
+ */
+export async function updateReimbursement(
+  client: SupabaseClient<Database>,
+  reimbursement: z.infer<typeof reimbursementUpdateValidator> & {
+    companyId: string;
+    updatedBy: string;
+    customFields?: Json;
+  }
+) {
+  const { id, companyId, ...update } = reimbursement;
+  return client
+    .from("reimbursement")
+    .update({
+      ...sanitize(update),
+      updatedAt: datetime.timestamp()
+    })
+    .eq("id", id)
+    .eq("companyId", companyId)
+    .eq("status", "Draft")
+    .select("id, reimbursementId")
+    .single();
+}
+
+/**
+ * Replace every coding line of a Draft reimbursement, transactionally.
+ *
+ * Kysely BYPASSES RLS, so the parent is re-read `forUpdate()` and its status
+ * re-asserted inside the transaction — exactly as replaceInvoiceSettlements
+ * does. The reimbursementLine_draft_guard trigger is the final backstop, but
+ * it raises a raw 55000; this throws a message the route can flash.
+ *
+ * Delete-all-then-reinsert rather than a diff: the editor submits the whole
+ * line set as one field, so a diff would be more code for the same result.
+ * @mcp upsert destructive
+ */
+export async function upsertReimbursementLines(
+  db: Kysely<KyselyDatabase>,
+  args: {
+    reimbursementId: string;
+    companyId: string;
+    createdBy: string;
+    lines: z.infer<typeof reimbursementLineValidator>[];
+  }
+) {
+  return db.transaction().execute(async (trx) => {
+    const reimbursement = await trx
+      .selectFrom("reimbursement")
+      .select(["id", "status"])
+      .where("id", "=", args.reimbursementId)
+      .where("companyId", "=", args.companyId)
+      .forUpdate()
+      .executeTakeFirst();
+    if (!reimbursement) throw new Error("Reimbursement not found");
+    if (reimbursement.status !== "Draft")
+      throw new Error(
+        "Coding lines can only be edited while the reimbursement is Draft"
+      );
+
+    // The reimbursementLineDimension rows need no explicit delete — the line
+    // delete cascades them (ON DELETE CASCADE on the line FK), so the replace
+    // is one delete and two inserts.
+    await trx
+      .deleteFrom("reimbursementLine")
+      .where("reimbursementId", "=", args.reimbursementId)
+      .where("companyId", "=", args.companyId)
+      .execute();
+
+    if (args.lines.length === 0) return 0;
+
+    // RETURNING id, so the dimension rows can be bound to the line they
+    // belong to without relying on PostgreSQL's unspecified INSERT row
+    // order — the same reason post-charge allocates journal line ids up
+    // front. Insert order is preserved by `sequence`, but do NOT zip the
+    // returned rows by position; key them by `sequence`.
+    const inserted = await trx
+      .insertInto("reimbursementLine")
+      .values(
+        args.lines.map((line, index) => ({
+          reimbursementId: args.reimbursementId,
+          companyId: args.companyId,
+          accountId: line.accountId,
+          costCenterId: line.costCenterId ?? null,
+          projectId: line.projectId ?? null,
+          description: line.description ?? null,
+          amount: line.amount,
+          sequence: index,
+          createdBy: args.createdBy
+        }))
+      )
+      .returning(["id", "sequence"])
+      .execute();
+
+    const idBySequence = new Map(inserted.map((r) => [r.sequence, r.id]));
+    const dimensionRows = args.lines.flatMap((line, index) => {
+      const lineId = idBySequence.get(index);
+      if (!lineId) throw new Error("Failed to map reimbursement line");
+      return (line.dimensions ?? []).map((d) => ({
+        reimbursementLineId: lineId,
+        companyId: args.companyId,
+        dimensionId: d.dimensionId,
+        valueId: d.valueId
+      }));
+    });
+    if (dimensionRows.length) {
+      await trx
+        .insertInto("reimbursementLineDimension")
+        .values(dimensionRows)
+        .execute();
+    }
+
+    return args.lines.length;
+  });
+}
+
+/** @mcp read */
+export async function getInvoiceSettlements(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  paymentId: string
+) {
+  type Settlement = Database["public"]["Tables"]["invoiceSettlement"]["Row"] & {
+    salesInvoice: { invoiceId: string } | null;
+    purchaseInvoice: { invoiceId: string } | null;
+    targetMemo: { memoId: string } | null;
+    targetReimbursement: { reimbursementId: string } | null;
+  };
+  return fetchAllFromTable<Settlement>(
+    client,
+    "invoiceSettlement",
+    "*, salesInvoice:targetSalesInvoiceId(invoiceId), purchaseInvoice:targetPurchaseInvoiceId(invoiceId), targetMemo:targetMemoId(memoId), targetReimbursement:reimbursement!invoiceSettlement_targetReimbursementId_fkey(reimbursementId)",
+    (query) =>
+      query
+        .eq("companyId", companyId)
+        .eq("paymentId", paymentId)
+        .order("appliedDate", { ascending: true })
+        .order("id")
+  );
+}
+
+// A settlement against an invoice can be sourced by either a cash payment or a
+// credit/debit memo — both are invoiceSettlement rows. The panel shows them
+// together, so the source is a tagged union.
+export type InvoiceSettlementSource =
+  | {
+      type: "payment";
+      id: string;
+      readableId: string;
+      status: string | null;
+      date: string | null;
+      currencyCode: string;
+    }
+  | {
+      type: "memo";
+      id: string;
+      readableId: string;
+      status: string | null;
+      date: string | null;
+      currencyCode: string;
+      direction: string;
+    };
+
+export type InvoiceSettlementForInvoice = {
+  id: string;
+  sourceAmount: number | null;
+  appliedAmount: number;
+  discountAmount: number;
+  writeOffAmount: number;
+  fxGainLossAmount: number | null;
+  targetExchangeRate: number;
+  sourceExchangeRate: number | null;
+  appliedDate: string;
+  source: InvoiceSettlementSource;
+};
+
+// Posted settlements against a specific invoice — BOTH cash payments and applied
+// credit/debit memos. Used by the "Applied" panel on the sales/purchase invoice
+// detail page. Page the embedded parents with their applications so large histories
+// retain every source without oversized ID lookups.
+/** @mcp read */
+export async function getInvoiceSettlementsForInvoice(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  side: "sales" | "purchase",
+  invoiceId: string
+): Promise<{
+  data: InvoiceSettlementForInvoice[] | null;
+  error: unknown;
+}> {
+  const column =
+    side === "sales" ? "targetSalesInvoiceId" : "targetPurchaseInvoiceId";
+  type Settlement = Pick<
+    Database["public"]["Tables"]["invoiceSettlement"]["Row"],
+    | "id"
+    | "paymentId"
+    | "memoId"
+    | "appliedViaPaymentId"
+    | "sourceAmount"
+    | "appliedAmount"
+    | "discountAmount"
+    | "writeOffAmount"
+    | "fxGainLossAmount"
+    | "targetExchangeRate"
+    | "sourceExchangeRate"
+    | "appliedDate"
+  > & {
+    payment: Pick<
+      Database["public"]["Tables"]["payment"]["Row"],
+      "id" | "paymentId" | "status" | "paymentDate" | "currencyCode"
+    > | null;
+    memo: Pick<
+      Database["public"]["Tables"]["memo"]["Row"],
+      | "id"
+      | "memoId"
+      | "status"
+      | "postingDate"
+      | "memoDate"
+      | "currencyCode"
+      | "direction"
+    > | null;
+    appliedViaPayment: { status: string | null } | null;
+  };
+  const apps = await fetchAllFromTable<Settlement>(
+    client,
+    "invoiceSettlement",
+    "id, paymentId, memoId, appliedViaPaymentId, sourceAmount, appliedAmount, discountAmount, writeOffAmount, fxGainLossAmount, targetExchangeRate, sourceExchangeRate, appliedDate, payment:payment!invoiceSettlement_paymentId_fkey(id,paymentId,status,paymentDate,currencyCode), memo:memo!invoiceSettlement_memoId_fkey(id,memoId,status,postingDate,memoDate,currencyCode,direction), appliedViaPayment:payment!invoiceSettlement_appliedViaPaymentId_fkey(status)",
+    (query) =>
+      query
+        .eq("companyId", companyId)
+        .eq(column, invoiceId)
+        .order("appliedDate", { ascending: false })
+        .order("id")
+  );
+  if (apps.error) return { data: null, error: apps.error };
+
+  const merged: InvoiceSettlementForInvoice[] = [];
+  for (const a of apps.data ?? []) {
+    if (
+      !isEffectiveSettlement({
+        paymentId: a.paymentId,
+        memoId: a.memoId,
+        appliedViaPaymentId: a.appliedViaPaymentId,
+        paymentStatus: a.payment?.status ?? null,
+        memoStatus: a.memo?.status ?? null,
+        viaStatus: a.appliedViaPayment?.status ?? null
+      })
+    )
+      continue;
+    let source: InvoiceSettlementSource | null = null;
+    if (a.paymentId && a.payment) {
+      const p = a.payment;
+      source = {
+        type: "payment",
+        id: p.id,
+        readableId: p.paymentId,
+        status: p.status,
+        date: p.paymentDate,
+        currencyCode: p.currencyCode
+      };
+    } else if (a.memoId && a.memo) {
+      const m = a.memo;
+      source = {
+        type: "memo",
+        id: m.id,
+        readableId: m.memoId,
+        status: m.status,
+        date: m.postingDate ?? m.memoDate,
+        currencyCode: m.currencyCode,
+        direction: m.direction
+      };
+    }
+    if (!source) continue;
+    merged.push({
+      id: a.id,
+      sourceAmount: a.sourceAmount,
+      appliedAmount: Number(a.appliedAmount),
+      discountAmount: Number(a.discountAmount),
+      writeOffAmount: Number(a.writeOffAmount),
+      fxGainLossAmount:
+        a.fxGainLossAmount == null ? null : Number(a.fxGainLossAmount),
+      targetExchangeRate: Number(a.targetExchangeRate),
+      sourceExchangeRate: Number(a.sourceExchangeRate),
+      appliedDate: a.appliedDate,
+      source
+    });
+  }
+
+  const bySource = new Map<string, InvoiceSettlementForInvoice>();
+  for (const row of merged) {
+    const key = `${row.source.type}:${row.source.id}:${row.appliedDate}`;
+    const previous = bySource.get(key);
+    if (!previous) {
+      bySource.set(key, { ...row });
+      continue;
+    }
+    previous.appliedAmount = round(previous.appliedAmount + row.appliedAmount);
+    previous.discountAmount = round(
+      previous.discountAmount + row.discountAmount
+    );
+    previous.writeOffAmount = round(
+      previous.writeOffAmount + row.writeOffAmount
+    );
+    previous.sourceAmount =
+      previous.sourceAmount == null || row.sourceAmount == null
+        ? null
+        : round(previous.sourceAmount + row.sourceAmount);
+    previous.fxGainLossAmount = round(
+      Number(previous.fxGainLossAmount ?? 0) + Number(row.fxGainLossAmount ?? 0)
+    );
+    if (previous.sourceExchangeRate !== row.sourceExchangeRate)
+      previous.sourceExchangeRate = null;
+  }
+  return { data: [...bySource.values()], error: null };
+}
+
+// Where a posted credit/debit memo's balance went — the documents it has been
+// applied to. The reverse of the invoice "Payments" panel: drives the "Applied To"
+// card on the memo detail page so you can see at a glance which invoices a memo
+// settled without opening each one. Target is a tagged union (sales/purchase
+// invoice, another memo when refunding a balance-increasing memo, or a
+// reimbursement — the fourth settlement target column, kept here so the union
+// stays total even though nothing writes a memo-sourced reimbursement
+// settlement today).
+export type MemoApplication = {
+  id: string;
+  appliedAmount: number;
+  appliedDate: string;
+  target:
+    | { type: "salesInvoice"; id: string; readableId: string }
+    | { type: "purchaseInvoice"; id: string; readableId: string }
+    | { type: "memo"; id: string; readableId: string }
+    | { type: "reimbursement"; id: string; readableId: string };
+};
+
+/** @mcp read */
+export async function getMemoApplications(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  memoId: string
+): Promise<{ data: MemoApplication[] | null; error: unknown }> {
+  // Embed the target documents' human-readable ids so the card can link out.
+  //
+  // Read through `fetchAllFromTable` rather than `client.from(...).select(...)`
+  // for the same reason `getInvoiceSettlements` does: its `selectColumns` is a
+  // plain `string`, so PostgREST's select-string type parser never runs. With
+  // four embeds the inline literal form trips TS2589 ("Type instantiation is
+  // excessively deep"). Paging is a free bonus — a heavily applied memo can
+  // exceed PostgREST's 1000-row cap.
+  type SettlementRow = Pick<
+    Database["public"]["Tables"]["invoiceSettlement"]["Row"],
+    | "id"
+    | "appliedAmount"
+    | "appliedDate"
+    | "appliedViaPaymentId"
+    | "targetSalesInvoiceId"
+    | "targetPurchaseInvoiceId"
+    | "targetMemoId"
+    | "targetReimbursementId"
+  > & {
+    salesInvoice: { invoiceId: string } | null;
+    purchaseInvoice: { invoiceId: string } | null;
+    targetMemo: { memoId: string } | null;
+    targetReimbursement: { reimbursementId: string } | null;
+  };
+  const settlements = await fetchAllFromTable<SettlementRow>(
+    client,
+    "invoiceSettlement",
+    "id, appliedAmount, appliedDate, appliedViaPaymentId, targetSalesInvoiceId, targetPurchaseInvoiceId, targetMemoId, targetReimbursementId, salesInvoice:targetSalesInvoiceId(invoiceId), purchaseInvoice:targetPurchaseInvoiceId(invoiceId), targetMemo:targetMemoId(memoId), targetReimbursement:reimbursement!invoiceSettlement_targetReimbursementId_fkey(reimbursementId)",
+    (query) =>
+      query
+        // `memoId` is a bare xid from the URL, so the tenant filter is what
+        // decides which company's history a caller can read — exactly as
+        // getInvoiceSettlements / getInvoiceSettlementsForInvoice do it. RLS is
+        // the backstop, not the gate: it admits every company the caller is an
+        // employee of, so without this a multi-company user's memo page would
+        // happily render another company's applications.
+        .eq("companyId", companyId)
+        .eq("memoId", memoId)
+        .order("appliedDate", { ascending: false })
+        .order("id")
+  );
+
+  if (settlements.error) return { data: null, error: settlements.error };
+  if (!settlements.data || settlements.data.length === 0)
+    return { data: [], error: null };
+
+  // A credit applied through a payment only takes effect once that payment is
+  // Posted (mirrors getInvoiceSettlementsForInvoice and the balance views).
+  const viaPaymentIds = settlements.data
+    .map((s) => s.appliedViaPaymentId)
+    .filter((id): id is string => Boolean(id));
+  const postedViaPayments =
+    viaPaymentIds.length > 0
+      ? await client
+          .from("payment")
+          .select("id")
+          .eq("companyId", companyId)
+          .in("id", viaPaymentIds)
+          .eq("status", "Posted")
+      : { data: [] as { id: string }[], error: null };
+  if (postedViaPayments.error)
+    return { data: null, error: postedViaPayments.error };
+  const postedViaSet = new Set(
+    ((postedViaPayments.data ?? []) as { id: string }[]).map((p) => p.id)
+  );
+
+  const rows: MemoApplication[] = [];
+  for (const s of settlements.data) {
+    // Staged on a Draft payment — not applied yet, so omit it.
+    if (s.appliedViaPaymentId && !postedViaSet.has(s.appliedViaPaymentId))
+      continue;
+
+    let target: MemoApplication["target"] | null = null;
+    if (s.targetSalesInvoiceId) {
+      target = {
+        type: "salesInvoice",
+        id: s.targetSalesInvoiceId,
+        readableId: s.salesInvoice?.invoiceId ?? s.targetSalesInvoiceId
+      };
+    } else if (s.targetPurchaseInvoiceId) {
+      target = {
+        type: "purchaseInvoice",
+        id: s.targetPurchaseInvoiceId,
+        readableId: s.purchaseInvoice?.invoiceId ?? s.targetPurchaseInvoiceId
+      };
+    } else if (s.targetMemoId) {
+      target = {
+        type: "memo",
+        id: s.targetMemoId,
+        readableId: s.targetMemo?.memoId ?? s.targetMemoId
+      };
+    } else if (s.targetReimbursementId) {
+      target = {
+        type: "reimbursement",
+        id: s.targetReimbursementId,
+        readableId:
+          s.targetReimbursement?.reimbursementId ?? s.targetReimbursementId
+      };
+    }
+    if (!target) continue;
+
+    rows.push({
+      id: s.id,
+      appliedAmount: Number(s.appliedAmount),
+      appliedDate: s.appliedDate,
+      target
+    });
+  }
+
+  return { data: rows, error: null };
+}
+
+/**
+ * The documents around a payment or memo, for its Documents panel: the
+ * statuses of what it settles, the credits a payment draws (memo settlements
+ * applied through it) and what those settle, its posting journal, and a
+ * memo's return order. One query per table; ids the caller does not pass are
+ * not queried.
+ */
+export async function getSettlementRelatedItems(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: {
+    journalId: string | null;
+    targets: {
+      targetSalesInvoiceId: string | null;
+      targetPurchaseInvoiceId: string | null;
+      targetMemoId: string | null;
+      targetReimbursementId: string | null;
+    }[];
+    appliedViaPaymentId?: string;
+    // The payment is still Draft: credits applied through it are only staged,
+    // so what they target is not settled yet (as in getMemoApplications).
+    appliedViaPaymentStaged?: boolean;
+    salesReturnOrderId?: string | null;
+    purchaseReturnOrderId?: string | null;
+    /** A rental early-return credit memo's agreement. */
+    rentalAgreementId?: string | null;
+  }
+) {
+  const viaPayment = args.appliedViaPaymentId
+    ? await client
+        .from("invoiceSettlement")
+        .select(
+          "memoId, targetSalesInvoiceId, targetPurchaseInvoiceId, targetMemoId, targetReimbursementId"
+        )
+        .eq("companyId", companyId)
+        .eq("appliedViaPaymentId", args.appliedViaPaymentId)
+    : null;
+  if (viaPayment?.error) {
+    logger.error("Failed to get credits applied via payment", {
+      companyId,
+      paymentId: args.appliedViaPaymentId,
+      error: viaPayment.error
+    });
+  }
+  const viaRows = viaPayment?.data ?? [];
+  const targets = args.appliedViaPaymentStaged
+    ? args.targets
+    : [...args.targets, ...viaRows];
+
+  const unique = (ids: (string | null | undefined)[]) => [
+    ...new Set(ids.filter((id): id is string => Boolean(id)))
+  ];
+  const salesInvoiceIds = unique(targets.map((t) => t.targetSalesInvoiceId));
+  const purchaseInvoiceIds = unique(
+    targets.map((t) => t.targetPurchaseInvoiceId)
+  );
+  const creditIds = unique(viaRows.map((row) => row.memoId));
+  const memoIds = unique([...targets.map((t) => t.targetMemoId), ...creditIds]);
+  const reimbursementIds = unique(targets.map((t) => t.targetReimbursementId));
+
+  const [
+    journal,
+    salesInvoices,
+    purchaseInvoices,
+    memos,
+    reimbursements,
+    salesReturnOrder,
+    purchaseReturnOrder,
+    rentalAgreement
+  ] = await Promise.all([
+    args.journalId
+      ? client
+          .from("journal")
+          .select("id, journalEntryId, status")
+          .eq("id", args.journalId)
+          .eq("companyId", companyId)
+          .maybeSingle()
+      : null,
+    salesInvoiceIds.length > 0
+      ? client
+          .from("salesInvoices")
+          .select("id, invoiceId, status")
+          .in("id", salesInvoiceIds)
+          .eq("companyId", companyId)
+          .order("invoiceId")
+      : null,
+    purchaseInvoiceIds.length > 0
+      ? client
+          .from("purchaseInvoices")
+          .select("id, invoiceId, status")
+          .in("id", purchaseInvoiceIds)
+          .eq("companyId", companyId)
+          .order("invoiceId")
+      : null,
+    memoIds.length > 0
+      ? client
+          .from("memo")
+          .select("id, memoId, status")
+          .in("id", memoIds)
+          .eq("companyId", companyId)
+          .order("memoId")
+      : null,
+    reimbursementIds.length > 0
+      ? client
+          .from("reimbursement")
+          .select("id, reimbursementId, status")
+          .in("id", reimbursementIds)
+          .eq("companyId", companyId)
+          .order("reimbursementId")
+      : null,
+    args.salesReturnOrderId
+      ? client
+          .from("salesReturnOrder")
+          .select("id, salesReturnOrderId, status")
+          .eq("id", args.salesReturnOrderId)
+          .eq("companyId", companyId)
+          .maybeSingle()
+      : null,
+    args.purchaseReturnOrderId
+      ? client
+          .from("purchaseReturnOrder")
+          .select("id, purchaseReturnOrderId, status")
+          .eq("id", args.purchaseReturnOrderId)
+          .eq("companyId", companyId)
+          .maybeSingle()
+      : null,
+    args.rentalAgreementId
+      ? client
+          .from("rentalAgreement")
+          .select("id, rentalAgreementId, status")
+          .eq("id", args.rentalAgreementId)
+          .eq("companyId", companyId)
+          .maybeSingle()
+      : null
+  ]);
+
+  const failures = {
+    journal,
+    salesInvoices,
+    purchaseInvoices,
+    memos,
+    reimbursements,
+    salesReturnOrder,
+    purchaseReturnOrder,
+    rentalAgreement
+  };
+  for (const [read, result] of Object.entries(failures)) {
+    if (result?.error) {
+      logger.error("Failed to get settlement related {read}", {
+        read,
+        companyId,
+        error: result.error
+      });
+    }
+  }
+
+  const credits = new Set(creditIds);
+  const allMemos = memos?.data ?? [];
+  return {
+    journal: journal?.data ?? null,
+    salesInvoices: salesInvoices?.data ?? [],
+    purchaseInvoices: purchaseInvoices?.data ?? [],
+    memos: allMemos.filter((memo) => !credits.has(memo.id)),
+    credits: allMemos.filter((memo) => credits.has(memo.id)),
+    reimbursements: reimbursements?.data ?? [],
+    salesReturnOrder: salesReturnOrder?.data ?? null,
+    purchaseReturnOrder: purchaseReturnOrder?.data ?? null,
+    rentalAgreement: rentalAgreement?.data ?? null
+  };
+}
+
+// Open sales invoices for a customer (active status and a positive
+// balance). Drives the apply table on the AR payment detail.
+/** @mcp read */
+export async function getOpenSalesInvoicesForCustomer(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  customerId: string,
+  currencyCode?: string
+) {
+  return getOpenInvoicesForParty(
+    client,
+    companyId,
+    true,
+    customerId,
+    currencyCode
+  );
+}
+/** @mcp read */
+export async function getOpenPurchaseInvoicesForSupplier(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  supplierId: string,
+  currencyCode?: string
+) {
+  return getOpenInvoicesForParty(
+    client,
+    companyId,
+    false,
+    supplierId,
+    currencyCode
+  );
+}
+
+async function getOpenInvoicesForParty(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  isAR: boolean,
+  partyId: string,
+  currencyCode?: string
+) {
+  type OpenInvoiceRow = Pick<
+    Database["public"]["Views"]["salesInvoices" | "purchaseInvoices"]["Row"],
+    | "id"
+    | "invoiceId"
+    // dateIssued + paymentTermId drive the early-payment discount window when a
+    // payment is seeded from these invoices.
+    | "dateIssued"
+    | "dateDue"
+    | "paymentTermId"
+    | "currencyCode"
+    | "exchangeRate"
+    | "totalAmount"
+    | "balance"
+    | "status"
+  >;
+  type SettlementRow = SettlementBalanceRow & {
+    paymentId: string | null;
+    memoId: string | null;
+    appliedViaPaymentId: string | null;
+    payment: { status: string } | null;
+    memo: { status: string } | null;
+    appliedViaPayment: { status: string } | null;
+  };
+  type ControlRow = Pick<
+    Database["public"]["Tables"]["journalLine"]["Row"],
+    "documentId" | "amount"
+  >;
+  type DocumentLineRow = Pick<
+    Database["public"]["Tables"]["salesInvoiceLine"]["Row"],
+    "invoiceId" | "rentalAgreementId" | "salesOrderId"
+  >;
+  const [invoices, company] = await Promise.all([
+    fetchAllFromTable<OpenInvoiceRow>(
+      client,
+      isAR ? "salesInvoices" : "purchaseInvoices",
+      "id, invoiceId, dateIssued, dateDue, paymentTermId, currencyCode, exchangeRate, totalAmount, balance, status",
+      (query) => {
+        query = query
+          .eq("companyId", companyId)
+          .in(
+            "status",
+            isAR
+              ? ["Submitted", "Partially Paid", "Overdue"]
+              : ["Open", "Partially Paid", "Overdue"]
+          )
+          .eq(isAR ? "customerId" : "supplierId", partyId);
+        if (currencyCode) query = query.eq("currencyCode", currencyCode);
+        return query.order("dateDue", { ascending: true }).order("id");
+      }
+    ),
+    client.from("company").select("companyGroupId").eq("id", companyId).single()
+  ]);
+  if (invoices.error) return { data: null, error: invoices.error };
+  if (company.error || !company.data?.companyGroupId)
+    return {
+      data: null,
+      error: { message: "Company currency configuration is missing" }
+    };
+  const currencies = await client
+    .from("currency")
+    .select("code, decimalPlaces")
+    .eq("companyGroupId", company.data.companyGroupId);
+  if (currencies.error) return { data: null, error: currencies.error };
+  const ids = invoices.data.map((i) => i.id!);
+  const settlements: SettlementRow[] = [];
+  const controls: ControlRow[] = [];
+  const documentLines: DocumentLineRow[] = [];
+  // Bound filter URLs as well as response pages. A single invoice can itself
+  // have more than one response page of control lines or settlements.
+  for (const batch of chunkArray(ids, 100)) {
+    const [batchSettlements, batchControls, batchDocumentLines] =
+      await Promise.all([
+        fetchAllFromTable<SettlementRow>(
+          client,
+          "invoiceSettlement",
+          "paymentId, memoId, targetSalesInvoiceId, targetPurchaseInvoiceId, sourceAmount, appliedAmount, discountAmount, writeOffAmount, appliedViaPaymentId, payment:payment!invoiceSettlement_paymentId_fkey(status), memo:memo!invoiceSettlement_memoId_fkey(status), appliedViaPayment:payment!invoiceSettlement_appliedViaPaymentId_fkey(status)",
+          (query) =>
+            query
+              .eq("companyId", companyId)
+              .in(
+                isAR ? "targetSalesInvoiceId" : "targetPurchaseInvoiceId",
+                batch
+              )
+              .order("id")
+        ),
+        fetchAllFromTable<ControlRow>(
+          client,
+          "journalLine",
+          "documentId, amount, journal:journalId!inner(status,sourceType,companyId)",
+          (query) =>
+            query
+              .eq("companyId", companyId)
+              .eq("journal.companyId", companyId)
+              .eq("journal.status", "Posted")
+              .eq(
+                "journal.sourceType",
+                isAR ? "Sales Invoice" : "Purchase Invoice"
+              )
+              .eq("documentType", "Invoice")
+              .in(
+                "description",
+                isAR
+                  ? RECEIVABLE_POSTING_DESCRIPTIONS
+                  : PAYABLE_POSTING_DESCRIPTIONS
+              )
+              .in("documentId", batch)
+              .order("id")
+        ),
+        // The documents each invoice bills: a customer deposit funds only an
+        // invoice of its own rental agreement or sales order.
+        isAR
+          ? fetchAllFromTable<DocumentLineRow>(
+              client,
+              "salesInvoiceLine",
+              "invoiceId, rentalAgreementId, salesOrderId",
+              (query) =>
+                query
+                  .eq("companyId", companyId)
+                  .in("invoiceId", batch)
+                  .or("rentalAgreementId.not.is.null,salesOrderId.not.is.null")
+                  .order("id")
+            )
+          : { data: [] as DocumentLineRow[], error: null }
+      ]);
+    const error =
+      batchSettlements.error ?? batchControls.error ?? batchDocumentLines.error;
+    if (error) return { data: null, error };
+    settlements.push(...(batchSettlements.data ?? []));
+    controls.push(...(batchControls.data ?? []));
+    documentLines.push(...(batchDocumentLines.data ?? []));
+  }
+  const documentsByInvoice = new Map<
+    string,
+    { rentalAgreementIds: string[]; salesOrderIds: string[] }
+  >();
+  for (const line of documentLines) {
+    const documents = documentsByInvoice.get(line.invoiceId) ?? {
+      rentalAgreementIds: [],
+      salesOrderIds: []
+    };
+    if (
+      line.rentalAgreementId &&
+      !documents.rentalAgreementIds.includes(line.rentalAgreementId)
+    )
+      documents.rentalAgreementIds.push(line.rentalAgreementId);
+    if (
+      line.salesOrderId &&
+      !documents.salesOrderIds.includes(line.salesOrderId)
+    )
+      documents.salesOrderIds.push(line.salesOrderId);
+    documentsByInvoice.set(line.invoiceId, documents);
+  }
+  try {
+    const decimals = new Map(
+      (currencies.data ?? []).map((c) => [c.code, c.decimalPlaces])
+    );
+    if (currencyCode) requireCurrencyDecimals(decimals, currencyCode);
+    const effective = settlements.filter((s) =>
+      isEffectiveSettlement({
+        paymentId: s.paymentId,
+        memoId: s.memoId,
+        appliedViaPaymentId: s.appliedViaPaymentId,
+        paymentStatus: s.payment?.status ?? null,
+        memoStatus: s.memo?.status ?? null,
+        viaStatus: s.appliedViaPayment?.status ?? null
+      })
+    );
+    const controlAmounts = new Map<string, number>();
+    for (const line of controls)
+      if (line.documentId)
+        controlAmounts.set(
+          line.documentId,
+          (controlAmounts.get(line.documentId) ?? 0) + Number(line.amount)
+        );
+    return {
+      data: (invoices.data ?? [])
+        .map((i) => {
+          if (!i.id || !i.currencyCode)
+            throw new Error("Invoice currency or identity is missing");
+          const remaining = invoiceRemainingAmounts(
+            i,
+            effective,
+            controlAmounts,
+            requireCurrencyDecimals(decimals, i.currencyCode!),
+            isAR
+          );
+          return {
+            ...i,
+            id: i.id,
+            currencyCode: i.currencyCode,
+            balance: remaining.remainingBase,
+            remainingDocument: remaining.remainingDocument,
+            rentalAgreementIds:
+              documentsByInvoice.get(i.id)?.rentalAgreementIds ?? [],
+            salesOrderIds: documentsByInvoice.get(i.id)?.salesOrderIds ?? []
+          };
+        })
+        .filter((i) => i.remainingDocument > 0),
+      error: null
+    };
+  } catch (error) {
+    return {
+      data: null,
+      error: {
+        message:
+          error instanceof Error
+            ? error.message
+            : "Unable to load invoice balances"
+      }
+    };
+  }
+}
+
+/**
+ * Posted reimbursements an employee is still owed money on — the apply table's
+ * target list when a payment's payee is an employee, and the source of the
+ * balance the Pay expense modal defaults to.
+ *
+ * The supabase-client counterpart of `loadTransactionReimbursements`: same
+ * arithmetic (`invoiceRemainingAmounts` with `isReimbursement`), same control
+ * lookup, but a read rather than a `FOR UPDATE` lock — the transactional
+ * version stays the authority, this one only decides what to offer.
+ *
+ * `reimbursement.amount` is DOCUMENT currency (there is no base-currency total
+ * column), so it is converted once here; `invoiceRemainingAmounts` wants a base
+ * total and converts back itself.
+ * @mcp read
+ */
+export async function getOpenReimbursementsForEmployee(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  employeeId: string,
+  currencyCode?: string
+): Promise<{
+  data:
+    | {
+        id: string;
+        reimbursementId: string;
+        reimbursementDate: string;
+        currencyCode: string;
+        exchangeRate: number;
+        totalAmount: number;
+        balance: number;
+        remainingDocument: number;
+      }[]
+    | null;
+  error: unknown;
+}> {
+  type ReimbursementRow = Pick<
+    Database["public"]["Tables"]["reimbursement"]["Row"],
+    | "id"
+    | "reimbursementId"
+    | "reimbursementDate"
+    | "currencyCode"
+    | "exchangeRate"
+    | "amount"
+  >;
+  type SettlementRow = SettlementBalanceRow & {
+    paymentId: string | null;
+    memoId: string | null;
+    appliedViaPaymentId: string | null;
+    payment: { status: string } | null;
+  };
+  type ControlRow = Pick<
+    Database["public"]["Tables"]["journalLine"]["Row"],
+    "documentId" | "amount"
+  >;
+  const [reimbursements, company] = await Promise.all([
+    fetchAllFromTable<ReimbursementRow>(
+      client,
+      "reimbursement",
+      "id, reimbursementId, reimbursementDate, currencyCode, exchangeRate, amount",
+      (query) => {
+        query = query
+          .eq("companyId", companyId)
+          .eq("employeeId", employeeId)
+          // Only a Posted reimbursement has a booked payable to settle.
+          .eq("status", "Posted");
+        if (currencyCode) query = query.eq("currencyCode", currencyCode);
+        return query
+          .order("reimbursementDate", { ascending: true })
+          .order("id");
+      }
+    ),
+    client.from("company").select("companyGroupId").eq("id", companyId).single()
+  ]);
+  if (reimbursements.error) return { data: null, error: reimbursements.error };
+  if (company.error || !company.data?.companyGroupId)
+    return {
+      data: null,
+      error: { message: "Company currency configuration is missing" }
+    };
+  if (!reimbursements.data.length) return { data: [], error: null };
+  const currencies = await client
+    .from("currency")
+    .select("code, decimalPlaces")
+    .eq("companyGroupId", company.data.companyGroupId);
+  if (currencies.error) return { data: null, error: currencies.error };
+  const ids = reimbursements.data.map((r) => r.id);
+  const settlements: SettlementRow[] = [];
+  const controls: ControlRow[] = [];
+  // Bound the filter URL as well as the response pages, exactly as the invoice
+  // reader does — one reimbursement can own more than a page of either.
+  for (const batch of chunkArray(ids, 100)) {
+    const [batchSettlements, batchControls] = await Promise.all([
+      fetchAllFromTable<SettlementRow>(
+        client,
+        "invoiceSettlement",
+        "paymentId, memoId, targetSalesInvoiceId, targetPurchaseInvoiceId, targetReimbursementId, sourceAmount, appliedAmount, discountAmount, writeOffAmount, appliedViaPaymentId, payment:payment!invoiceSettlement_paymentId_fkey(status)",
+        (query) =>
+          query
+            .eq("companyId", companyId)
+            .in("targetReimbursementId", batch)
+            .order("id")
+      ),
+      fetchAllFromTable<ControlRow>(
+        client,
+        "journalLine",
+        "documentId, amount, journal:journalId!inner(status,sourceType,companyId)",
+        (query) =>
+          query
+            .eq("companyId", companyId)
+            .eq("journal.companyId", companyId)
+            .eq("journal.status", "Posted")
+            .eq("journal.sourceType", "Reimbursement")
+            .eq("documentType", "Reimbursement")
+            .eq("description", REIMBURSEMENT_PAYABLE_POSTING_DESCRIPTION)
+            .in("documentId", batch)
+            .order("id")
+      )
+    ]);
+    const error = batchSettlements.error ?? batchControls.error;
+    if (error) return { data: null, error };
+    settlements.push(...(batchSettlements.data ?? []));
+    controls.push(...(batchControls.data ?? []));
+  }
+  try {
+    const decimals = new Map(
+      (currencies.data ?? []).map((c) => [c.code, c.decimalPlaces])
+    );
+    // A reimbursement is never settled by a memo, so a Posted payment is the
+    // only source that can have taken effect.
+    const effective = settlements.filter((s) =>
+      isEffectiveSettlement({
+        paymentId: s.paymentId,
+        memoId: s.memoId,
+        appliedViaPaymentId: s.appliedViaPaymentId,
+        paymentStatus: s.payment?.status ?? null,
+        memoStatus: null,
+        viaStatus: null
+      })
+    );
+    const controlAmounts = new Map<string, number>();
+    for (const line of controls)
+      if (line.documentId)
+        controlAmounts.set(
+          line.documentId,
+          (controlAmounts.get(line.documentId) ?? 0) + Number(line.amount)
+        );
+    return {
+      data: reimbursements.data
+        .map((r) => {
+          const rate = Number(r.exchangeRate);
+          const totalAmount = toBaseAmount(Number(r.amount), rate);
+          const remaining = invoiceRemainingAmounts(
+            { id: r.id, totalAmount, exchangeRate: rate },
+            effective,
+            controlAmounts,
+            requireCurrencyDecimals(decimals, r.currencyCode),
+            false,
+            true
+          );
+          return {
+            id: r.id,
+            reimbursementId: r.reimbursementId,
+            reimbursementDate: r.reimbursementDate,
+            currencyCode: r.currencyCode,
+            exchangeRate: rate,
+            totalAmount,
+            balance: remaining.remainingBase,
+            remainingDocument: remaining.remainingDocument
+          };
+        })
+        .filter((r) => r.remainingDocument > 0),
+      error: null
+    };
+  } catch (error) {
+    return {
+      data: null,
+      error: {
+        message:
+          error instanceof Error
+            ? error.message
+            : "Unable to load reimbursement balances"
+      }
+    };
+  }
+}
+
+type PaymentParty =
+  | { paymentType: "Receipt"; customerId: string }
+  | { paymentType: "Disbursement"; supplierId: string };
+
+function requireCurrencyDecimals(
+  decimals: Map<string, number>,
+  code: string
+): number {
+  const value = decimals.get(code);
+  if (value == null || !Number.isInteger(value) || value < 0) {
+    throw new Error(`Currency ${code} requires configured decimal places`);
+  }
+  assertCurrencyDecimals(value);
+  return value;
+}
+
+/** @mcp read */
+export async function getPaymentCurrencyConfiguration(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  currencyCode: string
+): Promise<{ baseCurrencyCode: string; currencyDecimals: number }> {
+  const company = await client
+    .from("company")
+    .select("companyGroupId, baseCurrencyCode")
+    .eq("id", companyId)
+    .single();
+  if (
+    company.error ||
+    !company.data?.companyGroupId ||
+    !company.data.baseCurrencyCode
+  ) {
+    throw new Error("Company currency configuration is missing");
+  }
+  const currencies = await client
+    .from("currency")
+    .select("code, decimalPlaces")
+    .eq("companyGroupId", company.data.companyGroupId)
+    .eq("code", currencyCode);
+  if (currencies.error) throw new Error(currencies.error.message);
+  return {
+    baseCurrencyCode: company.data.baseCurrencyCode,
+    currencyDecimals: requireCurrencyDecimals(
+      new Map((currencies.data ?? []).map((c) => [c.code, c.decimalPlaces])),
+      currencyCode
+    )
+  };
+}
+
+async function loadOnAccountSources(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  party: PaymentParty,
+  currencyCode?: string
+) {
+  type OnAccountPaymentRow = FundingPaymentRow & {
+    rentalAgreementId: string | null;
+    salesOrderId: string | null;
+    depositAgreement: { readableId: string } | null;
+    depositOrder: { readableId: string } | null;
+  };
+  const [payments, company] = await Promise.all([
+    fetchAllFromTable<OnAccountPaymentRow>(
+      client,
+      "payment",
+      // A deposit's document comes along with its readable id so the composer
+      // can say which document the deposit is reserved for.
+      "id, totalAmount, exchangeRate, postingDate, paymentDate, currencyCode, rentalAgreementId, salesOrderId, depositAgreement:rentalAgreement!payment_rentalAgreementId_fkey(readableId:rentalAgreementId), depositOrder:salesOrder!payment_salesOrderId_fkey(readableId:salesOrderId)",
+      (query) => {
+        query = query
+          .eq("companyId", companyId)
+          .eq("status", "Posted")
+          .eq("paymentType", party.paymentType);
+        query =
+          party.paymentType === "Receipt"
+            ? query.eq("customerId", party.customerId)
+            : query.eq("supplierId", party.supplierId);
+        if (currencyCode) query = query.eq("currencyCode", currencyCode);
+        return query.order("id");
+      }
+    ),
+    client.from("company").select("companyGroupId").eq("id", companyId).single()
+  ]);
+  if (payments.error) throw new Error(payments.error.message);
+  if (company.error || !company.data?.companyGroupId)
+    throw new Error("Company currency configuration is missing");
+  const currencies = await client
+    .from("currency")
+    .select("code, decimalPlaces")
+    .eq("companyGroupId", company.data.companyGroupId);
+  if (currencies.error) throw new Error(currencies.error.message);
+  const decimals = new Map(
+    (currencies.data ?? []).map((c) => [c.code, c.decimalPlaces])
+  );
+  if (currencyCode) requireCurrencyDecimals(decimals, currencyCode);
+  if (!payments.data.length)
+    return { sources: [] as FundingSource[], decimals };
+  // Filter through the applying parent instead of sending an unbounded source-ID
+  // list in the URL. Every valid use of prior funding has the same party/currency.
+  const apps = await fetchAllFromTable<
+    FundingConsumptionRow & { payment: { status: string } | null }
+  >(
+    client,
+    "invoiceSettlement",
+    "paymentId, sourcePaymentId, sourceAmount, appliedAmount, fxGainLossAmount, payment:payment!invoiceSettlement_paymentId_fkey!inner(status)",
+    (query) => {
+      query = query
+        .eq("companyId", companyId)
+        .eq("payment.companyId", companyId)
+        .eq("payment.status", "Posted")
+        .eq("payment.paymentType", party.paymentType);
+      query =
+        party.paymentType === "Receipt"
+          ? query.eq("payment.customerId", party.customerId)
+          : query.eq("payment.supplierId", party.supplierId);
+      if (currencyCode) query = query.eq("payment.currencyCode", currencyCode);
+      return query.order("id");
+    }
+  );
+  if (apps.error) throw new Error(apps.error.message);
+  const effective = (apps.data ?? []).filter(
+    (a) => a.payment?.status === "Posted"
+  );
+  const isAR = party.paymentType === "Receipt";
+  return {
+    sources: remainingFundingSources(
+      (payments.data ?? []).map((payment) => {
+        const scope = isAR ? fundingScopeOf(payment) : null;
+        return {
+          ...payment,
+          scope: scope && {
+            ...scope,
+            readableId:
+              (scope.type === "rentalAgreement"
+                ? payment.depositAgreement?.readableId
+                : payment.depositOrder?.readableId) ?? null
+          }
+        };
+      }),
+      effective,
+      decimals,
+      isAR
+    ),
+    decimals
+  };
+}
+
+/** On-account credit funds any invoice; a deposit only its own document's. */
+function onAccountOnly(sources: FundingSource[]): FundingSource[] {
+  return sources.filter((source) => !source.scope);
+}
+
+/** @mcp read */
+export async function getAvailableOnAccountCreditSources(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  party: PaymentParty,
+  currencyCode: string
+): Promise<{
+  data: {
+    sources: FundingSource[];
+    availableDocumentAmount: number;
+    availableBaseAmount: number;
+  } | null;
+  error: { message: string } | null;
+}> {
+  try {
+    const { sources, decimals } = await loadOnAccountSources(
+      client,
+      companyId,
+      party,
+      currencyCode
+    );
+    // `sources` keeps deposits (each carries its `scope`) for the allocator;
+    // the totals are on-account credit only, which any invoice can draw on.
+    const credit = onAccountOnly(sources);
+    return {
+      data: {
+        sources,
+        availableDocumentAmount: toDocumentAmount(
+          credit.reduce((sum, p) => sum + p.remainingDocument, 0),
+          1,
+          requireCurrencyDecimals(decimals, currencyCode)
+        ),
+        availableBaseAmount: round(
+          credit.reduce((sum, p) => sum + p.remainingBase, 0)
+        )
+      },
+      error: null
+    };
+  } catch (error) {
+    return {
+      data: null,
+      error: {
+        message:
+          error instanceof Error
+            ? error.message
+            : "Unable to load payment funding"
+      }
+    };
+  }
+}
+
+/**
+ * Base-total contract for other readers; the composer uses typed document sources.
+ * @mcp read
+ */
+export async function getAvailableOnAccountCredit(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  party: PaymentParty
+): Promise<number> {
+  try {
+    const { sources } = await loadOnAccountSources(client, companyId, party);
+    return round(
+      onAccountOnly(sources).reduce((sum, p) => sum + p.remainingBase, 0)
+    );
+  } catch {
+    return 0;
+  }
+}
+
+/** @mcp upsert */
+export async function upsertPayment(
+  client: SupabaseClient<Database>,
+  payment:
+    | (Omit<z.infer<typeof paymentValidator>, "id" | "paymentId"> & {
+        paymentId: string;
+        companyId: string;
+        createdBy: string;
+        customFields?: Json;
+      })
+    | (Omit<z.infer<typeof paymentValidator>, "id"> & {
+        id: string;
+        updatedBy: string;
+        customFields?: Json;
+      })
+) {
+  if ("createdBy" in payment) {
+    return client
+      .from("payment")
+      .insert([
+        {
+          ...sanitize(payment),
+          customerId: payment.customerId ?? null,
+          supplierId: payment.supplierId ?? null,
+          salesOrderId: payment.salesOrderId ?? null,
+          rentalAgreementId: payment.rentalAgreementId ?? null,
+          employeeId: payment.employeeId ?? null
+        }
+      ])
+      .select("id, paymentId")
+      .single();
+  }
+  return client
+    .from("payment")
+    .update({
+      ...sanitize(payment),
+      customerId: payment.customerId ?? null,
+      supplierId: payment.supplierId ?? null,
+      salesOrderId: payment.salesOrderId ?? null,
+      rentalAgreementId: payment.rentalAgreementId ?? null,
+      // Explicit null, like the two trade parties: switching a Draft payment's
+      // payee must CLEAR the other two, or the widened one-of-three CHECK
+      // rejects the update.
+      employeeId: payment.employeeId ?? null
+    })
+    .eq("id", payment.id)
+    .select("id, paymentId")
+    .single();
+}
+
+// RLS DELETE policy on payment restricts to status='Draft'.
+/** @mcp delete */
+export async function deletePayment(
+  client: SupabaseClient<Database>,
+  id: string,
+  companyId: string
+) {
+  return client
+    .from("payment")
+    .delete()
+    .eq("id", id)
+    .eq("companyId", companyId);
+}
+
+export async function upsertInvoiceSettlement(
+  client: SupabaseClient<Database>,
+  app:
+    | (Omit<z.infer<typeof invoiceSettlementValidator>, "id"> & {
+        companyId: string;
+        createdBy: string;
+      })
+    | (Omit<z.infer<typeof invoiceSettlementValidator>, "id"> & {
+        id: string;
+      })
+) {
+  if ("createdBy" in app) {
+    return client
+      .from("invoiceSettlement")
+      .insert([sanitize(app)])
+      .select("id")
+      .single();
+  }
+  return client
+    .from("invoiceSettlement")
+    .update(sanitize(app))
+    .eq("id", app.id)
+    .select("id")
+    .single();
+}
+
+// RLS DELETE policy requires parent payment.status='Draft'.
+export async function deleteInvoiceSettlement(
+  client: SupabaseClient<Database>,
+  id: string
+) {
+  return client.from("invoiceSettlement").delete().eq("id", id);
+}
+
+// Replace-all for the apply table. The delete + insert run in a single
+// transaction so a failed insert can never leave the payment with its
+// applications wiped and nothing in their place. Kysely bypasses RLS, so we
+// re-assert the payment is Draft inside the txn — the FOR UPDATE lock also
+// serializes this against a concurrent post/void of the same payment.
+async function loadTransactionCurrency(
+  db: Kysely<KyselyDatabase>,
+  companyId: string,
+  code: string
+) {
+  const company = await db
+    .selectFrom("company")
+    .select(["companyGroupId", "baseCurrencyCode"])
+    .where("id", "=", companyId)
+    .executeTakeFirst();
+  if (!company?.companyGroupId)
+    throw new Error("Company currency configuration is missing");
+  const currencies = await db
+    .selectFrom("currency")
+    .select(["code", "decimalPlaces"])
+    .where("companyGroupId", "=", company.companyGroupId)
+    .execute();
+  const decimals = new Map(currencies.map((c) => [c.code, c.decimalPlaces]));
+  return {
+    decimals,
+    currencyDecimals: requireCurrencyDecimals(decimals, code)
+  };
+}
+
+async function loadTransactionInvoices(
+  db: Kysely<KyselyDatabase>,
+  companyId: string,
+  ids: string[],
+  isAR: boolean,
+  currencyCode: string,
+  partyId: string,
+  decimals: number
+) {
+  const view = isAR ? "salesInvoices" : "purchaseInvoices";
+  const targetColumn = isAR
+    ? "invoiceSettlement.targetSalesInvoiceId"
+    : "invoiceSettlement.targetPurchaseInvoiceId";
+  const invoices = isAR
+    ? await db
+        .selectFrom("salesInvoice")
+        .select([
+          "id",
+          "status",
+          "exchangeRate",
+          "currencyCode",
+          "customerId as partyId"
+        ])
+        .where("companyId", "=", companyId)
+        .where("id", "in", ids)
+        .orderBy("id")
+        .forUpdate()
+        .execute()
+    : await db
+        .selectFrom("purchaseInvoice")
+        .select([
+          "id",
+          "status",
+          "exchangeRate",
+          "currencyCode",
+          "supplierId as partyId"
+        ])
+        .where("companyId", "=", companyId)
+        .where("id", "in", ids)
+        .orderBy("id")
+        .forUpdate()
+        .execute();
+  for (const id of ids) {
+    const invoice = invoices.find((i) => i.id === id);
+    if (!invoice) throw new Error(`Invoice ${id} not found`);
+    if (invoice.partyId !== partyId)
+      throw new Error("A payment can only settle invoices for the same party");
+    if (invoice.currencyCode !== currencyCode)
+      throw new Error("Invoice and payment currency must match");
+    if (
+      !(
+        isAR
+          ? ["Submitted", "Partially Paid", "Overdue"]
+          : ["Open", "Partially Paid", "Overdue"]
+      ).includes(invoice.status)
+    )
+      throw new Error(`Invoice ${id} is not open`);
+    assertExchangeRate(Number(invoice.exchangeRate));
+  }
+  const [totals, settlements, controls] = await Promise.all([
+    db
+      .selectFrom(view)
+      .select(["id", "totalAmount", "exchangeRate"])
+      .where("companyId", "=", companyId)
+      .where("id", "in", ids)
+      .execute(),
+    db
+      .selectFrom("invoiceSettlement")
+      .leftJoin(
+        "payment as applyingPayment",
+        "applyingPayment.id",
+        "invoiceSettlement.paymentId"
+      )
+      .leftJoin(
+        "memo as sourceMemo",
+        "sourceMemo.id",
+        "invoiceSettlement.memoId"
+      )
+      .leftJoin(
+        "payment as viaPayment",
+        "viaPayment.id",
+        "invoiceSettlement.appliedViaPaymentId"
+      )
+      .select([
+        "invoiceSettlement.targetSalesInvoiceId",
+        "invoiceSettlement.targetPurchaseInvoiceId",
+        "invoiceSettlement.sourceAmount",
+        "invoiceSettlement.appliedAmount",
+        "invoiceSettlement.discountAmount",
+        "invoiceSettlement.writeOffAmount"
+      ])
+      .where("invoiceSettlement.companyId", "=", companyId)
+      .where(targetColumn, "in", ids)
+      .where((eb) =>
+        eb.or([
+          eb.and([
+            eb("applyingPayment.companyId", "=", companyId),
+            eb("applyingPayment.status", "=", "Posted")
+          ]),
+          eb.and([
+            eb("sourceMemo.companyId", "=", companyId),
+            eb("sourceMemo.status", "=", "Posted"),
+            eb.or([
+              eb("invoiceSettlement.appliedViaPaymentId", "is", null),
+              eb.and([
+                eb("viaPayment.companyId", "=", companyId),
+                eb("viaPayment.status", "=", "Posted")
+              ])
+            ])
+          ])
+        ])
+      )
+      .execute(),
+    db
+      .selectFrom("journalLine")
+      .innerJoin("journal", "journal.id", "journalLine.journalId")
+      .select(["journalLine.documentId", "journalLine.amount"])
+      .where("journalLine.companyId", "=", companyId)
+      .where("journal.companyId", "=", companyId)
+      .where("journal.status", "=", "Posted")
+      .where(
+        "journal.sourceType",
+        "=",
+        isAR ? "Sales Invoice" : "Purchase Invoice"
+      )
+      .where("journalLine.documentType", "=", "Invoice")
+      .where(
+        "journalLine.description",
+        "in",
+        isAR ? RECEIVABLE_POSTING_DESCRIPTIONS : PAYABLE_POSTING_DESCRIPTIONS
+      )
+      .where("journalLine.documentId", "in", ids)
+      .execute()
+  ]);
+  const controlAmounts = new Map<string, number>();
+  for (const line of controls)
+    if (line.documentId)
+      controlAmounts.set(
+        line.documentId,
+        (controlAmounts.get(line.documentId) ?? 0) + Number(line.amount)
+      );
+  return new Map(
+    totals.map((i) => [
+      i.id!,
+      {
+        ...invoiceRemainingAmounts(
+          i,
+          settlements,
+          controlAmounts,
+          decimals,
+          isAR
+        ),
+        exchangeRate: Number(i.exchangeRate)
+      }
+    ])
+  );
+}
+
+/**
+ * The reimbursement counterpart of `loadTransactionInvoices`. A Posted
+ * reimbursement is a TARGET exactly like a payable invoice — a liability whose
+ * carrying value prior payouts draw down — so the balance arithmetic is the
+ * shared `invoiceRemainingAmounts`, with only the target column and the
+ * original-control lookup differing.
+ *
+ * `reimbursement.amount` is DOCUMENT currency (the `reimbursement` table has no
+ * base-currency total column, unlike the `salesInvoices`/`purchaseInvoices`
+ * views), so it is converted once here — `invoiceRemainingAmounts` expects a
+ * base-currency `totalAmount` and converts back to document itself.
+ */
+async function loadTransactionReimbursements(
+  db: Kysely<KyselyDatabase>,
+  companyId: string,
+  ids: string[],
+  currencyCode: string,
+  employeeId: string,
+  decimals: number
+) {
+  const reimbursements = await db
+    .selectFrom("reimbursement")
+    .select([
+      "id",
+      "status",
+      "exchangeRate",
+      "currencyCode",
+      "amount",
+      "employeeId"
+    ])
+    .where("companyId", "=", companyId)
+    .where("id", "in", ids)
+    .orderBy("id")
+    .forUpdate()
+    .execute();
+  for (const id of ids) {
+    const reimbursement = reimbursements.find((r) => r.id === id);
+    if (!reimbursement) throw new Error(`Reimbursement ${id} not found`);
+    if (reimbursement.employeeId !== employeeId)
+      throw new Error(
+        "A payment can only settle reimbursements for the same employee"
+      );
+    if (reimbursement.currencyCode !== currencyCode)
+      throw new Error("Reimbursement and payment currency must match");
+    // Only a Posted reimbursement has a booked payable to settle; a Draft has
+    // no journal and a Voided one has been reversed.
+    if (reimbursement.status !== "Posted")
+      throw new Error(`Reimbursement ${id} is not posted`);
+    assertExchangeRate(Number(reimbursement.exchangeRate));
+  }
+  const [settlements, controls] = await Promise.all([
+    db
+      .selectFrom("invoiceSettlement")
+      .innerJoin(
+        "payment as applyingPayment",
+        "applyingPayment.id",
+        "invoiceSettlement.paymentId"
+      )
+      .select([
+        "invoiceSettlement.targetSalesInvoiceId",
+        "invoiceSettlement.targetPurchaseInvoiceId",
+        "invoiceSettlement.targetReimbursementId",
+        "invoiceSettlement.sourceAmount",
+        "invoiceSettlement.appliedAmount",
+        "invoiceSettlement.discountAmount",
+        "invoiceSettlement.writeOffAmount"
+      ])
+      .where("invoiceSettlement.companyId", "=", companyId)
+      .where("invoiceSettlement.targetReimbursementId", "in", ids)
+      // A reimbursement is never settled by a memo, so a posted payment is the
+      // only source that can have taken effect.
+      .where("applyingPayment.companyId", "=", companyId)
+      .where("applyingPayment.status", "=", "Posted")
+      .execute(),
+    db
+      .selectFrom("journalLine")
+      .innerJoin("journal", "journal.id", "journalLine.journalId")
+      .select(["journalLine.documentId", "journalLine.amount"])
+      .where("journalLine.companyId", "=", companyId)
+      .where("journal.companyId", "=", companyId)
+      .where("journal.status", "=", "Posted")
+      .where("journal.sourceType", "=", "Reimbursement")
+      .where("journalLine.documentType", "=", "Reimbursement")
+      .where(
+        "journalLine.description",
+        "=",
+        REIMBURSEMENT_PAYABLE_POSTING_DESCRIPTION
+      )
+      .where("journalLine.documentId", "in", ids)
+      .execute()
+  ]);
+  const controlAmounts = new Map<string, number>();
+  for (const line of controls)
+    if (line.documentId)
+      controlAmounts.set(
+        line.documentId,
+        (controlAmounts.get(line.documentId) ?? 0) + Number(line.amount)
+      );
+  return new Map(
+    reimbursements.map((r) => [
+      r.id,
+      {
+        ...invoiceRemainingAmounts(
+          {
+            id: r.id,
+            totalAmount: toBaseAmount(Number(r.amount), Number(r.exchangeRate)),
+            exchangeRate: Number(r.exchangeRate)
+          },
+          settlements,
+          controlAmounts,
+          decimals,
+          false,
+          true
+        ),
+        exchangeRate: Number(r.exchangeRate)
+      }
+    ])
+  );
+}
+
+/** Reserve both invoice applications and refunds against the same locked memo. */
+async function loadTransactionMemoConsumption(
+  trx: Kysely<KyselyDatabase>,
+  companyId: string,
+  memoIds: string[],
+  excludePaymentId: string
+) {
+  return trx
+    .selectFrom("invoiceSettlement")
+    .leftJoin("payment as viaPayment", (join) =>
+      join
+        .onRef("viaPayment.id", "=", "invoiceSettlement.appliedViaPaymentId")
+        .onRef("viaPayment.companyId", "=", "invoiceSettlement.companyId")
+    )
+    .leftJoin("payment as refund", (join) =>
+      join
+        .onRef("refund.id", "=", "invoiceSettlement.paymentId")
+        .onRef("refund.companyId", "=", "invoiceSettlement.companyId")
+    )
+    .select([
+      "invoiceSettlement.memoId",
+      "invoiceSettlement.targetMemoId",
+      "invoiceSettlement.sourceAmount",
+      "invoiceSettlement.appliedAmount",
+      "invoiceSettlement.fxGainLossAmount"
+    ])
+    .where("invoiceSettlement.companyId", "=", companyId)
+    .where((eb) =>
+      eb.or([
+        eb.and([
+          eb("invoiceSettlement.memoId", "in", memoIds),
+          eb.or([
+            eb("invoiceSettlement.appliedViaPaymentId", "is", null),
+            eb.and([
+              eb(
+                "invoiceSettlement.appliedViaPaymentId",
+                "!=",
+                excludePaymentId
+              ),
+              eb("viaPayment.status", "in", ["Draft", "Posted"])
+            ])
+          ])
+        ]),
+        eb.and([
+          eb("invoiceSettlement.targetMemoId", "in", memoIds),
+          eb("invoiceSettlement.paymentId", "!=", excludePaymentId),
+          eb("refund.status", "in", ["Draft", "Posted"])
+        ])
+      ])
+    )
+    .execute();
+}
+
+/**
+ * @mcp action destructive
+ * @mcp audit createdBy
+ */
+export async function replaceInvoiceSettlements(
+  db: Kysely<KyselyDatabase>,
+  args: {
+    paymentId: string;
+    companyId: string;
+    createdBy: string;
+    applications: Omit<
+      z.infer<typeof invoiceSettlementValidator>,
+      "id" | "paymentId"
+    >[];
+  }
+) {
+  return db.transaction().execute(async (trx) => {
+    const payment = await trx
+      .selectFrom("payment")
+      .selectAll()
+      .where("id", "=", args.paymentId)
+      .where("companyId", "=", args.companyId)
+      .forUpdate()
+      .executeTakeFirst();
+    if (!payment) throw new Error("Payment not found");
+    if (payment.status !== "Draft")
+      throw new Error(
+        "Applications can only be edited while the payment is Draft"
+      );
+    const { decimals, currencyDecimals } = await loadTransactionCurrency(
+      trx,
+      args.companyId,
+      payment.currencyCode
+    );
+    assertExchangeRate(Number(payment.exchangeRate));
+    const isAR = Boolean(payment.customerId);
+    const cashIn = payment.paymentType === "Receipt";
+    // An employee payee is a reimbursement payout, never a trade settlement:
+    // it is always cash OUT against the employee-payable control account, so
+    // it is neither AR nor a refund and has no on-account credit history to
+    // draw on. Resolve it BEFORE the customer-XOR-supplier check, which a
+    // three-way party can no longer satisfy.
+    const isReimbursement = Boolean(payment.employeeId);
+    const isRefund = !isReimbursement && cashIn !== isAR;
+    const partyId = isReimbursement
+      ? payment.employeeId
+      : isAR
+        ? payment.customerId
+        : payment.supplierId;
+    if (
+      !partyId ||
+      [payment.customerId, payment.supplierId, payment.employeeId].filter(
+        Boolean
+      ).length !== 1
+    )
+      throw new Error(
+        "A payment requires exactly one party (customer, supplier, or employee)"
+      );
+    if (isReimbursement && cashIn)
+      throw new Error("An employee payment must be a disbursement");
+    for (const app of args.applications) {
+      if (
+        app.sourceAmount != null &&
+        toDocumentAmount(app.sourceAmount, 1, currencyDecimals) !==
+          app.sourceAmount
+      ) {
+        throw new Error("Source amount exceeds document currency precision");
+      }
+      if ("sourcePaymentId" in app || "fxGainLossAmount" in app || app.memoId)
+        throw new Error("Funding source and FX are server-authoritative");
+      if (app.sourceExchangeRate !== Number(payment.exchangeRate))
+        throw new Error("Source exchange rate does not match the payment");
+      // A reimbursement payout takes no trade discount and no write-off —
+      // there is no negotiated settlement with an employee, and the AP
+      // discount/write-off accounts are supplier-scoped by class.
+      if (
+        isReimbursement &&
+        (!app.targetReimbursementId ||
+          app.targetSalesInvoiceId ||
+          app.targetPurchaseInvoiceId ||
+          app.targetMemoId ||
+          app.discountAmount !== 0 ||
+          app.writeOffAmount !== 0)
+      )
+        throw new Error(
+          "An employee payment targets reimbursements only, without discounts or write-offs"
+        );
+      if (
+        !isReimbursement &&
+        (isRefund
+          ? !app.targetMemoId ||
+            app.targetSalesInvoiceId ||
+            app.targetPurchaseInvoiceId ||
+            app.targetReimbursementId ||
+            app.discountAmount !== 0 ||
+            app.writeOffAmount !== 0
+          : app.targetMemoId ||
+            app.targetReimbursementId ||
+            (isAR
+              ? !app.targetSalesInvoiceId || app.targetPurchaseInvoiceId
+              : !app.targetPurchaseInvoiceId || app.targetSalesInvoiceId))
+      )
+        throw new Error(
+          "Payments target same-side invoices; refunds target reducing memos without adjustments"
+        );
+    }
+    if (isReimbursement) {
+      const ids = [
+        ...new Set(args.applications.map((app) => app.targetReimbursementId!))
+      ].sort();
+      if (!ids.length) {
+        await trx
+          .deleteFrom("invoiceSettlement")
+          .where("paymentId", "=", args.paymentId)
+          .where("companyId", "=", args.companyId)
+          .execute();
+        return;
+      }
+      const reimbursements = await loadTransactionReimbursements(
+        trx,
+        args.companyId,
+        ids,
+        payment.currencyCode,
+        partyId,
+        currencyDecimals
+      );
+      const requests = new Map<string, FundingRequest>();
+      const dates = new Map<string, string>();
+      for (const app of args.applications) {
+        const id = app.targetReimbursementId!;
+        const target = reimbursements.get(id);
+        if (!target) throw new Error(`Reimbursement ${id} balance not found`);
+        if (app.targetExchangeRate !== target.exchangeRate)
+          throw new Error(
+            "Target exchange rate does not match the reimbursement"
+          );
+        // Paying the balance in full releases the exact document remainder, so
+        // a payout never strands a minor unit the base-rounded conversion
+        // would leave behind.
+        const sourceAmount =
+          app.sourceAmount ??
+          (app.appliedAmount === target.remainingBase
+            ? target.remainingDocument
+            : toDocumentAmount(
+                app.appliedAmount,
+                target.exchangeRate,
+                currencyDecimals
+              ));
+        const request = requests.get(id) ?? {
+          targetId: id,
+          targetExchangeRate: target.exchangeRate,
+          remainingDocument: target.remainingDocument,
+          remainingBase: target.remainingBase,
+          requestedDocumentPrincipal: 0,
+          discountAmount: 0,
+          writeOffAmount: 0
+        };
+        request.requestedDocumentPrincipal = toDocumentAmount(
+          request.requestedDocumentPrincipal + sourceAmount,
+          1,
+          currencyDecimals
+        );
+        requests.set(id, request);
+        dates.set(id, app.appliedDate);
+      }
+      const allocation = allocatePaymentFunding({
+        currentPayment: {
+          paymentId: payment.id,
+          postingDate: payment.paymentDate,
+          exchangeRate: Number(payment.exchangeRate),
+          remainingDocument: Number(payment.totalAmount),
+          remainingBase: toBaseAmount(
+            Number(payment.totalAmount),
+            Number(payment.exchangeRate)
+          )
+        },
+        // An employee has no on-account credit history to draw on: a
+        // reimbursement payout is always funded by the current disbursement.
+        priorSources: [],
+        requests: [...requests.values()],
+        currencyDecimals,
+        isAR: cashIn
+      });
+      await trx
+        .deleteFrom("invoiceSettlement")
+        .where("paymentId", "=", payment.id)
+        .where("companyId", "=", args.companyId)
+        .execute();
+      if (allocation.applications.length)
+        await trx
+          .insertInto("invoiceSettlement")
+          .values(
+            allocation.applications.map(({ targetId, ...application }) => ({
+              ...application,
+              paymentId: payment.id,
+              targetReimbursementId: targetId,
+              targetSalesInvoiceId: null,
+              targetPurchaseInvoiceId: null,
+              targetMemoId: null,
+              appliedDate: dates.get(targetId)!,
+              createdBy: args.createdBy,
+              companyId: args.companyId
+            }))
+          )
+          .execute();
+      return;
+    }
+    if (isRefund) {
+      const ids = [
+        ...new Set(args.applications.map((app) => app.targetMemoId!))
+      ].sort();
+      const memos = ids.length
+        ? await trx
+            .selectFrom("memo")
+            .selectAll()
+            .where("companyId", "=", args.companyId)
+            .where("id", "in", ids)
+            .orderBy("id")
+            .forUpdate()
+            .execute()
+        : [];
+      if (memos.length !== ids.length)
+        throw new Error("Refund memo not found in this company");
+      for (const memo of memos) {
+        if (
+          memo.status !== "Posted" ||
+          memo.direction !== (isAR ? "Credit" : "Debit") ||
+          (isAR ? memo.customerId : memo.supplierId) !== partyId ||
+          memo.currencyCode !== payment.currencyCode
+        ) {
+          throw new Error(
+            "Refund target must be a posted reducing memo with matching party and currency"
+          );
+        }
+      }
+      const consumption = ids.length
+        ? await loadTransactionMemoConsumption(
+            trx,
+            args.companyId,
+            ids,
+            payment.id
+          )
+        : [];
+      const remaining = new Map(
+        remainingFundingSources(
+          memos.map((memo) => ({
+            ...memo,
+            totalAmount: memo.amount,
+            paymentDate: memo.memoDate
+          })),
+          consumption.map((row) => ({
+            ...row,
+            paymentId: row.memoId ?? row.targetMemoId,
+            sourcePaymentId: null,
+            fxGainLossAmount: row.targetMemoId ? 0 : row.fxGainLossAmount
+          })),
+          decimals,
+          isAR
+        ).map((source) => [source.paymentId, source])
+      );
+      const requests = new Map<string, FundingRequest>();
+      const dates = new Map<string, string>();
+      for (const app of args.applications) {
+        const memo = remaining.get(app.targetMemoId!);
+        if (!memo) throw new Error("Memo has no remaining refund balance");
+        if (app.targetExchangeRate !== memo.exchangeRate)
+          throw new Error("Target exchange rate does not match the memo");
+        const requested =
+          app.sourceAmount ??
+          (app.appliedAmount === memo.remainingBase
+            ? memo.remainingDocument
+            : toDocumentAmount(
+                app.appliedAmount,
+                memo.exchangeRate,
+                currencyDecimals
+              ));
+        const request = requests.get(app.targetMemoId!) ?? {
+          targetId: app.targetMemoId!,
+          targetExchangeRate: memo.exchangeRate,
+          remainingDocument: memo.remainingDocument,
+          remainingBase: memo.remainingBase,
+          requestedDocumentPrincipal: 0,
+          discountAmount: 0,
+          writeOffAmount: 0
+        };
+        request.requestedDocumentPrincipal = toDocumentAmount(
+          request.requestedDocumentPrincipal + requested,
+          1,
+          currencyDecimals
+        );
+        requests.set(app.targetMemoId!, request);
+        dates.set(app.targetMemoId!, app.appliedDate);
+      }
+      const allocation = allocatePaymentFunding({
+        currentPayment: {
+          paymentId: payment.id,
+          postingDate: payment.paymentDate,
+          exchangeRate: Number(payment.exchangeRate),
+          remainingDocument: Number(payment.totalAmount),
+          remainingBase: toBaseAmount(
+            Number(payment.totalAmount),
+            Number(payment.exchangeRate)
+          )
+        },
+        priorSources: [],
+        requests: [...requests.values()],
+        currencyDecimals,
+        isAR: cashIn
+      });
+      await trx
+        .deleteFrom("invoiceSettlement")
+        .where("paymentId", "=", payment.id)
+        .where("companyId", "=", args.companyId)
+        .execute();
+      if (allocation.applications.length)
+        await trx
+          .insertInto("invoiceSettlement")
+          .values(
+            allocation.applications.map(({ targetId, ...application }) => ({
+              ...application,
+              paymentId: payment.id,
+              targetMemoId: targetId,
+              targetSalesInvoiceId: null,
+              targetPurchaseInvoiceId: null,
+              appliedDate: dates.get(targetId)!,
+              createdBy: args.createdBy,
+              companyId: args.companyId
+            }))
+          )
+          .execute();
+      return;
+    }
+    const ids = [
+      ...new Set(
+        args.applications.map(
+          (a) => (isAR ? a.targetSalesInvoiceId : a.targetPurchaseInvoiceId)!
+        )
+      )
+    ].sort();
+    if (!ids.length) {
+      await trx
+        .deleteFrom("invoiceSettlement")
+        .where("paymentId", "=", args.paymentId)
+        .where("companyId", "=", args.companyId)
+        .execute();
+      return;
+    }
+    const invoices = await loadTransactionInvoices(
+      trx,
+      args.companyId,
+      ids,
+      isAR,
+      payment.currencyCode,
+      partyId,
+      currencyDecimals
+    );
+    // Existing staged memos reserve target capacity while the cash half is edited.
+    const staged = await trx
+      .selectFrom("invoiceSettlement")
+      .selectAll()
+      .where("companyId", "=", args.companyId)
+      .where("appliedViaPaymentId", "=", args.paymentId)
+      .execute();
+    const stagedMemoIds = [
+      ...new Set(
+        staged
+          .map((row) => row.memoId)
+          .filter((id): id is string => Boolean(id))
+      )
+    ].sort();
+    const stagedMemos = stagedMemoIds.length
+      ? await trx
+          .selectFrom("memo")
+          .select([
+            "id",
+            "status",
+            "direction",
+            "customerId",
+            "supplierId",
+            "currencyCode",
+            "exchangeRate"
+          ])
+          .where("companyId", "=", args.companyId)
+          .where("id", "in", stagedMemoIds)
+          .orderBy("id")
+          .forUpdate()
+          .execute()
+      : [];
+    const stagedMemoById = new Map(stagedMemos.map((memo) => [memo.id, memo]));
+    for (const row of staged) {
+      const memo = row.memoId ? stagedMemoById.get(row.memoId) : undefined;
+      if (
+        !memo ||
+        memo.status !== "Posted" ||
+        memo.direction !== (isAR ? "Credit" : "Debit")
+      ) {
+        throw new Error("Staged applications must use a posted credit memo");
+      }
+      if (
+        (isAR ? memo.customerId : memo.supplierId) !== partyId ||
+        memo.currencyCode !== payment.currencyCode
+      ) {
+        throw new Error(
+          "Staged credit and payment currency and party must match"
+        );
+      }
+      const id = isAR ? row.targetSalesInvoiceId : row.targetPurchaseInvoiceId;
+      const invoice = id ? invoices.get(id) : undefined;
+      if (!invoice) continue;
+      if (Number(memo.exchangeRate) !== invoice.exchangeRate)
+        throw new Error("Staged credit and invoice exchange rates must match");
+      const reserved = reduceInvoiceSettlements(
+        [row],
+        invoice.exchangeRate,
+        currencyDecimals
+      );
+      invoice.remainingDocument = toDocumentAmount(
+        invoice.remainingDocument - reserved.document,
+        1,
+        currencyDecimals
+      );
+      invoice.remainingBase = round(invoice.remainingBase - reserved.base);
+    }
+    let priorQuery = trx
+      .selectFrom("payment")
+      .selectAll()
+      .where("companyId", "=", args.companyId)
+      .where("status", "=", "Posted")
+      .where("paymentType", "=", payment.paymentType)
+      .where("currencyCode", "=", payment.currencyCode);
+    priorQuery = isAR
+      ? priorQuery.where("customerId", "=", partyId)
+      : priorQuery.where("supplierId", "=", partyId);
+    const priorPayments = (
+      await priorQuery.orderBy("id").forUpdate().execute()
+    ).map((p) => ({
+      ...p,
+      // A customer deposit funds only invoices of its own document.
+      scope: isAR ? fundingScopeOf(p) : null
+    }));
+    const currentScope: FundingScope | null = isAR
+      ? await loadDepositScope(trx, args.companyId, payment)
+      : null;
+    // Only read the invoices' documents when a deposit is in play.
+    const invoiceDocuments =
+      currentScope || priorPayments.some((p) => p.scope)
+        ? await loadSalesInvoiceDocumentIds(trx, args.companyId, ids)
+        : new Map<string, InvoiceDocumentIds>();
+    const sourceIds = priorPayments.map((p) => p.id);
+    const consumption = sourceIds.length
+      ? await trx
+          .selectFrom("invoiceSettlement")
+          .innerJoin(
+            "payment as applyingPayment",
+            "applyingPayment.id",
+            "invoiceSettlement.paymentId"
+          )
+          .select([
+            "invoiceSettlement.paymentId",
+            "invoiceSettlement.sourcePaymentId",
+            "invoiceSettlement.sourceAmount",
+            "invoiceSettlement.appliedAmount",
+            "invoiceSettlement.fxGainLossAmount"
+          ])
+          .where("invoiceSettlement.companyId", "=", args.companyId)
+          .where("applyingPayment.companyId", "=", args.companyId)
+          .where("applyingPayment.status", "=", "Posted")
+          .where((eb) =>
+            eb.or([
+              eb("invoiceSettlement.sourcePaymentId", "in", sourceIds),
+              eb("invoiceSettlement.paymentId", "in", sourceIds)
+            ])
+          )
+          .execute()
+      : [];
+    const requests = new Map<string, FundingRequest>();
+    const dates = new Map<string, string>();
+    for (const app of args.applications) {
+      const id = (
+        isAR ? app.targetSalesInvoiceId : app.targetPurchaseInvoiceId
+      )!;
+      const invoice = invoices.get(id);
+      if (!invoice) throw new Error(`Invoice ${id} balance not found`);
+      if (app.targetExchangeRate !== invoice.exchangeRate)
+        throw new Error("Target exchange rate does not match the invoice");
+      const sourceAmount =
+        app.sourceAmount ??
+        (round(app.appliedAmount + app.discountAmount + app.writeOffAmount) ===
+        invoice.remainingBase
+          ? toDocumentAmount(
+              invoice.remainingDocument -
+                toDocumentAmount(
+                  app.discountAmount + app.writeOffAmount,
+                  invoice.exchangeRate,
+                  currencyDecimals
+                ),
+              1,
+              currencyDecimals
+            )
+          : toDocumentAmount(
+              app.appliedAmount,
+              invoice.exchangeRate,
+              currencyDecimals
+            ));
+      const request = requests.get(id) ?? {
+        targetId: id,
+        targetExchangeRate: invoice.exchangeRate,
+        remainingDocument: invoice.remainingDocument,
+        remainingBase: invoice.remainingBase,
+        requestedDocumentPrincipal: 0,
+        discountAmount: 0,
+        writeOffAmount: 0,
+        ...invoiceDocuments.get(id)
+      };
+      request.requestedDocumentPrincipal = toDocumentAmount(
+        request.requestedDocumentPrincipal + sourceAmount,
+        1,
+        currencyDecimals
+      );
+      request.discountAmount = round(
+        request.discountAmount + app.discountAmount
+      );
+      request.writeOffAmount = round(
+        request.writeOffAmount + app.writeOffAmount
+      );
+      requests.set(id, request);
+      dates.set(id, app.appliedDate);
+    }
+    const result = allocatePaymentFunding({
+      currentPayment: {
+        paymentId: payment.id,
+        postingDate: payment.paymentDate,
+        exchangeRate: Number(payment.exchangeRate),
+        remainingDocument: Number(payment.totalAmount),
+        remainingBase: toBaseAmount(
+          Number(payment.totalAmount),
+          Number(payment.exchangeRate)
+        ),
+        scope: currentScope
+      },
+      priorSources: remainingFundingSources(
+        priorPayments,
+        consumption,
+        decimals,
+        isAR
+      ),
+      requests: [...requests.values()],
+      currencyDecimals,
+      isAR
+    });
+    await trx
+      .deleteFrom("invoiceSettlement")
+      .where("paymentId", "=", args.paymentId)
+      .where("companyId", "=", args.companyId)
+      .execute();
+    if (result.applications.length)
+      await trx
+        .insertInto("invoiceSettlement")
+        .values(
+          result.applications.map(({ targetId, ...a }) => ({
+            ...a,
+            paymentId: args.paymentId,
+            companyId: args.companyId,
+            createdBy: args.createdBy,
+            targetSalesInvoiceId: isAR ? targetId : null,
+            targetPurchaseInvoiceId: isAR ? null : targetId,
+            appliedDate: dates.get(targetId)!
+          }))
+        )
+        .execute();
+  });
+}
+
+// Memos (credit/debit). A memo is payment-shaped: a party (customer XOR
+// supplier), a signed amount against a reason GL account, and a set of
+// invoiceSettlement applications (memo as SOURCE) to open invoices of the same
+// party. Direction (Credit/Debit) is the discriminator; numbering uses the
+// creditMemo / debitMemo sequences. Posting is handled by the post-memo server
+// function; the apply table is editable only while the memo is Draft.
+
+/** @mcp read */
+export async function getMemo(
+  client: SupabaseClient<Database>,
+  id: string,
+  companyId?: string
+) {
+  let query = client.from("memo").select("*").eq("id", id);
+  if (companyId) query = query.eq("companyId", companyId);
+  return query.single();
+}
+
+/** @mcp read */
+export async function getMemos(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  args: GenericQueryFilters & {
+    search: string | null;
+    direction: "Credit" | "Debit" | null;
+    status: "Draft" | "Posted" | "Voided" | null;
+    counterpartyIds: string[] | null;
+    // Restrict to one party. A memo carries exactly one of customerId /
+    // supplierId, so the two invoicing submodules pass "customer" (Credit Memos,
+    // AR) or "supplier" (Supplier Credits, AP); null returns both parties.
+    party: "customer" | "supplier" | null;
+  }
+) {
+  let query = client
+    .from("memo")
+    .select("*", { count: LIST_COUNT })
+    .eq("companyId", companyId);
+
+  if (args.search) {
+    query = query.ilike("memoId", `%${args.search}%`);
+  }
+  if (args.party === "customer") {
+    query = query.not("customerId", "is", null);
+  } else if (args.party === "supplier") {
+    query = query.not("supplierId", "is", null);
+  }
+  if (args.direction) {
+    query = query.eq("direction", args.direction);
+  }
+  if (args.status) {
+    query = query.eq("status", args.status);
+  }
+  if (args.counterpartyIds && args.counterpartyIds.length > 0) {
+    // A memo carries either customerId or supplierId; match the selected ids
+    // against both columns (customer/supplier id spaces don't overlap).
+    const csv = args.counterpartyIds.join(",");
+    query = query.or(`customerId.in.(${csv}),supplierId.in.(${csv})`);
+  }
+
+  // Newest first by creation date (not the readable memoId — Credit and Debit
+  // share the table but use separate CR-/DR- sequences, so a memoId sort
+  // interleaves them oddly).
+  query = setGenericQueryFilters(query, args, [
+    { column: "createdAt", ascending: false }
+  ]);
+  return query;
+}
+
+/** @mcp upsert */
+export async function upsertMemo(
+  client: SupabaseClient<Database>,
+  memo:
+    | (Omit<z.infer<typeof memoValidator>, "id" | "memoId"> & {
+        memoId: string;
+        companyId: string;
+        createdBy: string;
+        customFields?: Json;
+      })
+    | (Omit<z.infer<typeof memoValidator>, "id"> & {
+        id: string;
+        updatedBy: string;
+        customFields?: Json;
+      })
+) {
+  if ("createdBy" in memo) {
+    return client
+      .from("memo")
+      .insert([sanitize(memo)])
+      .select("id, memoId")
+      .single();
+  }
+  return client
+    .from("memo")
+    .update(sanitize(memo))
+    .eq("id", memo.id)
+    .select("id, memoId")
+    .single();
+}
+
+// RLS DELETE policy on memo restricts to status='Draft'.
+/** @mcp delete */
+export async function deleteMemo(
+  client: SupabaseClient<Database>,
+  id: string,
+  companyId: string
+) {
+  return client.from("memo").delete().eq("id", id).eq("companyId", companyId);
+}
+
+// The party's available credit to draw on when clearing invoices alongside cash:
+// their POSTED, balance-reducing memos with credit remaining. A customer's Credit
+// memos reduce AR (apply to sales invoices); a supplier's Debit memos reduce AP
+// (apply to purchase invoices). `remaining` = amount − Σ already applied (memo as
+// settlement source). Drives the credits section of the invoice "Receive Payment"
+// composer.
+type AvailableMemoCredit = {
+  id: string;
+  memoId: string;
+  direction: string;
+  currencyCode: string;
+  exchangeRate: number;
+  amount: number;
+  remaining: number;
+  remainingDocument: number;
+};
+
+async function loadAvailableMemoCredits(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  side: "sales" | "purchase",
+  partyId?: string,
+  excludePaymentId?: string,
+  currencyCode?: string
+): Promise<AvailableMemoCredit[]> {
+  const [memos, company] = await Promise.all([
+    fetchAllFromTable<
+      Omit<AvailableMemoCredit, "remaining" | "remainingDocument"> & {
+        memoDate: string;
+        postingDate: string | null;
+      }
+    >(
+      client,
+      "memo",
+      "id, memoId, direction, currencyCode, exchangeRate, amount, memoDate, postingDate",
+      (query) => {
+        query = query
+          .eq("companyId", companyId)
+          .eq("status", "Posted")
+          .eq("direction", side === "sales" ? "Credit" : "Debit");
+        if (partyId)
+          query =
+            side === "sales"
+              ? query.eq("customerId", partyId)
+              : query.eq("supplierId", partyId);
+        if (currencyCode) query = query.eq("currencyCode", currencyCode);
+        return query.order("id");
+      }
+    ),
+    client.from("company").select("companyGroupId").eq("id", companyId).single()
+  ]);
+  if (memos.error) throw new Error(memos.error.message);
+  if (company.error || !company.data?.companyGroupId)
+    throw new Error("Company currency configuration is missing");
+  const currencies = await client
+    .from("currency")
+    .select("code, decimalPlaces")
+    .eq("companyGroupId", company.data.companyGroupId);
+  if (currencies.error) throw new Error(currencies.error.message);
+  const decimals = new Map(
+    (currencies.data ?? []).map((c) => [c.code, c.decimalPlaces])
+  );
+  if (currencyCode) requireCurrencyDecimals(decimals, currencyCode);
+  if (!memos.data?.length) return [];
+  const apps = await fetchAllFromTable<{
+    memoId: string | null;
+    sourceAmount: number | null;
+    appliedAmount: number;
+    fxGainLossAmount: number | null;
+    appliedViaPaymentId: string | null;
+    appliedViaPayment: { status: string } | null;
+  }>(
+    client,
+    "invoiceSettlement",
+    "memoId, sourceAmount, appliedAmount, fxGainLossAmount, appliedViaPaymentId, appliedViaPayment:payment!invoiceSettlement_appliedViaPaymentId_fkey(status), memo:memo!invoiceSettlement_memoId_fkey!inner(status)",
+    (query) => {
+      query = query
+        .eq("companyId", companyId)
+        .eq("memo.companyId", companyId)
+        .eq("memo.status", "Posted")
+        .eq("memo.direction", side === "sales" ? "Credit" : "Debit");
+      if (partyId)
+        query =
+          side === "sales"
+            ? query.eq("memo.customerId", partyId)
+            : query.eq("memo.supplierId", partyId);
+      if (currencyCode) query = query.eq("memo.currencyCode", currencyCode);
+      return query.order("id");
+    }
+  );
+  if (apps.error) throw new Error(apps.error.message);
+  const refunds = await fetchAllFromTable<{
+    targetMemoId: string | null;
+    paymentId: string | null;
+    sourceAmount: number | null;
+    appliedAmount: number;
+    payment: { status: string } | null;
+  }>(
+    client,
+    "invoiceSettlement",
+    "targetMemoId, paymentId, sourceAmount, appliedAmount, payment:payment!invoiceSettlement_paymentId_fkey(status), targetMemo:memo!invoiceSettlement_targetMemoId_fkey!inner(status)",
+    (query) => {
+      query = query
+        .eq("companyId", companyId)
+        .eq("targetMemo.companyId", companyId)
+        .eq("targetMemo.status", "Posted")
+        .eq("targetMemo.direction", side === "sales" ? "Credit" : "Debit");
+      if (partyId)
+        query = query.eq(
+          side === "sales" ? "targetMemo.customerId" : "targetMemo.supplierId",
+          partyId
+        );
+      if (currencyCode)
+        query = query.eq("targetMemo.currencyCode", currencyCode);
+      return query.order("id");
+    }
+  );
+  if (refunds.error) throw new Error(refunds.error.message);
+  const reservedRefunds = refunds.data.filter(
+    (row) =>
+      row.targetMemoId &&
+      !(excludePaymentId && row.paymentId === excludePaymentId) &&
+      ["Draft", "Posted"].includes(row.payment?.status ?? "")
+  );
+  // Memo availability reserves competing Draft applications as well as Posted
+  // ones; sharing the arithmetic must not change this eligibility policy.
+  const reserved = apps.data.filter(
+    (row) =>
+      row.memoId &&
+      !(excludePaymentId && row.appliedViaPaymentId === excludePaymentId) &&
+      (!row.appliedViaPaymentId ||
+        ["Draft", "Posted"].includes(row.appliedViaPayment?.status ?? ""))
+  );
+  const sources = remainingFundingSources(
+    memos.data.map((memo) => ({
+      ...memo,
+      totalAmount: memo.amount,
+      paymentDate: memo.memoDate
+    })),
+    [
+      ...reserved.map((row) => ({
+        ...row,
+        paymentId: row.memoId,
+        sourcePaymentId: null
+      })),
+      ...reservedRefunds.map((row) => ({
+        ...row,
+        paymentId: row.targetMemoId,
+        sourcePaymentId: null,
+        fxGainLossAmount: 0
+      }))
+    ],
+    decimals,
+    side === "sales"
+  );
+  const remaining = new Map(
+    sources.map((source) => [source.paymentId, source])
+  );
+  return memos.data.flatMap((memo) => {
+    const source = remaining.get(memo.id);
+    return source
+      ? [
+          {
+            id: memo.id,
+            memoId: memo.memoId,
+            direction: memo.direction,
+            currencyCode: memo.currencyCode,
+            exchangeRate: memo.exchangeRate,
+            amount: toBaseAmount(
+              Number(memo.amount),
+              Number(memo.exchangeRate)
+            ),
+            remaining: source.remainingBase,
+            remainingDocument: source.remainingDocument
+          }
+        ]
+      : [];
+  });
+}
+
+/** @mcp read */
+export async function getAvailableCreditsForParty(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  party:
+    | { side: "sales"; customerId: string }
+    | { side: "purchase"; supplierId: string },
+  excludePaymentId?: string,
+  currencyCode?: string
+): Promise<{ data: AvailableMemoCredit[] | null; error: unknown }> {
+  try {
+    return {
+      data: await loadAvailableMemoCredits(
+        client,
+        companyId,
+        party.side,
+        party.side === "sales" ? party.customerId : party.supplierId,
+        excludePaymentId,
+        currencyCode
+      ),
+      error: null
+    };
+  } catch (error) {
+    return { data: null, error };
+  }
+}
+
+/** @mcp read */
+export async function getCompanyHasOpenCredits(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  side: "sales" | "purchase"
+): Promise<boolean> {
+  try {
+    return (await loadAvailableMemoCredits(client, companyId, side)).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Apply posted credits to invoices — additive insert of memo-sourced
+// invoiceSettlement rows (the credits half of the "Receive Payment" composer).
+// GL-neutral (the memos already posted their own journals), so no journal here;
+// caps are validated under FOR UPDATE locks. Each application matches the memo's
+// exchange rate to the invoice's (v1 requires equal rates — no cross-rate FX on
+// credit application).
+// The credit applications currently staged on a (Draft) payment — drives the
+// composer's pre-fill so a staged credit stays visible and editable instead of
+// silently vanishing from the available list.
+/** @mcp read */
+export async function getStagedCreditsForPayment(
+  client: SupabaseClient<Database>,
+  paymentId: string,
+  side: "sales" | "purchase",
+  companyId?: string
+): Promise<{
+  data:
+    | {
+        memoId: string;
+        invoiceId: string;
+        amount: number;
+        sourceAmount: number | null;
+      }[]
+    | null;
+  error: unknown;
+}> {
+  let query = client
+    .from("invoiceSettlement")
+    .select(
+      "memoId, targetSalesInvoiceId, targetPurchaseInvoiceId, appliedAmount, sourceAmount"
+    )
+    .eq("appliedViaPaymentId", paymentId);
+  if (companyId) query = query.eq("companyId", companyId);
+  const apps = await query;
+  if (apps.error) return { data: null, error: apps.error };
+  const rows = (apps.data ?? []) as Array<{
+    memoId: string | null;
+    targetSalesInvoiceId: string | null;
+    targetPurchaseInvoiceId: string | null;
+    appliedAmount: number;
+    sourceAmount: number | null;
+  }>;
+  const data = rows
+    .map((r) => ({
+      memoId: r.memoId ?? "",
+      invoiceId:
+        side === "sales"
+          ? (r.targetSalesInvoiceId ?? "")
+          : (r.targetPurchaseInvoiceId ?? ""),
+      amount: Number(r.appliedAmount),
+      sourceAmount: r.sourceAmount
+    }))
+    .filter((r) => r.memoId && r.invoiceId);
+  return { data, error: null };
+}
+
+/**
+ * @mcp action destructive
+ * @mcp audit createdBy
+ */
+export async function applyCreditsToInvoices(
+  db: Kysely<KyselyDatabase>,
+  args: {
+    paymentId: string;
+    companyId: string;
+    createdBy: string;
+    appliedDate: string;
+    side: "sales" | "purchase";
+    applications: {
+      memoId: string;
+      invoiceId: string;
+      amount: number;
+      sourceAmount?: number;
+    }[];
+  }
+) {
+  return db.transaction().execute(async (trx) => {
+    const payment = await trx
+      .selectFrom("payment")
+      .selectAll()
+      .where("id", "=", args.paymentId)
+      .where("companyId", "=", args.companyId)
+      .forUpdate()
+      .executeTakeFirst();
+    if (!payment) throw new Error("Payment not found");
+    if (payment.status !== "Draft")
+      throw new Error(
+        "Credit applications can only be edited while the payment is Draft"
+      );
+    const isAR = args.side === "sales";
+    if ((payment.paymentType === "Receipt") !== isAR)
+      throw new Error("Payment and invoice side must match");
+    const partyId = isAR ? payment.customerId : payment.supplierId;
+    if (!partyId) throw new Error("Payment party is required");
+    const { currencyDecimals } = await loadTransactionCurrency(
+      trx,
+      args.companyId,
+      payment.currencyCode
+    );
+    if (!args.applications.length) {
+      await trx
+        .deleteFrom("invoiceSettlement")
+        .where("appliedViaPaymentId", "=", args.paymentId)
+        .where("companyId", "=", args.companyId)
+        .execute();
+      return;
+    }
+    const ids = [...new Set(args.applications.map((a) => a.invoiceId))].sort();
+    const memoIds = [...new Set(args.applications.map((a) => a.memoId))].sort();
+    const invoices = await loadTransactionInvoices(
+      trx,
+      args.companyId,
+      ids,
+      isAR,
+      payment.currencyCode,
+      partyId,
+      currencyDecimals
+    );
+    const memos = await trx
+      .selectFrom("memo")
+      .selectAll()
+      .where("companyId", "=", args.companyId)
+      .where("id", "in", memoIds)
+      .orderBy("id")
+      .forUpdate()
+      .execute();
+    const [prior, cash] = await Promise.all([
+      loadTransactionMemoConsumption(
+        trx,
+        args.companyId,
+        memoIds,
+        args.paymentId
+      ),
+      trx
+        .selectFrom("invoiceSettlement")
+        .selectAll()
+        .where("companyId", "=", args.companyId)
+        .where("paymentId", "=", args.paymentId)
+        .execute()
+    ]);
+    for (const row of cash) {
+      const id = isAR ? row.targetSalesInvoiceId : row.targetPurchaseInvoiceId;
+      const invoice = id ? invoices.get(id) : undefined;
+      if (!invoice) continue;
+      const reserved = reduceInvoiceSettlements(
+        [row],
+        invoice.exchangeRate,
+        currencyDecimals
+      );
+      invoice.remainingDocument = toDocumentAmount(
+        invoice.remainingDocument - reserved.document,
+        1,
+        currencyDecimals
+      );
+      invoice.remainingBase = round(invoice.remainingBase - reserved.base);
+    }
+    for (const id of memoIds) {
+      const memo = memos.find((m) => m.id === id);
+      if (!memo || memo.status !== "Posted")
+        throw new Error("Only posted credits can be applied");
+      if (memo.direction !== (isAR ? "Credit" : "Debit"))
+        throw new Error("Memo direction does not reduce this invoice balance");
+      if ((isAR ? memo.customerId : memo.supplierId) !== partyId)
+        throw new Error("Memo and payment party must match");
+      if (memo.currencyCode !== payment.currencyCode)
+        throw new Error("Memo and payment currency must match");
+    }
+    const sources = new Map(
+      remainingFundingSources(
+        memos.map((memo) => ({
+          ...memo,
+          totalAmount: memo.amount,
+          paymentDate: memo.memoDate
+        })),
+        prior.map((row) => ({
+          ...row,
+          paymentId: row.memoId ?? row.targetMemoId,
+          sourcePaymentId: null,
+          fxGainLossAmount: row.targetMemoId ? 0 : row.fxGainLossAmount
+        })),
+        new Map([[payment.currencyCode, currencyDecimals]]),
+        isAR
+      ).map((source) => [source.paymentId, source])
+    );
+    const values: Database["public"]["Tables"]["invoiceSettlement"]["Insert"][] =
+      [];
+    for (const app of args.applications) {
+      const source = sources.get(app.memoId);
+      if (!source) throw new Error("Credit has no remaining funding balance");
+      const invoice = invoices.get(app.invoiceId);
+      if (!invoice)
+        throw new Error(`Invoice ${app.invoiceId} balance not found`);
+      if (source.exchangeRate !== invoice.exchangeRate)
+        throw new Error("Applying a credit requires matching exchange rates");
+      if (!Number.isFinite(app.amount) || app.amount < 0)
+        throw new Error("Applied amount must be nonnegative and finite");
+      const sourceAmount =
+        app.sourceAmount ??
+        (app.amount === source.remainingBase
+          ? source.remainingDocument
+          : app.amount === invoice.remainingBase
+            ? invoice.remainingDocument
+            : toDocumentAmount(
+                app.amount,
+                invoice.exchangeRate,
+                currencyDecimals
+              ));
+      if (sourceAmount <= 0)
+        throw new Error("Applied document amount must be greater than zero");
+      const result = allocatePaymentFunding({
+        currentPayment: source,
+        priorSources: [],
+        currencyDecimals,
+        isAR,
+        requests: [
+          {
+            targetId: app.invoiceId,
+            targetExchangeRate: invoice.exchangeRate,
+            remainingDocument: invoice.remainingDocument,
+            remainingBase: invoice.remainingBase,
+            requestedDocumentPrincipal: sourceAmount,
+            discountAmount: 0,
+            writeOffAmount: 0
+          }
+        ]
+      });
+      const allocated = result.applications[0];
+      sources.set(app.memoId, { ...source, ...result.sourceRemainders[0] });
+      invoice.remainingDocument = toDocumentAmount(
+        invoice.remainingDocument - sourceAmount,
+        1,
+        currencyDecimals
+      );
+      invoice.remainingBase = round(
+        invoice.remainingBase - allocated.appliedAmount
+      );
+      values.push({
+        memoId: app.memoId,
+        appliedViaPaymentId: args.paymentId,
+        companyId: args.companyId,
+        createdBy: args.createdBy,
+        targetSalesInvoiceId: isAR ? app.invoiceId : null,
+        targetPurchaseInvoiceId: isAR ? null : app.invoiceId,
+        sourceAmount: allocated.sourceAmount,
+        appliedAmount: allocated.appliedAmount,
+        discountAmount: 0,
+        writeOffAmount: 0,
+        sourceExchangeRate: source.exchangeRate,
+        targetExchangeRate: invoice.exchangeRate,
+        // Matching-snapshot memo applications are GL-neutral.
+        fxGainLossAmount: 0,
+        appliedDate: args.appliedDate
+      });
+    }
+    await trx
+      .deleteFrom("invoiceSettlement")
+      .where("appliedViaPaymentId", "=", args.paymentId)
+      .where("companyId", "=", args.companyId)
+      .execute();
+    if (values.length)
+      await trx.insertInto("invoiceSettlement").values(values).execute();
+  });
+}
+
+// Tie-out RPCs (migration 20260519140000_ar-ap-tie-out)
+
+/** @mcp read */
+export async function getArTieOut(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  asOfDate: string
+) {
+  return client
+    .rpc("get_ar_tie_out", {
+      _company_id: companyId,
+      _as_of_date: asOfDate
+    })
+    .single();
+}
+
+/** @mcp read */
+export async function getApTieOut(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  asOfDate: string
+) {
+  return client
+    .rpc("get_ap_tie_out", {
+      _company_id: companyId,
+      _as_of_date: asOfDate
+    })
+    .single();
+}
+
+/** @mcp read */
+export async function getArOpenByCustomer(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  asOfDate: string
+) {
+  return client.rpc("get_ar_open_by_customer", {
+    _company_id: companyId,
+    _as_of_date: asOfDate
+  });
+}
+
+/** @mcp read */
+export async function getApOpenBySupplier(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  asOfDate: string
+) {
+  return client.rpc("get_ap_open_by_supplier", {
+    _company_id: companyId,
+    _as_of_date: asOfDate
+  });
+}
+
+// Aging RPCs (migration 20260519150000_ar-ap-aging)
+
+export type AgingOptions = {
+  agingMethod?: "dueDate" | "documentDate";
+  bucketDays?: [number, number, number];
+};
+
+/** @mcp read */
+export async function getArAging(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  asOfDate: string,
+  options: AgingOptions = {}
+) {
+  const [b1, b2, b3] = options.bucketDays ?? [30, 60, 90];
+  return client.rpc("get_ar_aging", {
+    _company_id: companyId,
+    _as_of_date: asOfDate,
+    _aging_method: options.agingMethod ?? "dueDate",
+    _bucket1: b1,
+    _bucket2: b2,
+    _bucket3: b3
+  });
+}
+
+/** @mcp read */
+export async function getApAging(
+  client: SupabaseClient<Database>,
+  companyId: string,
+  asOfDate: string,
+  options: AgingOptions = {}
+) {
+  const [b1, b2, b3] = options.bucketDays ?? [30, 60, 90];
+  return client.rpc("get_ap_aging", {
+    _company_id: companyId,
+    _as_of_date: asOfDate,
+    _aging_method: options.agingMethod ?? "dueDate",
+    _bucket1: b1,
+    _bucket2: b2,
+    _bucket3: b3
+  });
+}

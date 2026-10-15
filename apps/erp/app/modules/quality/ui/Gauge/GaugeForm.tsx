@@ -1,0 +1,491 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { DatePicker, Select, ValidatedForm } from "@carbon/form";
+import {
+  Button,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  MENU_ITEM_SHORTCUTS,
+  ModalDrawer,
+  ModalDrawerBody,
+  ModalDrawerContent,
+  ModalDrawerDescription,
+  ModalDrawerFooter,
+  ModalDrawerHeader,
+  ModalDrawerProvider,
+  ModalDrawerTitle,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  VStack
+} from "@carbon/react";
+import { parseDate } from "@internationalized/date";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { Suspense, useState } from "react";
+import {
+  LuCalendar,
+  LuCircleGauge,
+  LuCirclePlus,
+  LuEllipsisVertical
+} from "react-icons/lu";
+import { Await, Link, useFetcher, useNavigate } from "react-router";
+import type { z } from "zod";
+import { DateTime, EmployeeAvatar, Empty } from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import {
+  CustomFormFields,
+  Hidden,
+  Input,
+  Location,
+  NumberControlled,
+  SequenceOrCustomId,
+  StorageUnit,
+  Submit,
+  Supplier
+} from "~/components/Form";
+import { usePermissions } from "~/hooks";
+import type { ListItem } from "~/types";
+import { path } from "~/utils/path";
+import { gaugeRole, gaugeValidator } from "../../quality.models";
+import type { GaugeCalibrationRecord } from "../../types";
+import { GaugeRole } from "./GaugeStatus";
+
+type GaugeFormValues = z.infer<typeof gaugeValidator>;
+
+type GaugeFormProps = {
+  initialValues: GaugeFormValues;
+  gaugeTypes: ListItem[];
+  records?: Promise<PostgrestResponse<GaugeCalibrationRecord>>;
+  type?: "modal" | "drawer";
+  open?: boolean;
+  onClose?: () => void;
+};
+
+const GaugeForm = ({
+  initialValues,
+  gaugeTypes,
+  records,
+  open = true,
+  type = "drawer",
+  onClose
+}: GaugeFormProps) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const fetcher = useFetcher<{}>();
+  const navigate = useNavigate();
+  const isEditing = initialValues.id !== undefined;
+
+  const isDisabled = isEditing
+    ? !permissions.can("update", "quality")
+    : !permissions.can("create", "quality");
+
+  const [calibrationInterval, setCalibrationInterval] = useState({
+    lastCalibrationDate: initialValues.lastCalibrationDate,
+    nextCalibrationDate: initialValues.nextCalibrationDate,
+    calibrationIntervalInMonths: initialValues.calibrationIntervalInMonths ?? 6
+  });
+
+  const [activeTab, setActiveTab] = useState<string>("gauge");
+
+  return (
+    <>
+      <ModalDrawerProvider type={type}>
+        <ModalDrawer
+          open={open}
+          onOpenChange={(open) => {
+            if (!open && onClose) onClose();
+          }}
+        >
+          <ModalDrawerContent size="lg">
+            <Tabs
+              value={activeTab}
+              onValueChange={setActiveTab}
+              className="flex flex-col h-full"
+            >
+              <ValidatedForm
+                method="post"
+                validator={gaugeValidator}
+                defaultValues={initialValues}
+                fetcher={fetcher}
+                action={
+                  isEditing
+                    ? path.to.gauge(initialValues.id!)
+                    : path.to.newGauge
+                }
+                className="flex flex-col h-full"
+              >
+                <ModalDrawerHeader className="flex flex-col gap-4">
+                  <HStack className="w-full justify-between pr-8">
+                    <VStack>
+                      <ModalDrawerTitle>
+                        {isEditing ? (
+                          `${initialValues.gaugeId}`
+                        ) : (
+                          <Trans>New Gauge</Trans>
+                        )}
+                      </ModalDrawerTitle>
+                      <ModalDrawerDescription>
+                        {isEditing ? initialValues.description : undefined}
+                      </ModalDrawerDescription>
+                    </VStack>
+
+                    {isEditing && (
+                      <div>
+                        <TabsList>
+                          <TabsTrigger value="gauge">
+                            <Trans>Details</Trans>
+                          </TabsTrigger>
+                          <TabsTrigger value="records">
+                            <Trans>Calibration Records</Trans>
+                          </TabsTrigger>
+                        </TabsList>
+                      </div>
+                    )}
+                  </HStack>
+                </ModalDrawerHeader>
+                <ModalDrawerBody className="w-full">
+                  <Hidden name="id" />
+                  <Hidden name="type" value={type} />
+
+                  {isEditing ? (
+                    <>
+                      <TabsContent value="gauge" className="w-full">
+                        <GaugeFormContent
+                          isEditing={isEditing}
+                          gaugeTypes={gaugeTypes}
+                          initialValues={initialValues}
+                          calibrationInterval={calibrationInterval}
+                          setCalibrationInterval={setCalibrationInterval}
+                        />
+                      </TabsContent>
+                      <TabsContent
+                        value="records"
+                        className="w-full flex flex-col gap-4"
+                      >
+                        <div className="flex justify-end">
+                          <Button
+                            leftIcon={<LuCirclePlus />}
+                            onClick={() =>
+                              navigate(
+                                `${path.to.newGaugeCalibrationRecord}?gaugeId=${initialValues.id}`
+                              )
+                            }
+                          >
+                            <Trans>Add Calibration Record</Trans>
+                          </Button>
+                        </div>
+                        {records && (
+                          <Suspense fallback={null}>
+                            <Await resolve={records}>
+                              {(resolvedRecords) => (
+                                <VStack spacing={4} className="w-full">
+                                  {Array.isArray(resolvedRecords.data) &&
+                                  resolvedRecords.data.length > 0 ? (
+                                    <div className="border rounded-lg w-full">
+                                      {resolvedRecords.data.map(
+                                        (record, index) => {
+                                          const isUpdated =
+                                            record.updatedBy !== null;
+                                          const person = isUpdated
+                                            ? record.updatedBy
+                                            : record.createdBy;
+                                          const date = isUpdated
+                                            ? record.updatedAt
+                                            : record.createdAt;
+                                          return (
+                                            <div
+                                              key={record.id}
+                                              className={cn(
+                                                "border-b p-6",
+                                                index ===
+                                                  (resolvedRecords.data
+                                                    ?.length ?? 0) -
+                                                    1 && "border-none"
+                                              )}
+                                            >
+                                              <div className="flex flex-1 justify-between items-center w-full">
+                                                <HStack
+                                                  spacing={4}
+                                                  className="w-1/2"
+                                                >
+                                                  <HStack
+                                                    spacing={4}
+                                                    className="flex-1"
+                                                  >
+                                                    <div
+                                                      className={cn(
+                                                        "rounded-full flex items-center justify-center p-2",
+                                                        record.inspectionStatus ===
+                                                          "Pass"
+                                                          ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-400"
+                                                          : "bg-red-100 text-red-800 dark:bg-red-900/50 dark:text-red-400"
+                                                      )}
+                                                    >
+                                                      <LuCircleGauge className="size-4" />
+                                                    </div>
+                                                    <VStack spacing={0}>
+                                                      <p className="text-foreground text-sm font-medium">
+                                                        {
+                                                          record.inspectionStatus
+                                                        }
+                                                      </p>
+                                                      <span className="text-xs text-muted-foreground">
+                                                        <Trans>
+                                                          Calibration Record
+                                                        </Trans>
+                                                      </span>
+                                                    </VStack>
+                                                  </HStack>
+                                                </HStack>
+                                                <div className="flex items-center justify-end gap-2">
+                                                  <HStack spacing={2}>
+                                                    <span className="text-xs text-muted-foreground">
+                                                      {date
+                                                        ? isUpdated
+                                                          ? t`Updated`
+                                                          : t`Created`
+                                                        : null}{" "}
+                                                      <DateTime
+                                                        value={date}
+                                                        variant="relative"
+                                                      />
+                                                    </span>
+                                                    <EmployeeAvatar
+                                                      employeeId={person}
+                                                      withName={false}
+                                                    />
+                                                  </HStack>
+                                                  <DropdownMenu>
+                                                    <DropdownMenuTrigger
+                                                      asChild
+                                                    >
+                                                      <IconButton
+                                                        aria-label={t`Open menu`}
+                                                        icon={
+                                                          <LuEllipsisVertical />
+                                                        }
+                                                        variant="ghost"
+                                                      />
+                                                    </DropdownMenuTrigger>
+                                                    <DropdownMenuContent align="end">
+                                                      <DropdownMenuItem
+                                                        shortcut={
+                                                          MENU_ITEM_SHORTCUTS.view
+                                                        }
+                                                        asChild
+                                                      >
+                                                        <Link
+                                                          to={path.to.gaugeCalibrationRecord(
+                                                            record.id!
+                                                          )}
+                                                        >
+                                                          View
+                                                        </Link>
+                                                      </DropdownMenuItem>
+                                                    </DropdownMenuContent>
+                                                  </DropdownMenu>
+                                                </div>
+                                              </div>
+                                            </div>
+                                          );
+                                        }
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <div className="py-16 w-full">
+                                      <Empty
+                                        title={t`No calibration records found`}
+                                      />
+                                    </div>
+                                  )}
+                                </VStack>
+                              )}
+                            </Await>
+                          </Suspense>
+                        )}
+                      </TabsContent>
+                    </>
+                  ) : (
+                    <GaugeFormContent
+                      isEditing={isEditing}
+                      gaugeTypes={gaugeTypes}
+                      initialValues={initialValues}
+                      calibrationInterval={calibrationInterval}
+                      setCalibrationInterval={setCalibrationInterval}
+                    />
+                  )}
+                </ModalDrawerBody>
+                <ModalDrawerFooter>
+                  <HStack>
+                    <Submit isDisabled={isDisabled}>
+                      <Trans>Save</Trans>
+                    </Submit>
+                    {onClose && (
+                      <Button size="md" variant="solid" onClick={onClose}>
+                        <Trans>Cancel</Trans>
+                      </Button>
+                    )}
+                  </HStack>
+                </ModalDrawerFooter>
+              </ValidatedForm>
+            </Tabs>
+          </ModalDrawerContent>
+        </ModalDrawer>
+      </ModalDrawerProvider>
+    </>
+  );
+};
+
+function GaugeFormContent({
+  isEditing,
+  gaugeTypes,
+  initialValues,
+  calibrationInterval,
+  setCalibrationInterval
+}: {
+  isEditing: boolean;
+  gaugeTypes: ListItem[];
+  initialValues: GaugeFormValues;
+  calibrationInterval: {
+    lastCalibrationDate: string | undefined;
+    nextCalibrationDate: string | undefined;
+    calibrationIntervalInMonths: number;
+  };
+  setCalibrationInterval: React.Dispatch<
+    React.SetStateAction<{
+      lastCalibrationDate: string | undefined;
+      nextCalibrationDate: string | undefined;
+      calibrationIntervalInMonths: number;
+    }>
+  >;
+}) {
+  const { t } = useLingui();
+  return (
+    <VStack spacing={4}>
+      <div className="grid w-full gap-4 grid-cols-1 md:grid-cols-2">
+        {isEditing ? (
+          <Input name="gaugeId" label={t`Gauge ID`} isReadOnly />
+        ) : (
+          <SequenceOrCustomId
+            name="gaugeId"
+            label={t`Gauge ID`}
+            table="gauge"
+          />
+        )}
+        <Input
+          name="description"
+          label={t`Description`}
+          autoFocus={!isEditing}
+        />
+        <Select
+          name="gaugeTypeId"
+          label={t`Gauge Type`}
+          options={gaugeTypes.map((type) => ({
+            label: <Enumerable value={type.name} />,
+            value: type.id
+          }))}
+        />
+        <Supplier name="supplierId" label={t`Manufacturer`} />
+        <Input name="modelNumber" label={t`Model Number`} />
+        <Input name="serialNumber" label={t`Serial Number`} />
+        {/* <Select
+          name="gaugeCalibrationStatus"
+          label={t`Calibration Status`}
+          options={gaugeCalibrationStatus.map((status) => ({
+            label: <GaugeCalibrationStatus status={status} />,
+            value: status,
+          }))}
+        /> */}
+        <Select
+          name="gaugeRole"
+          label={t`Role`}
+          termId="gauge-role"
+          options={gaugeRole.map((role) => ({
+            label: <GaugeRole role={role} />,
+            value: role
+          }))}
+        />
+        <DatePicker name="dateAcquired" label={t`Date Acquired`} />
+        {/* <Select
+          name="gaugeStatus"
+          label={t`Status`}
+          options={gaugeStatus.map((status) => ({
+            label: <GaugeStatus status={status} />,
+            value: status,
+          }))}
+        /> */}
+        <DatePicker
+          name="lastCalibrationDate"
+          label={t`Last Calibration Date`}
+          termId="gauge-last-calibration-date"
+          value={calibrationInterval.lastCalibrationDate}
+          onChange={(value) => {
+            setCalibrationInterval({
+              ...calibrationInterval,
+              lastCalibrationDate: value?.toString(),
+              nextCalibrationDate: value
+                ? parseDate(value?.toString())
+                    .add({
+                      months: calibrationInterval.calibrationIntervalInMonths
+                    })
+                    .toString()
+                : undefined
+            });
+          }}
+        />
+        <DatePicker
+          name="nextCalibrationDate"
+          label={t`Next Calibration Date`}
+          termId="gauge-next-calibration-date"
+          value={calibrationInterval.nextCalibrationDate}
+          onChange={(value) => {
+            setCalibrationInterval({
+              ...calibrationInterval,
+              nextCalibrationDate: value?.toString()
+            });
+          }}
+        />
+        <Location name="locationId" label={t`Location`} />
+        <StorageUnit
+          name="storageUnitId"
+          label={t`Storage Unit`}
+          locationId={initialValues.locationId}
+        />
+        <CustomFormFields table="gauge" />
+      </div>
+      <div className="border bg-muted/30 rounded-lg p-4 relative w-full">
+        <LuCalendar className="absolute top-2 right-4 text-muted-foreground" />
+        <NumberControlled
+          name="calibrationIntervalInMonths"
+          label={t`Calibration Interval (Months)`}
+          termId="gauge-calibration-interval-months"
+          value={calibrationInterval.calibrationIntervalInMonths}
+          onChange={(value) => {
+            setCalibrationInterval({
+              ...calibrationInterval,
+              calibrationIntervalInMonths: value,
+              nextCalibrationDate: calibrationInterval.lastCalibrationDate
+                ? parseDate(calibrationInterval.lastCalibrationDate)
+                    .add({
+                      months: value
+                    })
+                    .toString()
+                : undefined
+            });
+          }}
+        />
+      </div>
+    </VStack>
+  );
+}
+
+export default GaugeForm;

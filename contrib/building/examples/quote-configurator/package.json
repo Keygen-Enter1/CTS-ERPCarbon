@@ -1,0 +1,42 @@
+{
+  "name": "quote-configurator",
+  "type": "module",
+  "dependencies": {
+    "@carbon/config": "workspace:*",
+    "@carbon/form": "workspace:*",
+    "@carbon/react": "workspace:*",
+    "@carbon/utils": "workspace:*",
+    "@react-router/dev": "catalog:",
+    "@react-router/fs-routes": "7.14.0",
+    "@supabase/functions-js": "catalog:",
+    "@supabase/supabase-js": "catalog:",
+    "@vercel/react-router": "catalog:",
+    "non.geist": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "react-dropzone": "catalog:",
+    "react-icons": "catalog:",
+    "react-router": "catalog:",
+    "sst": "catalog:",
+    "zod": "catalog:",
+    "zod-form-data": "catalog:"
+  },
+  "devDependencies": {
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@tailwindcss/vite": "catalog:",
+    "cross-env": "catalog:",
+    "nodemon": "catalog:",
+    "tailwindcss": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:"
+  },
+  "private": true,
+  "scripts": {
+    "clean": "rimraf .cache .turbo node_modules dist build",
+    "start": "react-router dev",
+    "lint": "biome lint --write ",
+    "types": "react-router typegen && tsc"
+  },
+  "sideEffects": false
+}

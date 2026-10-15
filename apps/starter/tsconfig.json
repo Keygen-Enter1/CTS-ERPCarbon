@@ -1,0 +1,30 @@
+{
+  "include": [
+    "env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    "app/modules/documents/documents.service.ts",
+    "../carbon/app/components/Breadcrumb.tsx"
+  ],
+  "compilerOptions": {
+    "lib": ["dom", "dom.iterable", "ESNext"],
+    "esModuleInterop": true,
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "target": "ES2019",
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowJs": true,
+    "paths": {
+      "~/*": ["./app/*"]
+    },
+    "rootDirs": [".", ".react-router/types"],
+    "noEmit": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "noErrorTruncation": true
+  }
+}

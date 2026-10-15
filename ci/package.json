@@ -1,0 +1,22 @@
+{
+  "private": true,
+  "name": "ci",
+  "version": "0.0.1",
+  "description": "Deployment scripts for Carbon",
+  "dependencies": {
+    "@supabase/supabase-js": "catalog:",
+    "dotenv": "16.3.1",
+    "execa": "8.0.1",
+    "tsx": "catalog:"
+  },
+  "scripts": {
+    "ci:migrations": "tsx src/migrations.ts",
+    "ci:deploy": "tsx src/deploy.ts",
+    "ci:assembler": "tsx src/assembler.ts",
+    "ci:jobs": "tsx src/jobs.ts",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "devDependencies": {
+    "sst": "catalog:"
+  }
+}

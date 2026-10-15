@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { redirect } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useNavigate, useParams } from "react-router";
+import { ConfirmDelete } from "~/components/Modals";
+import { deleteCustomerType, getCustomerType } from "~/modules/sales";
+import { getParams, path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    view: "sales"
+  });
+  const { customerTypeId } = params;
+  if (!customerTypeId) throw notFound("customerTypeId not found");
+
+  const customerType = await getCustomerType(client, customerTypeId);
+  if (customerType.error) {
+    throw redirect(
+      `${path.to.customerTypes}?${getParams(request)}`,
+      await flash(
+        request,
+        error(customerType.error, "Failed to get customer type")
+      )
+    );
+  }
+
+  return { customerType: customerType.data };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    delete: "sales"
+  });
+
+  const { customerTypeId } = params;
+  if (!customerTypeId) {
+    throw redirect(
+      `${path.to.customerTypes}?${getParams(request)}`,
+      await flash(request, error(params, "Failed to get an customer type id"))
+    );
+  }
+
+  const { error: deleteTypeError } = await deleteCustomerType(
+    client,
+    customerTypeId
+  );
+  if (deleteTypeError) {
+    throw redirect(
+      `${path.to.customerTypes}?${getParams(request)}`,
+      await flash(
+        request,
+        error(deleteTypeError, "Failed to delete customer type")
+      )
+    );
+  }
+
+  throw redirect(
+    `${path.to.customerTypes}?${getParams(request)}`,
+    await flash(request, success("Successfully deleted customer type"))
+  );
+}
+
+export default function DeleteCustomerTypeRoute() {
+  const { t } = useLingui();
+  const { customerTypeId } = useParams();
+  const { customerType } = useLoaderData<typeof loader>();
+  const navigate = useNavigate();
+
+  if (!customerTypeId) throw new Error("customerTypeId not found");
+
+  const onCancel = () => navigate(path.to.customerTypes);
+
+  return (
+    <ConfirmDelete
+      action={path.to.deleteCustomerType(customerTypeId)}
+      name={customerType.name}
+      text={t`Are you sure you want to delete the customer type: ${customerType.name}? This cannot be undone.`}
+      onCancel={onCancel}
+    />
+  );
+}

@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { getLogger } from "@carbon/logger";
+import { RecordOutlet, VStack } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import { useLingui } from "@lingui/react/macro";
+import { Suspense } from "react";
+import type { LoaderFunctionArgs } from "react-router";
+import { Await, useLoaderData, useParams } from "react-router";
+import { PanelProvider, ResizablePanels } from "~/components/Layout/Panels";
+import {
+  getChangeNoticesForNonConformance,
+  getItemFiles
+} from "~/modules/items";
+import {
+  getIssue,
+  getIssueAssociations,
+  getIssueSuppliers,
+  getIssueTypesList,
+  getRequiredActionsList
+} from "~/modules/quality";
+import type { IssueAssociationNode } from "~/modules/quality/types";
+import {
+  IssueAssociationsSkeleton,
+  IssueAssociationsTree
+} from "~/modules/quality/ui/Issue/IssueAssociations";
+import IssueHeader from "~/modules/quality/ui/Issue/IssueHeader";
+import IssueProperties from "~/modules/quality/ui/Issue/IssueProperties";
+import { getTagsList } from "~/modules/shared";
+import { detailBreadcrumb, type Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+const logger = getLogger("erp", "issue-detail");
+
+export const handle: Handle = {
+  appBarSubtitle: msg`Issue`,
+  realtime: [
+    { table: "nonConformance", column: "id", param: "id" },
+    {
+      table: "nonConformanceActionTask",
+      column: "nonConformanceId",
+      param: "id"
+    },
+    { table: "nonConformanceItem", column: "nonConformanceId", param: "id" }
+  ],
+  breadcrumb: detailBreadcrumb(
+    { breadcrumb: msg`Issues`, to: path.to.issues },
+    (data) => data?.nonConformance?.nonConformanceId
+  ),
+  module: "quality"
+};
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "quality",
+    bypassRls: true
+  });
+
+  const { id } = params;
+  if (!id) throw new Error("Could not find id");
+
+  const [
+    nonConformance,
+    nonConformanceTypes,
+    requiredActions,
+    suppliers,
+    tags,
+    changeNotices
+  ] = await Promise.all([
+    getIssue(client, id),
+    getIssueTypesList(client, companyId),
+    getRequiredActionsList(client, companyId),
+    getIssueSuppliers(client, id, companyId),
+    getTagsList(client, companyId, "nonConformance"),
+    // Reverse Linked-NCR cross-link (4a): COs referencing this issue.
+    getChangeNoticesForNonConformance(client, id, companyId)
+  ]);
+
+  if (nonConformance.error) {
+    throw redirect(
+      path.to.issues,
+      await flash(request, error(nonConformance.error, "Failed to load issue"))
+    );
+  }
+
+  // bypassRls makes `client` the service role, so the URL id is only proven to
+  // exist — not to be this company's.
+  if (nonConformance.data.companyId !== companyId) {
+    logger.error("Issue is not in the caller's company", {
+      companyId,
+      issueId: id
+    });
+    throw redirect(path.to.issues);
+  }
+
+  return {
+    associations: getIssueAssociations(client, id, companyId),
+    files: getItemFiles(client, id, companyId),
+    nonConformance: nonConformance.data,
+    nonConformanceTypes: nonConformanceTypes.data ?? [],
+    requiredActions: requiredActions.data ?? [],
+    suppliers: suppliers.data ?? [],
+    tags: tags.data ?? [],
+    changeNotices: changeNotices.data ?? []
+  };
+}
+
+export default function IssueRoute() {
+  const { t } = useLingui();
+  const { associations, changeNotices } = useLoaderData<typeof loader>();
+  const { id } = useParams();
+  if (!id) throw new Error("Could not find id");
+
+  return (
+    <PanelProvider>
+      <div className="flex flex-col h-[calc(100dvh-var(--topbar-height)-var(--content-inset))] overflow-hidden w-full">
+        <IssueHeader />
+        <div className="flex h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] overflow-hidden w-full">
+          <div className="flex flex-grow overflow-hidden">
+            <ResizablePanels
+              explorerLabel={t`Associations`}
+              explorer={
+                <Suspense fallback={<IssueAssociationsSkeleton />}>
+                  <Await resolve={associations}>
+                    {(resolvedAssociations) => {
+                      // Transform the raw associations data into the tree structure expected by IssueAssociationsTree
+                      const tree: IssueAssociationNode[] = [
+                        {
+                          key: "items",
+                          name: t`Item`,
+                          pluralName: t`Items`,
+                          module: "parts",
+                          children: resolvedAssociations.items
+                        },
+                        {
+                          key: "jobOperations",
+                          name: t`Job Operation`,
+                          pluralName: t`Job Operations`,
+                          module: "production",
+                          children: resolvedAssociations.jobOperations
+                        },
+                        {
+                          key: "purchaseOrderLines",
+                          name: t`Purchase Order`,
+                          pluralName: t`Purchase Orders`,
+                          module: "purchasing",
+                          children: resolvedAssociations.purchaseOrderLines
+                        },
+                        {
+                          key: "salesOrderLines",
+                          name: t`Sales Order`,
+                          pluralName: t`Sales Orders`,
+                          module: "sales",
+                          children: resolvedAssociations.salesOrderLines
+                        },
+                        {
+                          key: "shipmentLines",
+                          name: t`Shipment`,
+                          pluralName: t`Shipments`,
+                          module: "shipping",
+                          children: resolvedAssociations.shipmentLines
+                        },
+                        {
+                          key: "receiptLines",
+                          name: t`Receipt`,
+                          pluralName: t`Receipts`,
+                          module: "receiving",
+                          children: resolvedAssociations.receiptLines
+                        },
+                        {
+                          key: "salesReturnOrderLines",
+                          name: t`RMA Line`,
+                          pluralName: t`RMA Lines`,
+                          module: "sales",
+                          children: resolvedAssociations.salesReturnOrderLines
+                        },
+                        {
+                          key: "purchaseReturnOrderLines",
+                          name: t`Supplier Return Line`,
+                          pluralName: t`Supplier Return Lines`,
+                          module: "purchasing",
+                          children:
+                            resolvedAssociations.purchaseReturnOrderLines
+                        },
+                        {
+                          key: "trackedEntities",
+                          name: t`Tracked Entity`,
+                          pluralName: t`Tracked Entities`,
+                          module: "inventory",
+                          children: resolvedAssociations.trackedEntities
+                        },
+                        {
+                          key: "customers",
+                          name: t`Customer`,
+                          pluralName: t`Customers`,
+                          module: "sales",
+                          children: resolvedAssociations.customers
+                        },
+                        {
+                          key: "suppliers",
+                          name: t`Supplier`,
+                          pluralName: t`Suppliers`,
+                          module: "purchasing",
+                          children: resolvedAssociations.suppliers
+                        },
+                        {
+                          key: "inspections",
+                          name: t`Inspection`,
+                          pluralName: t`Inspections`,
+                          module: "quality",
+                          children:
+                            (resolvedAssociations as any).inspections ?? []
+                        },
+                        {
+                          key: "changeNotices",
+                          name: t`Change Notice`,
+                          pluralName: t`Change Notices`,
+                          module: "parts",
+                          readOnly: true,
+                          children: changeNotices.map((cn) => ({
+                            id: cn.id,
+                            documentId: cn.id,
+                            documentReadableId: cn.changeOrderId,
+                            documentLineId: "",
+                            type: "changeNotices",
+                            status: cn.status
+                          }))
+                        }
+                      ];
+                      return (
+                        <IssueAssociationsTree
+                          tree={tree}
+                          nonConformanceId={id}
+                          items={
+                            resolvedAssociations.items?.map(
+                              (i: any) => i.documentId
+                            ) ?? undefined
+                          }
+                        />
+                      );
+                    }}
+                  </Await>
+                </Suspense>
+              }
+              content={
+                <div className="bg-card h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent w-full">
+                  <VStack spacing={4} className="p-4">
+                    <RecordOutlet />
+                  </VStack>
+                </div>
+              }
+              properties={<IssueProperties key={id} />}
+            />
+          </div>
+        </div>
+      </div>
+    </PanelProvider>
+  );
+}

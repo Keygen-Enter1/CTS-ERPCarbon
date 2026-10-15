@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { requirePermissions } from "@carbon/auth/auth.server";
+import {
+  EMPTY_EXCLUSIONS,
+  gatesDone,
+  type HubContacts,
+  type HubExclusions,
+  type ImplementationRowData,
+  SPINE,
+  spineForTier,
+  stateMap
+} from "@carbon/onboarding";
+import {
+  getImplementationCheckStates,
+  getImplementationFieldValues,
+  getImplementationHub,
+  getImplementationRows
+} from "@carbon/onboarding/server";
+import {
+  type HubData,
+  type HubFlags,
+  type HubMutation,
+  HubProvider,
+  toFormFields
+} from "@carbon/onboarding/ui";
+import { RecordOutlet } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import type { LoaderFunctionArgs, MetaFunction } from "react-router";
+import {
+  useFetcher,
+  useLoaderData,
+  useLocation,
+  useNavigate
+} from "react-router";
+import { GroupedContentSidebar } from "~/components/Layout";
+import { useUser } from "~/hooks";
+import {
+  isCustomerPreview,
+  setCustomerPreview,
+  useCustomerPreview
+} from "~/hooks/useCustomerPreview";
+import { useFlags } from "~/hooks/useFlags";
+import { useImplementationRealtime } from "~/hooks/useImplementationRealtime";
+import { useImplementationSubmodules } from "~/hooks/useImplementationSubmodules";
+import { getImplementationSignals } from "~/modules/shared/shared.server";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+import { trainingConfig } from "~/utils/training";
+
+export { RouteErrorBoundary as ErrorBoundary } from "@carbon/react/ErrorBoundary";
+
+export const meta: MetaFunction = () => {
+  return [{ title: "Carbon | Get Started" }];
+};
+
+// Deep links from the Setup Map: each setup row's stable key → the ERP screen
+// where you configure that thing. Keys without a screen are simply omitted (the
+// row renders as plain text). Add an entry here when a new setup row needs a link.
+const SETUP_SCREEN_PATHS: Record<string, string> = {
+  company: path.to.company,
+  "document-templates": path.to.documentTemplates,
+  logos: path.to.logos,
+  printing: path.to.printingSettings,
+  sequences: path.to.sequences,
+  "custom-fields": path.to.customFields,
+  integrations: path.to.integrations,
+  "approval-rules": path.to.approvalRules,
+  locations: path.to.locations,
+  "work-centers": path.to.workCenters,
+  processes: path.to.processes,
+  training: path.to.abilities,
+  "failure-modes": path.to.failureModes,
+  employees: path.to.employeeAccounts,
+  departments: path.to.departments,
+  shifts: path.to.shifts,
+  holidays: path.to.holidays,
+  attributes: path.to.attributes,
+  "employee-types": path.to.employeeTypes,
+  groups: path.to.groups,
+  units: path.to.uoms,
+  parts: path.to.parts,
+  materials: path.to.materials,
+  tools: path.to.tools,
+  consumables: path.to.consumables,
+  "material-dimensions": path.to.materialDimensions,
+  "material-types": path.to.materialTypes,
+  "material-substances": path.to.materialSubstances,
+  "material-shapes": path.to.materialForms,
+  "material-grades": path.to.materialGrades,
+  "material-finishes": path.to.materialFinishes,
+  customers: path.to.customers,
+  "customer-types": path.to.customerTypes,
+  "customer-statuses": path.to.customerStatuses,
+  "price-lists": path.to.salesPriceList,
+  "pricing-rules": path.to.salesPricingRules,
+  "no-quote-reasons": path.to.noQuoteReasons,
+  suppliers: path.to.suppliers,
+  "supplier-types": path.to.supplierTypes,
+  "item-groups": path.to.itemPostingGroups,
+  "accounting-dimensions": path.to.dimensions,
+  "storage-units": path.to.storageUnits,
+  "storage-types": path.to.storageTypes,
+  "storage-rules": path.to.storageRules,
+  "shipping-methods": path.to.shippingMethods,
+  "chart-of-accounts": path.to.chartOfAccountsImport,
+  "default-accounts": path.to.accountingDefaults,
+  "cost-centers": path.to.costCenters,
+  "payment-terms": path.to.paymentTerms,
+  "exchange-rates": path.to.exchangeRates,
+  "fiscal-year": path.to.fiscalYears,
+  "accounting-periods": path.to.accountingPeriods,
+  "asset-classes": path.to.assetClasses,
+  "fixed-assets": path.to.fixedAssets,
+  "scrap-reasons": path.to.scrapReasons,
+  "maintenance-schedules": path.to.maintenanceSchedules
+};
+
+const resolveScreenUrl = (appKey: string): string | undefined =>
+  SETUP_SCREEN_PATHS[appKey];
+
+// Resolve a training video key (on a nested product step) to a watch URL, via
+// the ERP trainingConfig — prefers the Academy course, falls back to the video.
+const resolveVideoUrl = (videoKey: string): string | undefined => {
+  const video = trainingConfig[videoKey];
+  return video?.academyUrl ?? video?.videoUrl;
+};
+
+function GetStartedSidebar() {
+  const { groups } = useImplementationSubmodules();
+  return <GroupedContentSidebar groups={groups} exactMatch />;
+}
+
+export const handle: Handle = {
+  breadcrumb: msg`Get Started`,
+  to: path.to.getStarted,
+  sidebar: GetStartedSidebar
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {});
+
+  const hub = await getImplementationHub(client, companyId);
+  // Only enrolled companies have a hub row — others never reach this surface.
+  // Enrollment is the gate (self-serve from the home page), not staff.
+  if (!hub.data) {
+    throw redirect(path.to.authenticatedRoot);
+  }
+
+  const [checkStates, fieldValues, rows, signals] = await Promise.all([
+    getImplementationCheckStates(client, companyId),
+    getImplementationFieldValues(client, companyId),
+    getImplementationRows(client, companyId),
+    getImplementationSignals(client, companyId)
+  ]);
+
+  return {
+    hub: hub.data,
+    previewAsCustomer: isCustomerPreview(request.headers.get("cookie")),
+    checkStates: checkStates.data ?? [],
+    fieldValues: fieldValues.data ?? [],
+    rows: rows.data ?? [],
+    signals
+  };
+}
+
+export default function GetStartedLayout() {
+  const { company } = useUser();
+  const { isInternal } = useFlags();
+  const previewingAsCustomer = useCustomerPreview();
+  useImplementationRealtime(company.id);
+
+  const loaderData = useLoaderData<typeof loader>();
+  const fetcher = useFetcher();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  // The hub scrolls inside this container (not the window), so client-side
+  // navigations keep the previous page's scroll position. Smooth-scroll back
+  // to the top on each page change — unless the target has a hash, in which
+  // case the destination page owns the scroll (e.g. the Plan's deep links).
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (location.hash) return;
+    scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [location.pathname, location.hash]);
+
+  // When the customer clears the final checkpoint anywhere (typically the Plan),
+  // send them to the command center so they land on the confetti + the exit
+  // dialog. Session-only: the ref seeds from the current value so a reload while
+  // already complete doesn't re-fire, and an exited hub (status "complete") is
+  // skipped entirely.
+  const spine = spineForTier(SPINE, loaderData.hub.tier);
+  const allPhasesDone =
+    spine.length > 0 &&
+    gatesDone(spine, stateMap(loaderData.checkStates), loaderData.signals) ===
+      spine.length;
+  const wasAllDone = useRef(allPhasesDone);
+  useEffect(() => {
+    if (
+      allPhasesDone &&
+      !wasAllDone.current &&
+      loaderData.hub.status !== "complete" &&
+      location.pathname !== path.to.getStarted
+    ) {
+      navigate(path.to.getStarted, { state: { justCompleted: true } });
+    }
+    wasAllDone.current = allPhasesDone;
+  }, [allPhasesDone, loaderData.hub.status, location.pathname, navigate]);
+
+  // The hub's single write path: every mutation submits to the /state action,
+  // which persists + revalidates the loader (server stays the source of truth).
+  const dispatch = useCallback(
+    (m: HubMutation) =>
+      fetcher.submit(toFormFields(m), {
+        method: "post",
+        action: path.to.getStartedState
+      }),
+    [fetcher]
+  );
+
+  const hubData = useMemo<HubData>(
+    () => ({
+      tier: loaderData.hub.tier,
+      status: loaderData.hub.status,
+      exclusions:
+        (loaderData.hub.exclusions as unknown as HubExclusions) ??
+        EMPTY_EXCLUSIONS,
+      contacts: (loaderData.hub.contacts as unknown as HubContacts) ?? {},
+      checkStates: loaderData.checkStates,
+      fieldValues: loaderData.fieldValues,
+      rows: loaderData.rows as unknown as ImplementationRowData[],
+      signals: loaderData.signals
+    }),
+    [loaderData]
+  );
+
+  const flags = useMemo<HubFlags>(
+    () => ({
+      isInternal,
+      previewing: previewingAsCustomer,
+      canEdit: isInternal && !previewingAsCustomer
+    }),
+    [isInternal, previewingAsCustomer]
+  );
+
+  return (
+    <div className="relative min-w-0 h-[calc(100dvh-var(--topbar-height)-var(--content-inset))] overflow-hidden bg-card">
+      <div ref={scrollRef} className="relative z-10 h-full overflow-y-auto">
+        {isInternal ? <PreviewBar previewing={previewingAsCustomer} /> : null}
+        <div className="p-8">
+          <HubProvider
+            data={hubData}
+            flags={flags}
+            dispatch={dispatch}
+            resolveScreenUrl={resolveScreenUrl}
+            resolveVideoUrl={resolveVideoUrl}
+          >
+            <RecordOutlet />
+          </HubProvider>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Internal-only bar: enter or exit the customer preview. State lives in a
+// session cookie (useCustomerPreview), so toggling is a button, not navigation —
+// it persists across pages + reloads without a URL param.
+function PreviewBar({ previewing }: { previewing: boolean }) {
+  if (previewing) {
+    return (
+      <div className="sticky top-0 z-20 flex items-center gap-3 px-8 py-2 bg-amber-500/15 border-b border-amber-500/20 text-sm backdrop-blur-sm">
+        <span className="text-amber-700 dark:text-amber-400 font-medium">
+          Customer preview
+        </span>
+        <span className="text-muted-foreground">
+          Internal pages and locked fields are hidden.
+        </span>
+        <button
+          type="button"
+          onClick={() => setCustomerPreview(false)}
+          className="ml-auto font-medium text-amber-700 dark:text-amber-400 hover:underline"
+        >
+          Exit preview
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="sticky top-0 z-20 flex items-center justify-end px-8 py-2">
+      <button
+        type="button"
+        onClick={() => setCustomerPreview(true)}
+        className="text-xs font-medium text-muted-foreground hover:text-foreground rounded-full border bg-card px-3 py-1 shadow-button-base"
+      >
+        Preview as customer
+      </button>
+    </div>
+  );
+}

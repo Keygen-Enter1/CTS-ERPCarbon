@@ -1,0 +1,96 @@
+---
+title: Inventory & locations
+description: Where stock lives, how on-hand is tracked, and how it moves.
+---
+
+Carbon stores stock at a **location** and, optionally, in a **storage unit**. On-hand quantity is derived from an append-only movement ledger rather than an editable balance.
+
+## Locations and storage units
+
+A **location** is a site or warehouse. **Storage units** are nested bins or shelves within a location, such as aisle › shelf › bin, and can be typed as cold, hazardous, or returns. A storage unit attached to a work center is a **lineside** bin for point-of-use material; other storage units are warehouse bins.
+
+## On hand is a ledger
+
+The **<Term id="item-ledger">item ledger</Term>** is the source of truth. On-hand is the sum of its signed movements: <Term id="receipt">receipts</Term> and outputs add, sales and consumption subtract, transfers move between places. A cached per-location quantity exists for quick reads, but the ledger is what's authoritative.
+
+| Entry type | Effect |
+| --- | --- |
+| `Purchase` · `Output` · `Assembly Output` | Goods received or produced into stock. |
+| `Sale` · `Consumption` · `Assembly Consumption` | Goods shipped or issued to a job. |
+| `Positive Adjmt.` · `Negative Adjmt.` | Manual corrections. |
+| `Transfer` | Movement between locations or storage units. |
+
+<Callout type="note">
+Read on-hand from the **ledger**, not the cached quantity table. The ledger is the truth, and it's status-aware (it can separate what's on hold or rejected from what's truly available).
+</Callout>
+
+<Callout type="warn">
+On hand can go **negative**. Shipping, issuing to a job, and picking all post their movements without first checking availability. Carbon would rather let the work proceed and reconcile later than block the floor. Only manual negative adjustments are guarded against overdraw.
+</Callout>
+
+## Movements
+
+A **warehouse transfer** moves stock between locations by posting a <Term id="shipment">shipment</Term> from one and a receipt into the other. A **stock transfer** moves stock between storage units in one location. A manual **adjustment** posts a positive or negative ledger entry; *Set Quantity* calculates the entry needed to reach a target.
+
+Adjustments also post a <Term id="journal">journal</Term>, Provisional until the company has [set up accounting](/docs/reference/accounting#setting-up-accounting). A loss debits inventory adjustment and credits inventory; a gain posts the reverse, valued at current item cost. Inventory count variances use the same accounts. Storage-unit transfers create no journal because value remains at the location. [Scrap](/docs/reference/scrap) uses a negative adjustment offset to the scrap account.
+
+## Correcting a movement
+
+The ledger is append-only — a posted movement is never edited or deleted. To fix one, use **"Correct Quantity"** on the movement in the Stock Movements screen and enter the quantity it should have been. Carbon books one **opposite movement for the difference**, linked to the original and dated with the original's posting date, so both sit in the right time period. The correction appears as its own row, flagged with a **Correction** badge that links it back to the movement it fixes. The journal for the correction posts into the original's accounting period. A **locked** period refuses the correction until it's unlocked; a **closed** period is permanent — once a movement's period has closed, it can no longer be corrected. Correcting the same movement again measures against what it currently nets to, so repeated corrections converge instead of stacking.
+
+## Value
+
+Inventory value is on-hand quantity multiplied by item unit cost, aggregated by item and location. The Valuation report groups by location or item. Its **Tie-Out** panel compares subledger value with GL inventory balances. If they differ, **Reconcile** creates a draft adjusting journal for review and posting.
+
+### Serial unit cost
+
+On an item's **Inventory** tab, each serialized unit in **Storage Units** shows what it is carried at: the cost a shipment, a scrap or a capitalization would take out of inventory for it. A unit with its own cost layer shows that cost; any other unit shows the next layer in the item's FIFO or LIFO order. A unit carried at nothing reads **No cost**. Only users who can view accounting see these costs.
+
+To give one unit a cost of its own, for example a unit a job completed with no production or material recorded, use the row's **Recost** action. You need permission to update accounting, and the item must use FIFO or LIFO costing, since a Standard or Average item carries every unit at the item's one cost. Enter the **Unit Cost** and the **Offset Account** the cost was spent from (Retained Earnings by default). Carbon takes the unit off the layer it was on and books it on a layer of its own at the new cost; the difference posts between the inventory account and the offset account. Nothing moves, so the unit's quantity and location are unchanged.
+
+## Related
+
+<Cards>
+  <Card title="Items" href="/docs/reference/items">
+    The tracking type that decides how an item's stock is counted.
+  </Card>
+  <Card title="Receipts" href="/docs/reference/receipts">
+    How goods enter inventory in the first place.
+  </Card>
+</Cards>
+
+<AgentContext>
+## Troubleshooting
+
+### "Insufficient quantity for negative adjustment"
+The decrease (or *Set Quantity* reduction) exceeds what's on hand in that storage unit. Manual adjustments are the one movement guarded against overdraw. Check on-hand for the exact item/location/storage unit (and lot, if tracked) and adjust by no more than that.
+
+### "… uses Average costing, so every unit carries the item's cost; one unit cannot have its own"
+Recost works on FIFO and LIFO items only. Change the item's cost on its **Costing** tab instead.
+
+### "… must have exactly one unit on hand to be recosted" / "… is already carried at that cost"
+The unit has left stock, or the entered cost equals what it already carries.
+
+### "Serial number not found"
+The serial or batch number entered for a negative adjustment doesn't exist in the selected storage unit. Verify the number and the storage unit — the stock may sit in a different bin.
+
+### "Multiple tracked entities in this storage unit — select a specific row to adjust"
+A negative adjustment on a tracked item was ambiguous: several lots/serials sit in that storage unit. Select the specific tracked-entity row (or enter its number) so Carbon knows which one to reduce.
+
+### "Cannot edit expiry of a consumed tracked entity"
+Expiration dates can't be changed on stock that's already **Consumed**. Only live entities (Available, On Hold) accept an expiry override.
+
+### "The original movement's accounting period is closed — its movements can no longer be corrected."
+A stock-movement correction posts its journal into the **original movement's** accounting period, and that period is closed. Closing is permanent — there is no reopening — so the movement stays as posted. The **locked** variant of this message is recoverable: unlock the period and correct again.
+
+### "Corrected quantity matches the current effective quantity — nothing to correct"
+The corrected quantity you entered equals what the movement already nets to (original plus any prior corrections). There's no difference to book.
+
+### "Corrections on serial-tracked items must be whole numbers"
+The correction delta on a serial-tracked item wasn't an integer. Serial stock moves in whole units.
+
+### Storage unit hierarchy errors
+- "Parent storage unit … is in location …, but this unit is in location …; they must match" — parent and child bins must share a location; pick a parent in the same location.
+- "Cannot change locationId of storage unit … because it has child units" — move or delete the children first, then move the parent.
+- "Cycle detected in storage unit hierarchy at …" — the chosen parent is a descendant of this unit; pick one that doesn't loop back.
+</AgentContext>

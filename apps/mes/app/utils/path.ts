@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { getAppUrl, getMESUrl, SUPABASE_URL } from "@carbon/auth";
+import { requestReferrer } from "@carbon/utils";
+import { generatePath } from "react-router";
+
+export const ERP_URL = getAppUrl();
+export const MES_URL = getMESUrl();
+
+const x = "/x";
+const api = "/api";
+const file = `/file`;
+// Wall-mounted work center displays live outside `/x` so they don't inherit the
+// operator chrome (sidebar, pin-in overlay, time-card warning).
+const display = "/display";
+
+export const path = {
+  to: {
+    acknowledge: `${x}/acknowledge`,
+    active: `${x}/active`,
+    addAndIssueMaintenanceDispatchItem: (dispatchId: string) =>
+      generatePath(`${x}/dispatch/${dispatchId}/add-and-issue`),
+    api: {
+      batchNumbers: (itemId: string) =>
+        generatePath(`${api}/batch-numbers?itemId=${itemId}`),
+      failureModes: `${api}/failure-modes`,
+      modelArtifacts: (modelUploadId: string) =>
+        generatePath(`${api}/model/artifacts/${modelUploadId}`),
+      modelDownload: (modelUploadId: string) =>
+        generatePath(`${api}/model/download/${modelUploadId}`),
+      modelOptimizeCancel: `${api}/model/optimize-cancel`,
+      modelReoptimize: `${api}/model/reoptimize`,
+      pickedAllocation: (jobMaterialId: string) =>
+        generatePath(`${api}/picked-allocation?jobMaterialId=${jobMaterialId}`),
+      qualityIssueTypes: `${api}/quality-issue-types`,
+      serialNumbers: (itemId: string) =>
+        generatePath(`${api}/serial-numbers?itemId=${itemId}`),
+      ssoCheck: `${api}/sso/check`,
+      suggestedAllocation: (
+        itemId: string,
+        locationId: string,
+        quantity: number
+      ) =>
+        generatePath(
+          `${api}/suggested-allocation?itemId=${itemId}&locationId=${locationId}&quantity=${quantity}`
+        )
+    },
+    assembly: (id: string) => generatePath(`${x}/assembly/${id}`),
+    assigned: `${x}/assigned`,
+    authenticatedRoot: x,
+    batch: (id: string) => generatePath(`${x}/batch/${id}`),
+    batchComplete: (id: string) => generatePath(`${x}/batch/${id}/complete`),
+    // Batch details live in ERP; MES links to it cross-origin.
+    batchDetail: (id: string) => `${getAppUrl()}${x}/production/batches/${id}`,
+    batchRecord: (id: string) => generatePath(`${x}/batch/${id}/record`),
+    callback: "/callback",
+    companySwitch: (companyId: string) =>
+      generatePath(`${x}/company/switch/${companyId}`),
+    complete: `${x}/complete`,
+    completeAllSteps: `${x}/steps/complete-all`,
+    consolePinIn: `${x}/console/pin-in`,
+    consolePinOut: `${x}/console/pin-out`,
+    consoleToggle: `${x}/console/toggle`,
+    convertEntity: (id: string) => generatePath(`${x}/entity/${id}/convert`),
+    displays: display,
+    endOperation: (id: string) => generatePath(`${x}/end/${id}`),
+    endShift: `${x}/end-shift`,
+    erpAccountSecurity: `${ERP_URL}/x/account/security`,
+    // The ERP's API routes, through the proxy (`x+/proxy.$.tsx`).
+    erpApi: `${x}/proxy/api`,
+    file: {
+      // The load-sheet route lives in ERP (like the traveler); MES links to it
+      // cross-origin.
+      batchList: (id: string) => `${getAppUrl()}${file}/batch/${id}.pdf`,
+      jobTraveler: (id: string) => `${getAppUrl()}${file}/traveler/${id}.pdf`,
+      operationLabelsPdf: (
+        id: string,
+        {
+          labelSize,
+          trackedEntityId
+        }: { labelSize?: string; trackedEntityId?: string } = {}
+      ) => {
+        let url = `${file}/operation/${id}/labels.pdf`;
+        const params = new URLSearchParams();
+
+        if (labelSize) params.append("labelSize", labelSize);
+        if (trackedEntityId) params.append("trackedEntityId", trackedEntityId);
+
+        const queryString = params.toString();
+        if (queryString) url += `?${queryString}`;
+
+        return generatePath(url);
+      },
+      operationLabelsZpl: (
+        id: string,
+        {
+          labelSize,
+          trackedEntityId
+        }: { labelSize?: string; trackedEntityId?: string } = {}
+      ) => {
+        let url = `${file}/operation/${id}/labels.zpl`;
+        const params = new URLSearchParams();
+
+        if (labelSize) params.append("labelSize", labelSize);
+        if (trackedEntityId) params.append("trackedEntityId", trackedEntityId);
+
+        const queryString = params.toString();
+        if (queryString) url += `?${queryString}`;
+
+        return generatePath(url);
+      },
+      previewFile: (path: string) => generatePath(`${file}/preview/${path}`),
+      previewImage: (bucket: string, path: string) =>
+        generatePath(`${file}/preview/image?file=${bucket}/${path}`),
+      trackedEntityLabelPdf: (
+        id: string,
+        { labelSize }: { labelSize?: string } = {}
+      ) => {
+        let url = `${file}/entity/${id}/labels.pdf`;
+        const params = new URLSearchParams();
+
+        if (labelSize) params.append("labelSize", labelSize);
+
+        const queryString = params.toString();
+        if (queryString) url += `?${queryString}`;
+
+        return generatePath(url);
+      },
+      trackedEntityLabelZpl: (
+        id: string,
+        { labelSize }: { labelSize?: string } = {}
+      ) => {
+        let url = `${file}/entity/${id}/labels.zpl`;
+        const params = new URLSearchParams();
+
+        if (labelSize) params.append("labelSize", labelSize);
+
+        const queryString = params.toString();
+        if (queryString) url += `?${queryString}`;
+
+        return generatePath(url);
+      }
+    },
+    finish: `${x}/finish`,
+    health: "/health",
+    inspection: (operationId: string) =>
+      generatePath(`${x}/inspection/${operationId}`),
+    inspectionCompletePassed: (id: string) =>
+      generatePath(`${x}/inspection-lot/${id}/complete-passed`),
+    inspectionDisposition: (id: string) =>
+      generatePath(`${x}/inspection-lot/${id}/disposition`),
+    inspectionGauge: (id: string) =>
+      generatePath(`${x}/inspection-lot/${id}/gauge`),
+    inspectionMeasurement: (id: string) =>
+      generatePath(`${x}/inspection-lot/${id}/measurement`),
+    inspectionSample: (id: string) =>
+      generatePath(`${x}/inspection-lot/${id}/sample`),
+    inspectionSteps: `${x}/steps/inspection`,
+    inventoryAdjustment: `${x}/adjustment`,
+    issue: `${x}/issue`,
+    issueTrackedEntity: `${x}/issue-tracked-entity`,
+    itemMaster: (itemId: string, type: string) =>
+      `${getAppUrl()}${x}/${type.toLowerCase()}/${itemId}/details`,
+    jobDag: (id: string) => generatePath(`${x}/job/${id}`),
+    jobDetail: (id: string) => `${getAppUrl()}${x}/job/${id}/details`,
+    jobMakeMethodDetail: (jobId: string, makeMethodId: string) =>
+      `${getAppUrl()}${x}/job/${jobId}/make/${makeMethodId}`,
+    jobs: `${x}/jobs`,
+    kanbanComplete: (id: string) => `${ERP_URL}/api/kanban/complete/${id}`,
+    location: `${x}/location`,
+    login: "/login",
+    logout: "/logout",
+    maintenance: `${x}/maintenance`,
+    maintenanceDetail: (id: string) => generatePath(`${x}/dispatch/${id}`),
+    maintenanceDispatchItem: (id: string) =>
+      generatePath(`${x}/dispatch/${id}/item`),
+    maintenanceDisplay: (workCenterId: string) =>
+      generatePath(`${display}/${workCenterId}/maintenance`),
+    maintenanceEvent: `${x}/maintenance-event`,
+    manualPrint: `${x}/print`,
+    messagingNotify: `${x}/proxy/api/messaging/notify`,
+    mfa: "/mfa",
+    newMaintenanceDispatch: `${x}/dispatch/new`,
+    onboarding: `${ERP_URL}/onboarding`,
+    operation: (id: string) => generatePath(`${x}/operation/${id}`),
+    operations: `${x}/operations?saved=1`,
+    peopleOverride: `${x}/people-override`,
+    picking: `${x}/picking`,
+    pickingDetail: (id: string) => generatePath(`${x}/picking/${id}`),
+    pickingLineQuantity: (id: string) =>
+      generatePath(`${x}/picking/${id}/line/quantity`),
+    pickingStatus: (id: string) => generatePath(`${x}/picking/${id}/status`),
+    pickingTracked: (id: string, lineId: string) =>
+      generatePath(`${x}/picking/${id}/tracked/${lineId}`),
+    printingSettings: `${ERP_URL}/x/settings/printing`,
+    productionEvent: `${x}/event`,
+    qualityIssueNew: `${x}/quality-issue/new`,
+    recent: `${x}/recent`,
+    record: `${x}/record`,
+    recordDelete: (id: string) => generatePath(`${x}/record/${id}/delete`),
+    refreshSession: "/refresh-session",
+    requestAccess: "/request-access",
+    rework: `${x}/rework`,
+    reworkTargets: (operationId: string) =>
+      generatePath(`${x}/rework-targets/${operationId}`),
+    root: "/",
+    scrap: `${x}/scrap`,
+    scrapEntity: (materialId: string, id: string, parentId?: string) => {
+      const basePath = generatePath(`${x}/entity/${materialId}/${id}/scrap`);
+      return parentId ? `${basePath}?parentId=${parentId}` : basePath;
+    },
+    scrapReasons: `${api}/scrap-reasons`,
+    setupRequired: "/setup-required",
+    startOperation: (id: string) => generatePath(`${x}/start/${id}`),
+    suggestion: `${x}/suggestion`,
+    switchCompany: (companyId: string) =>
+      generatePath(`${x}/company/switch/${companyId}`),
+    timeCardPage: `${x}/timecard`,
+    timecard: `${api}/timecard`,
+    triggerRework: `${x}/trigger-rework`,
+    unconsume: `${x}/unconsume`,
+    workCenter: (workCenter: string) =>
+      generatePath(`${x}/operations/${workCenter}`),
+    workDisplay: (workCenterId: string) =>
+      generatePath(`${display}/${workCenterId}/work`)
+  }
+} as const;
+
+export const removeSubdomain = (url?: string): string => {
+  if (!url) return "localhost:3000";
+  const parts = url.split("/")[0].split(".");
+
+  const domain = parts.slice(-2).join(".");
+
+  return domain;
+};
+
+export { getPrivateUrl, getRawModelUrl } from "@carbon/files/media";
+
+export const getStoragePath = (bucket: string, path: string) => {
+  return `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${path}`;
+};
+
+export { requestReferrer };
+
+export const getParams = (request: Request) => {
+  const url = new URL(requestReferrer(request) ?? "/", "http://relative.local");
+  const searchParams = new URLSearchParams(url.search);
+  return searchParams.toString();
+};

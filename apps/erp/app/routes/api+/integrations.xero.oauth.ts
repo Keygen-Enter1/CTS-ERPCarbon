@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { getAppUrl, XERO_CLIENT_ID, XERO_CLIENT_SECRET } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { consumeOAuthState } from "@carbon/auth/oauth-state.server";
+import { Xero } from "@carbon/ee";
+import {
+  DEFAULT_SYNC_CONFIG,
+  getProviderIntegration,
+  ProviderID,
+  syncEnabledOnConnect
+} from "@carbon/ee/accounting";
+import { xeroOnInstall } from "@carbon/ee/xero/hooks.server";
+import { getLogger } from "@carbon/logger";
+import { redirectExternal } from "@carbon/utils";
+import type { LoaderFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { upsertCompanyIntegration } from "~/modules/settings/settings.server";
+import { getIntegration } from "~/modules/settings/settings.service";
+import { oAuthCallbackSchema } from "~/modules/shared";
+import { path } from "~/utils/path";
+
+export const config = {
+  runtime: "nodejs"
+};
+
+const logger = getLogger("erp", "xero", "oauth");
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, userId, companyId } = await requirePermissions(request, {
+    update: "settings"
+  });
+
+  const url = new URL(request.url);
+  const searchParams = Object.fromEntries(url.searchParams.entries());
+
+  const xeroAuthResponse = oAuthCallbackSchema.safeParse(searchParams);
+
+  if (!xeroAuthResponse.success) {
+    return data({ error: "Invalid Xero auth response" }, { status: 400 });
+  }
+
+  const { data: params } = xeroAuthResponse;
+
+  // The state must be the one the integrations page issued to THIS browser
+  // for this user and company (IntegrationCard puts it on the authorize URL).
+  // Without the check anyone could send a victim a callback URL carrying the
+  // attacker's own authorization code, linking the victim's company to the
+  // attacker's Xero account. Single-use: consumed whether it matches or not.
+  const consumedState = await consumeOAuthState(request, params.state, {
+    integrationId: Xero.id,
+    userId,
+    companyId
+  });
+
+  if (!consumedState.valid) {
+    logger.error("Invalid Xero OAuth state", { companyId, userId });
+    return data(
+      { error: "Invalid state parameter" },
+      { status: 400, headers: { "Set-Cookie": consumedState.cookie } }
+    );
+  }
+
+  if (!XERO_CLIENT_ID || !XERO_CLIENT_SECRET) {
+    return data({ error: "Xero OAuth not configured" }, { status: 500 });
+  }
+
+  try {
+    const provider = getProviderIntegration(client, companyId, ProviderID.XERO);
+
+    // Exchange the authorization code for tokens. The redirect_uri must match
+    // the authorize-time one, which the connect route
+    // (`api+/integrations.$id.connect`) also builds from `getAppUrl()` — so the
+    // two match BY CONSTRUCTION now, rather than because the browser's origin
+    // happened to equal the canonical one. `new URL(request.url).origin` is the
+    // internal proxy address behind a TLS-terminating proxy and fails as a
+    // mismatch.
+    const auth = await provider.authenticate(
+      params.code,
+      `${getAppUrl()}/api/integrations/xero/oauth`
+    );
+
+    if (!auth || auth.type !== "oauth2") {
+      return data(
+        { error: "Failed to exchange code for token" },
+        { status: 500 }
+      );
+    }
+
+    // Fetch tenant ID from Xero connections endpoint
+    const connectionsResponse = await fetch(
+      "https://api.xero.com/connections",
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${auth.accessToken}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    if (!connectionsResponse.ok) {
+      return data(
+        { error: "Failed to fetch Xero connections" },
+        { status: 500 }
+      );
+    }
+
+    const connections = await connectionsResponse.json();
+
+    if (!Array.isArray(connections) || connections.length === 0) {
+      return data({ error: "No Xero connections found" }, { status: 500 });
+    }
+
+    // Get the first connection's tenant ID and name
+    const tenantId = connections[0].tenantId;
+    const tenantName = connections[0].tenantName;
+
+    if (!tenantId) {
+      return data(
+        { error: "No tenant ID found in Xero connections" },
+        { status: 500 }
+      );
+    }
+
+    // Fetch Carbon company's base currency
+    const { data: company, error: companyError } = await client
+      .from("company")
+      .select("baseCurrencyCode")
+      .eq("id", companyId)
+      .single();
+
+    if (companyError || !company?.baseCurrencyCode) {
+      return data(
+        { error: "Company base currency not configured" },
+        { status: 400 }
+      );
+    }
+
+    // Fetch Xero organisation to get base currency
+    const xeroOrgResponse = await fetch(
+      "https://api.xero.com/api.xro/2.0/Organisation",
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${auth.accessToken}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "xero-tenant-id": tenantId
+        }
+      }
+    );
+
+    if (!xeroOrgResponse.ok) {
+      logger.error("Xero Organisation API error", {
+        status: xeroOrgResponse.status,
+        body: await xeroOrgResponse.text()
+      });
+      return data(
+        { error: "Failed to fetch Xero organization details" },
+        { status: 500 }
+      );
+    }
+
+    let xeroOrgData;
+    try {
+      xeroOrgData = await xeroOrgResponse.json();
+    } catch (parseError) {
+      logger.error("Failed to parse Xero Organisation response", {
+        error: parseError
+      });
+      return data(
+        { error: "Invalid response from Xero organization API" },
+        { status: 500 }
+      );
+    }
+
+    const xeroBaseCurrency = xeroOrgData?.Organisations?.[0]?.BaseCurrency;
+
+    if (!xeroBaseCurrency) {
+      return data(
+        { error: "Could not determine Xero organization base currency" },
+        { status: 500 }
+      );
+    }
+
+    // Check if Carbon's base currency matches Xero's base currency
+    if (company.baseCurrencyCode !== xeroBaseCurrency) {
+      return data(
+        {
+          error: `Currency mismatch: Your Carbon company uses ${company.baseCurrencyCode}, but your Xero organization uses ${xeroBaseCurrency}. Please ensure both systems use the same base currency before connecting.`
+        },
+        { status: 400 }
+      );
+    }
+
+    // Sync starts off on a new connection so accounts can be mapped first; a
+    // reconnect to the same organization keeps the switch where it was.
+    const existing = await getIntegration(client, Xero.id, companyId);
+    const syncEnabled = syncEnabledOnConnect(existing.data?.metadata, tenantId);
+
+    const createdXeroIntegration = await upsertCompanyIntegration(client, {
+      id: Xero.id,
+      active: true,
+      // @ts-expect-error
+      metadata: {
+        syncConfig: DEFAULT_SYNC_CONFIG,
+        settings: { syncEnabled },
+        // Provider-specific fields live under providerMetadata (new
+        // credential shape) — legacy rows are upgraded on read
+        credentials: {
+          ...auth,
+          providerMetadata: {
+            tenantId,
+            tenantName: tenantName ?? undefined
+          }
+        }
+      },
+      updatedBy: userId,
+      companyId: companyId
+    });
+
+    await xeroOnInstall(companyId);
+
+    if (createdXeroIntegration?.data?.metadata) {
+      // Canonical public origin — `request.url`'s origin is the internal proxy
+      // address in dev, which would drop the session cookies on redirect.
+      return redirectExternal(`${getAppUrl()}${path.to.integrations}`, {
+        headers: { "Set-Cookie": consumedState.cookie }
+      });
+    } else {
+      return data(
+        { error: "Failed to save Xero integration" },
+        { status: 500 }
+      );
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    logger.error("Xero OAuth Error", { error: detail });
+    return data(
+      { error: "Failed to exchange code for token", detail },
+      { status: 500 }
+    );
+  }
+}

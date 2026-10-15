@@ -1,0 +1,680 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { useControlField, useField } from "@carbon/form";
+import { RefreshRate, useLoaderQuery } from "@carbon/query";
+import {
+  Button,
+  CreatableCombobox,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+  FormControl,
+  FormErrorMessage,
+  FormHelperText,
+  FormLabel,
+  IconButton,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  ModalTitle,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  useDisclosure
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { LuFilter, LuTriangleAlert } from "react-icons/lu";
+import ConsumableForm from "~/modules/items/ui/Consumables/ConsumableForm";
+import MaterialForm from "~/modules/items/ui/Materials/MaterialForm";
+import PartForm from "~/modules/items/ui/Parts/PartForm";
+import ServiceForm from "~/modules/items/ui/Services/ServiceForm";
+import ToolForm from "~/modules/items/ui/Tools/ToolForm";
+import type { ItemType, MethodItemType } from "~/modules/shared";
+import { itemType, methodItemType } from "~/modules/shared";
+import { useItems } from "~/stores";
+import { latestRevisionByReadableId } from "~/stores/items";
+import { path } from "~/utils/path";
+import { MethodItemTypeIcon } from "../Icons";
+import { ItemLifecycleBadge } from "../ItemLifecycleBadge";
+import type { EntityKey } from "./emptyStates";
+import { useEmptyState } from "./emptyStates";
+
+type ItemSelectProps = Omit<ComboboxProps, "options" | "type" | "inline"> & {
+  isReadOnly?: boolean;
+  blacklist?: string[];
+  includeInactive?: boolean;
+  // Collapse options to a single row per part (the latest revision), matching the
+  // parts/materials list views. Off by default so pickers that legitimately need a
+  // specific revision (BOM, sales/job lines) keep every revision.
+  latestRevisionOnly?: boolean;
+  inline?: boolean;
+  isConfigured?: boolean;
+  locationId?: string;
+  replenishmentSystem?: "Buy" | "Make";
+  type: ItemType | "Item";
+  typeFieldName?: string;
+  validItemTypes?: ItemType[];
+  whitelist?: string[];
+  onConfigure?: () => void;
+  // Narrower than `type`/`validItemTypes` on purpose: BOM/method callers pass a
+  // MethodItemType handler, and order-line callers pass a wider handler that is
+  // still assignable here (contravariance). The dropdown's emit is cast, so it
+  // can still surface "Service" when validItemTypes includes it.
+  onTypeChange?: (type: MethodItemType | "Item") => void;
+};
+
+const ItemPreview = (
+  value: string,
+  options: { value: string; label: string | JSX.Element }[]
+) => {
+  const item = options.find((o) => o.value === value);
+  if (!item) return null;
+  return <span>{item.label}</span>;
+};
+
+const useTranslatedItemType = () => {
+  const { t } = useLingui();
+  return (type: ItemType | "Item") => {
+    switch (type) {
+      case "Item":
+        return t`Item`;
+      case "Part":
+        return t`Part`;
+      case "Material":
+        return t`Material`;
+      case "Tool":
+        return t`Tool`;
+      case "Consumable":
+        return t`Consumable`;
+      case "Service":
+        return t`Service`;
+      default:
+        return type;
+    }
+  };
+};
+
+// Stable identity, so a picker with no quantities does not re-run its options
+// memo on every render.
+const NO_QUANTITIES: Record<string, number> = {};
+
+/**
+ * On-hand per item for the option badge, keyed by the location in play ("all"
+ * totals every location). This used to ride on the items store, which meant the
+ * whole `itemStockQuantities` table (item x location) was downloaded into the
+ * browser on every page load, re-polled every 10 minutes and re-read in full on
+ * every stock movement — to decorate a dropdown. Fetching it here means pages
+ * with no item picker fetch nothing, and the shared client dedupes across every
+ * picker on the page.
+ *
+ * An OBSERVED query, not the imperative `cachedApiQuery` read-through: a stock
+ * movement invalidates this entry (`RealtimeDataProvider`), and only an observer
+ * re-fetches and re-renders. Copying one result into state left an open picker
+ * showing yesterday's numbers until it remounted.
+ */
+function useItemQuantities(locationId?: string) {
+  const { data } = useLoaderQuery<{ data: Record<string, number> | null }>(
+    path.to.api.itemQuantities(locationId ?? "all"),
+    { staleTime: RefreshRate.High }
+  );
+
+  // A badge is decoration — a failed read leaves it off rather than breaking
+  // the picker.
+  return data?.data ?? NO_QUANTITIES;
+}
+
+const Item = ({
+  name,
+  label,
+  helperText,
+  isConfigured = false,
+  isOptional,
+  type = "Part",
+  typeFieldName = "itemType",
+  validItemTypes,
+  onConfigure,
+  onTypeChange,
+  isReadOnly = false,
+  ...props
+}: ItemSelectProps) => {
+  const { t } = useLingui();
+  const translateItemType = useTranslatedItemType();
+  const [items] = useItems();
+  const quantities = useItemQuantities(props.locationId);
+
+  const options = useMemo(() => {
+    let filtered = items.filter((item) => {
+      // Filter by type
+      // @ts-expect-error
+      if (validItemTypes && !validItemTypes.includes(item.type)) return false;
+
+      if (type !== "Item" && type !== item.type) return false;
+
+      // Filter by active status
+      if (!props.includeInactive && !item.active) return false;
+
+      // Filter by replenishment system
+      if (props.replenishmentSystem) {
+        const systemMatches =
+          item.replenishmentSystem === props.replenishmentSystem ||
+          item.replenishmentSystem === "Buy and Make" ||
+          props.replenishmentSystem === item.replenishmentSystem;
+
+        if (!systemMatches) return false;
+      }
+
+      return true;
+    });
+
+    // Collapse to a single current revision per part.
+    if (props.latestRevisionOnly) {
+      filtered = latestRevisionByReadableId(filtered);
+    }
+
+    let results = filtered.map((item) => {
+      const scopedQuantity = quantities[item.id];
+      return {
+        value: item.id,
+        label: item.supersessionMode ? (
+          <span className="flex items-center gap-1.5">
+            {item.readableIdWithRevision}
+            <ItemLifecycleBadge mode={item.supersessionMode} />
+          </span>
+        ) : (
+          item.readableIdWithRevision
+        ),
+        helper: item.name,
+        helperRight:
+          scopedQuantity !== undefined
+            ? `${scopedQuantity} ${item.unitOfMeasureCode}`
+            : undefined
+      };
+    });
+
+    if (props.whitelist) {
+      results = results.filter((item) => props.whitelist?.includes(item.value));
+    }
+
+    if (props.blacklist) {
+      return results.filter((item) => !props.blacklist?.includes(item.value));
+    }
+
+    return results;
+  }, [
+    items,
+    quantities,
+    props?.includeInactive,
+    props.blacklist,
+    props.latestRevisionOnly,
+    props.replenishmentSystem,
+    props.whitelist,
+    type,
+    validItemTypes
+  ]);
+
+  const selectTypeModal = useDisclosure();
+  const newItemsModal = useDisclosure();
+  const [created, setCreated] = useState<string>("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const { getInputProps, error, isOptional: fieldIsOptional } = useField(name);
+  const [value, setValue] = useControlField<string | undefined>(name);
+  const resolvedIsOptional = isOptional ?? fieldIsOptional ?? false;
+
+  useEffect(() => {
+    if (props.value !== null && props.value !== undefined)
+      setValue(props.value);
+  }, [props.value, setValue]);
+
+  const onChange = (value: string) => {
+    if (value) {
+      props?.onChange?.(options.find((o) => o.value === value) ?? null);
+    } else {
+      props?.onChange?.(null);
+    }
+  };
+
+  const canSwitchItemType = typeof onTypeChange === "function";
+  const submitRef = useRef<HTMLButtonElement>(null);
+
+  // Surface a soft, non-blocking notice when the selected part is superseded.
+  const selectedItem = items.find((i) => i.id === value);
+  const successorItem = selectedItem?.successorItemId
+    ? items.find((i) => i.id === selectedItem.successorItemId)
+    : null;
+
+  // Prefer an explicit label (e.g. "Successor Part") for the field label; fall
+  // back to the item-type name. Standard type-name labels are translated so the
+  // wording matches the type.
+  const fieldLabel =
+    label === "Item"
+      ? t`Item`
+      : label === "Part"
+        ? t`Part`
+        : label === "Material"
+          ? t`Material`
+          : label === "Tool"
+            ? t`Tool`
+            : label === "Consumable"
+              ? t`Consumable`
+              : (label ?? translateItemType(type));
+
+  const entityKey: EntityKey =
+    type === "Part"
+      ? "part"
+      : type === "Material"
+        ? "material"
+        : type === "Tool"
+          ? "tool"
+          : type === "Consumable"
+            ? "consumable"
+            : "item";
+
+  const storeEmptyMessage = useEmptyState(entityKey, {
+    onCreate: () => {
+      if (type === "Item") {
+        selectTypeModal.onOpen();
+      } else {
+        newItemsModal.onOpen();
+      }
+    }
+  });
+  // Only surface the empty state when the underlying store has no items at all
+  // — when filters (validItemTypes, replenishmentSystem, whitelist, …) narrow
+  // to zero, fall back to the bare empty list so the CTA doesn't mislead.
+  const emptyMessage = items.length === 0 ? storeEmptyMessage : undefined;
+
+  return (
+    <>
+      <FormControl isInvalid={!!error} className="w-full">
+        {type && (
+          <FormLabel
+            htmlFor={name}
+            isConfigured={isConfigured}
+            isOptional={resolvedIsOptional}
+            onConfigure={onConfigure}
+          >
+            {fieldLabel}
+          </FormLabel>
+        )}
+        <input
+          {...getInputProps({
+            id: name
+          })}
+          type="hidden"
+          name={name}
+          id={name}
+          value={value}
+        />
+        <input
+          type="hidden"
+          name={typeFieldName}
+          id={typeFieldName}
+          value={type}
+        />
+        <div className="flex flex-grow items-start min-w-0 relative">
+          <CreatableCombobox
+            className={cn("flex-grow min-w-0")}
+            ref={triggerRef}
+            options={options}
+            {...props}
+            isReadOnly={isReadOnly}
+            inline={props.inline ? ItemPreview : undefined}
+            value={value?.replace(/"/g, '\\"')}
+            onChange={(newValue) => {
+              setValue(newValue?.replace(/"/g, '\\"') ?? "");
+              onChange(newValue?.replace(/"/g, '\\"') ?? "");
+            }}
+            label={
+              label === "Item"
+                ? t`Item`
+                : label === "Part"
+                  ? t`Part`
+                  : label === "Material"
+                    ? t`Material`
+                    : label === "Tool"
+                      ? t`Tool`
+                      : label === "Consumable"
+                        ? t`Consumable`
+                        : undefined
+            }
+            itemHeight={44}
+            emptyMessage={emptyMessage}
+            onCreateOption={(option) => {
+              if (type === "Item") {
+                selectTypeModal.onOpen();
+                setCreated(option);
+              } else {
+                newItemsModal.onOpen();
+                setCreated(option);
+              }
+            }}
+          />
+          {canSwitchItemType && !props.inline && (
+            <DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger>
+                  <DropdownMenuTrigger asChild>
+                    <IconButton
+                      type="button"
+                      aria-label={t`Change Type`}
+                      className={cn(
+                        "absolute right-0 top-0 bg-card dark:bg-card flex-shrink-0 h-10 w-10 px-3 rounded-l-none before:rounded-l-none border -ml-px shadow-none hover:shadow-button-base"
+                      )}
+                      variant="secondary"
+                      size={props.inline ? "sm" : "md"}
+                      icon={
+                        type === "Item" ? (
+                          <LuFilter className="size-3" />
+                        ) : (
+                          <MethodItemTypeIcon type={type} />
+                        )
+                      }
+                    />
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <Trans>
+                    Change the item type (e.g. Part, Material, Tool, etc.)
+                  </Trans>
+                </TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent>
+                <DropdownMenuRadioGroup
+                  value={type}
+                  // @ts-expect-error
+                  onValueChange={onTypeChange}
+                >
+                  <DropdownMenuRadioItem
+                    value="Item"
+                    className="flex items-center gap-2"
+                  >
+                    <LuFilter className="h-4 w-4" />
+                    <span>
+                      <Trans>All Items</Trans>
+                    </span>
+                  </DropdownMenuRadioItem>
+                  {itemType
+                    .filter((option) =>
+                      // Default to methodItemType so BOM/method pickers never
+                      // surface Service; order-line forms opt in by passing
+                      // validItemTypes that include it.
+                      (validItemTypes ?? methodItemType).some(
+                        (t) => t === option
+                      )
+                    )
+                    .map((option) => (
+                      <DropdownMenuRadioItem
+                        key={option}
+                        value={option}
+                        className="flex items-center gap-2"
+                      >
+                        <MethodItemTypeIcon type={option} />
+                        <span>{translateItemType(option)}</span>
+                      </DropdownMenuRadioItem>
+                    ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+        {selectedItem?.supersessionMode && (
+          <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <LuTriangleAlert className="size-3 shrink-0" />
+            {selectedItem.supersessionMode === "No Stock" ? (
+              <span>
+                <Trans>This part is obsolete (No Stock).</Trans>
+              </span>
+            ) : selectedItem.supersessionMode === "Stock Only" ? (
+              <span>
+                {successorItem ? (
+                  <Trans>
+                    Stocked for spares only — successor:{" "}
+                    <span className="font-medium">
+                      {successorItem.readableIdWithRevision}
+                    </span>
+                  </Trans>
+                ) : (
+                  <Trans>Stocked for spares only.</Trans>
+                )}
+              </span>
+            ) : successorItem ? (
+              <span>
+                <Trans>
+                  Being phased out — successor:{" "}
+                  <span className="font-medium">
+                    {successorItem.readableIdWithRevision}
+                  </span>
+                </Trans>
+              </span>
+            ) : (
+              <span>
+                <Trans>This part is being phased out.</Trans>
+              </span>
+            )}
+          </div>
+        )}
+        {error ? (
+          <FormErrorMessage>{error}</FormErrorMessage>
+        ) : (
+          helperText && <FormHelperText>{helperText}</FormHelperText>
+        )}
+      </FormControl>
+      {selectTypeModal.isOpen && (
+        <Modal
+          open
+          onOpenChange={(open) => {
+            if (!open) {
+              selectTypeModal.onClose();
+            }
+          }}
+        >
+          <ModalContent>
+            <ModalHeader>
+              <ModalTitle>
+                <Trans>Select Item Type</Trans>
+              </ModalTitle>
+            </ModalHeader>
+            <ModalBody>
+              <div className="grid grid-cols-1 gap-4">
+                {itemType
+                  .filter((option) =>
+                    // Same narrowing as the dropdown above: BOM/method pickers
+                    // never surface Tool or Service; order-line forms opt in
+                    // via validItemTypes.
+                    (validItemTypes ?? methodItemType).some((t) => t === option)
+                  )
+                  .map((option) => (
+                    <Button
+                      key={option}
+                      leftIcon={<MethodItemTypeIcon type={option} />}
+                      className="flex w-full"
+                      variant={type === option ? "primary" : "secondary"}
+                      size="lg"
+                      onClick={() => {
+                        // Same contravariance cast as the dropdown emit above.
+                        onTypeChange?.(option as MethodItemType);
+                        setTimeout(() => {
+                          submitRef.current?.focus();
+                        }, 0);
+                      }}
+                    >
+                      {translateItemType(option)}
+                    </Button>
+                  ))}
+              </div>
+            </ModalBody>
+            <ModalFooter>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  selectTypeModal.onClose();
+                }}
+              >
+                <Trans>Cancel</Trans>
+              </Button>
+              <Button
+                ref={submitRef}
+                isDisabled={type === "Item"}
+                onClick={() => {
+                  selectTypeModal.onClose();
+                  newItemsModal.onOpen();
+                }}
+              >
+                <Trans>Create</Trans>
+              </Button>
+            </ModalFooter>
+          </ModalContent>
+        </Modal>
+      )}
+      {type === "Part" && newItemsModal.isOpen && (
+        <PartForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newItemsModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            id: "",
+            revision: "0",
+            name: created,
+            description: "",
+            itemTrackingType: "Inventory",
+            replenishmentSystem: props?.replenishmentSystem ?? "Make",
+            unitOfMeasureCode: "EA",
+            defaultMethodType:
+              props?.replenishmentSystem === "Buy"
+                ? "Pull from Inventory"
+                : "Make to Order",
+            unitCost: 0,
+            lotSize: 0,
+            shelfLifeCalculateFromBom: false,
+            tags: []
+          }}
+        />
+      )}
+      {type === "Consumable" && newItemsModal.isOpen && (
+        <ConsumableForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newItemsModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            id: "",
+            name: created,
+            description: "",
+            itemTrackingType: "Non-Inventory",
+            unitOfMeasureCode: "EA",
+            replenishmentSystem: "Buy",
+            defaultMethodType: "Pull from Inventory",
+            unitCost: 0,
+            shelfLifeCalculateFromBom: false,
+            tags: []
+          }}
+        />
+      )}
+      {type === "Material" && newItemsModal.isOpen && (
+        <MaterialForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newItemsModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            id: "",
+            name: created,
+            description: "",
+            materialFormId: "",
+            materialSubstanceId: "",
+            itemTrackingType: "Inventory",
+            unitOfMeasureCode: "EA",
+            replenishmentSystem: "Buy",
+            defaultMethodType: "Pull from Inventory",
+            unitCost: 0,
+            shelfLifeCalculateFromBom: false,
+            tags: []
+          }}
+        />
+      )}
+      {type === "Service" && newItemsModal.isOpen && (
+        <ServiceForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newItemsModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            name: created,
+            description: "",
+            itemTrackingType: "Non-Inventory",
+            unitOfMeasureCode: "EA",
+            replenishmentSystem: props?.replenishmentSystem ?? "Buy",
+            defaultMethodType:
+              props?.replenishmentSystem === "Make"
+                ? "Make to Order"
+                : "Purchase to Order",
+            unitCost: 0,
+            shelfLifeCalculateFromBom: false,
+            tags: []
+          }}
+        />
+      )}
+      {type === "Tool" && newItemsModal.isOpen && (
+        <ToolForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newItemsModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            id: "",
+            revision: "0",
+            name: created,
+            description: "",
+            itemTrackingType: "Inventory",
+            unitOfMeasureCode: "EA",
+            replenishmentSystem: props?.replenishmentSystem ?? "Buy",
+            defaultMethodType:
+              props?.replenishmentSystem === "Buy"
+                ? "Pull from Inventory"
+                : "Make to Order",
+            unitCost: 0,
+            shelfLifeCalculateFromBom: false,
+            tags: []
+          }}
+        />
+      )}
+    </>
+  );
+};
+
+Item.displayName = "Item";
+
+export default Item;
+
+export const useConfigurableItems = () => {
+  const configurableItemsLoader = useLoaderQuery<{
+    data: { itemId: string }[] | null;
+  }>(path.to.api.itemConfigurable);
+
+  const configurableItemIds = useMemo(() => {
+    return (configurableItemsLoader.data?.data ?? []).map((c) => c.itemId);
+  }, [configurableItemsLoader.data?.data]);
+
+  return configurableItemIds;
+};

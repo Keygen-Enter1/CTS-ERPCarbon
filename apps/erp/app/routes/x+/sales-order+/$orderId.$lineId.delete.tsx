@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { useCloseRoute } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useParams } from "react-router";
+import { ConfirmDelete } from "~/components/Modals";
+import {
+  deleteSalesOrderLine,
+  getSalesOrder,
+  getSalesOrderLine,
+  isSalesOrderLocked
+} from "~/modules/sales";
+import { requireUnlocked } from "~/utils/lockedGuard.server";
+import { path, requestReferrer } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    delete: "sales"
+  });
+  const { lineId, orderId } = params;
+  if (!lineId) throw notFound("lineId not found");
+  if (!orderId) throw notFound("orderId not found");
+
+  const salesOrderLine = await getSalesOrderLine(client, lineId);
+  if (salesOrderLine.error) {
+    throw redirect(
+      path.to.salesOrder(orderId),
+      await flash(
+        request,
+        error(salesOrderLine.error, "Failed to get sales order line")
+      )
+    );
+  }
+
+  return { salesOrderLine: salesOrderLine.data };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  const { lineId, orderId } = params;
+  if (!lineId) throw notFound("Could not find lineId");
+  if (!orderId) throw notFound("Could not find orderId");
+
+  const { client: viewClient } = await requirePermissions(request, {
+    view: "sales"
+  });
+
+  const salesOrder = await getSalesOrder(viewClient, orderId);
+  await requireUnlocked({
+    request,
+    isLocked: isSalesOrderLocked(salesOrder.data?.status),
+    redirectTo: path.to.salesOrder(orderId),
+    message: "Cannot delete lines on a locked sales order. Reopen it first."
+  });
+
+  const { client } = await requirePermissions(request, {
+    delete: "sales"
+  });
+
+  const { error: deleteTypeError } = await deleteSalesOrderLine(client, lineId);
+  if (deleteTypeError) {
+    throw redirect(
+      requestReferrer(request) ?? path.to.salesOrder(orderId),
+      await flash(
+        request,
+        error(deleteTypeError, "Failed to delete sales order line")
+      )
+    );
+  }
+
+  throw redirect(
+    requestReferrer(request) ?? path.to.salesOrder(orderId),
+    await flash(request, success("Successfully deleted sales order line"))
+  );
+}
+
+export default function DeleteSalesOrderLineRoute() {
+  const { t } = useLingui();
+  const { lineId, orderId } = useParams();
+  const { salesOrderLine } = useLoaderData<typeof loader>();
+  const closeRoute = useCloseRoute();
+
+  if (!salesOrderLine) return null;
+  if (!lineId) throw notFound("Could not find lineId");
+  if (!orderId) throw notFound("Could not find orderId");
+
+  const onCancel = () => closeRoute();
+
+  return (
+    <ConfirmDelete
+      action={path.to.deleteSalesOrderLine(orderId, lineId)}
+      name={t`Sales Order Line`}
+      text={t`Are you sure you want to delete the sales order line for ${
+        salesOrderLine.saleQuantity ?? 0
+      } ${salesOrderLine.description ?? ""}? This cannot be undone.`}
+      onCancel={onCancel}
+    />
+  );
+}

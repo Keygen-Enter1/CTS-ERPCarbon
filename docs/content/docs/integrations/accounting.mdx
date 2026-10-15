@@ -1,0 +1,111 @@
+---
+title: Accounting
+description: Mirror invoices, bills, and GL journals to Xero, QuickBooks, or Rillet, and keep exchange rates current.
+---
+
+Carbon synchronizes accounting data with **Xero**, **QuickBooks Online**, or **Rillet**. Ledger synchronization requires Enterprise Edition or the Carbon Cloud Business plan. The **Exchange Rates** service is available on every plan.
+
+## How the sync works
+
+<PlanBadge plan="Business" className="my-[8px]" />
+
+Once **Sync** is on, Carbon sends **customers**, **vendors**, **items**, **sales invoices**, **bills**, and automated **GL journals** to the provider. **Carbon is the source of truth**: Carbon changes take precedence, and stable record mappings prevent duplicates. Provider payments synchronize back to Carbon and settle the matching invoice or bill.
+
+<Callout type="note" title="Journal mirroring is automatic while sync is on">
+While **Sync** is on, Carbon mirrors every automated GL posting to the connected provider. Journals with a `Manual` source do not synchronize.
+</Callout>
+
+A provider payment creates a Carbon payment and <Term id="invoice-settlement">invoice settlement</Term>, then posts to Carbon's <Term id="general-ledger">general ledger</Term>. Rillet also accepts outbound Carbon payments. Xero and QuickBooks support inbound payment synchronization only.
+
+## Connect a ledger
+
+Xero and QuickBooks Online use **OAuth**. Rillet uses a per-company **API key**.
+
+<Steps>
+  <Step>
+  ### Authorize the connection
+
+  Authorize Xero or QuickBooks through OAuth, or enter the Rillet connection fields below.
+  </Step>
+  <Step>
+  ### Configure the sync
+
+  A new connection starts with **Sync** off, so nothing reaches the ledger while you set it up. Set the
+  account mapping, dimensions, and posting-sync options (below). If the ledger already has customers and
+  vendors, run **Import customers & vendors** now — it works while sync is off, and links them so the first
+  sync updates them instead of creating duplicates.
+  </Step>
+  <Step>
+  ### Turn on sync
+
+  Turn on the **Sync** switch at the top of the integration. It stays locked until every account marked
+  **Required** on the Account Mapping tab is mapped. Turning it off later pauses the sync again; a reconnect
+  to the same organization keeps it where it was.
+  </Step>
+  <Step>
+  ### Run the initial sync
+
+  For Xero, select **Run Initial Sync** to seed the ledger. Subsequent changes synchronize continuously.
+  </Step>
+</Steps>
+
+Rillet's connection fields:
+
+<FieldTable>
+  <Field name="API key" required>The Rillet API key that authenticates the connection. Stored as a secret.</Field>
+  <Field name="Environment">**Production** (`api.rillet.com`) or **Sandbox** (`sandbox.api.rillet.com`).</Field>
+  <Field name="Subsidiary ID">Optional. The Rillet subsidiary (entity) that Carbon posts into, for multi-entity ledgers.</Field>
+  <Field name="Webhook token">Optional secret. Inbound payment write-back stays off until this is set.</Field>
+</FieldTable>
+
+<Callout type="warn" title="Xero and QuickBooks are hidden without a server-side client">
+Xero appears only when `XERO_CLIENT_ID` is set. QuickBooks Online appears only when `QUICKBOOKS_CLIENT_ID` is set. See [Environment variables](/docs/platform/self-hosting/environment-variables). Rillet is always available because it authenticates with a per-company API key.
+</Callout>
+
+## Configure the sync
+
+An accounting integration has four tabs beyond the basic connection settings.
+
+<FieldTable>
+  <Field name="Account Mapping">Map each Carbon posting account to a code in the provider's chart of accounts. Posted journals push using the mapped provider account. Use **Suggest with AI** or **Match by code** to fill the map, then resolve anything left unmapped.</Field>
+  <Field name="Dimensions">Map Carbon dimensions to the provider's tracking slots. Xero and QuickBooks expose two slots. Rillet sends every dimension on each line and provisions the matching fields automatically, so the slot editor does not apply to it.</Field>
+  <Field name="Posting Sync">Choose how posted journals reach the ledger (see below).</Field>
+  <Field name="Sync Activity">Watch every sync operation and retry the ones that failed (see below).</Field>
+</FieldTable>
+
+The **Posting Sync** tab controls three things:
+
+<FieldTable>
+  <Field name="Source types">Posted journals with these source types always sync. A per-type **Daily summary** toggle groups a day's journals of that type into one provider entry instead of sending each individually.</Field>
+  <Field name="AR / AP representation">How receivables and payables reach the ledger. Each is either **Documents** (push the invoice or bill itself) or **Off — handled outside the sync**.</Field>
+  <Field name="Books lock date">A manual date before which Carbon will not push new entries, so a closed period stays closed.</Field>
+</FieldTable>
+
+## Watch it run
+
+The **Sync Activity** tab lists each operation's **Status**, **Entity**, **Direction**, **Trigger**, **Attempts**, **Last Attempt**, and **Error**. Filter by status, **Retry** or **Skip** a failed operation, **Re-send** a completed operation, or **Retry all**. **Export CSV** downloads every operation under the current status filter, with the document number, provider ID, and full error. Carbon creates an in-app notification when failures remain after an outbound run.
+
+Weekly reconciliation writes the **Sync Tie-Out** report under **Accounting → Reports → Sync Tie-Out**. Each row compares **Posted**, **Synced**, and **Provider** balances for one accounting period, account, and integration. The report flags **Internal** and **External Delta** values.
+
+<Callout type="tip" title="Sync Activity is for operators, Tie-Out is for the books">
+Use Sync Activity to inspect individual operations. Use Tie-Out to compare ledgers by account and period. Sync Activity links to the integration's tie-out summary.
+</Callout>
+
+## Exchange rates
+
+Enable Exchange Rates to refresh currency rates daily. It requires no additional configuration and is available on **every plan**.
+
+<Callout type="info">
+Carbon Cloud retrieves rates from **exchangeratesapi.io** with a **EUR** base, then converts them to each company's base currency.
+</Callout>
+
+## Related
+
+<Cards>
+  <Card title="Accounting reference" href="/docs/reference/accounting">
+    How Carbon posts to the ledger — what the sync mirrors.
+  </Card>
+  <Card title="Invoices" href="/docs/reference/invoices">
+    The sales and purchase invoices that sync to your ledger.
+  </Card>
+</Cards>

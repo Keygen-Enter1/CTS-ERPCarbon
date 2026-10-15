@@ -1,0 +1,137 @@
+---
+title: Environment variables
+description: Every variable that configures a Carbon instance, grouped by concern. The source of truth is packages/env.
+---
+
+Carbon reads configuration from environment variables registered in `packages/env`. Use `.env.example` as the template. `sst.config.ts` reads infrastructure-only variables. A minimal instance requires Supabase, a session secret, and Redis; other variables enable optional features.
+
+## Core
+
+Platform-wide behavior and edition.
+
+<EnvVars>
+<EnvVar name="CARBON_EDITION" type="enum">One of `community`, `cloud`, `enterprise`, or `test`. Gates edition-specific features.</EnvVar>
+<EnvVar name="CONTROLLED_ENVIRONMENT" type="boolean">Enables ITAR / controlled-environment restrictions: the US-Person certification gate, ITAR hostnames and branding, Slack and analytics disabled, and mandatory [two-factor authentication](/docs/reference/two-factor) that a company admin cannot turn off.</EnvVar>
+<EnvVar name="AUTH_PROVIDERS" type="enum[]">Allowed sign-in methods: `email`, `google`, `azure`, `passkey`, `sso` ([single sign-on](/docs/reference/single-sign-on), Enterprise edition only).</EnvVar>
+<EnvVar name="DOMAIN" type="string">Base domain the apps are served from.</EnvVar>
+<EnvVar name="ERP_URL" type="url">Public URL of the ERP app.</EnvVar>
+<EnvVar name="MES_URL" type="url">Public URL of the MES app.</EnvVar>
+<EnvVar name="DEFAULT_LANGUAGE" type="string">Default UI language.</EnvVar>
+<EnvVar name="RATE_LIMIT" type="number">Requests per window allowed against the API.</EnvVar>
+</EnvVars>
+
+## Database — Supabase
+
+Carbon's single Postgres database. The first four are required and crash boot if missing.
+
+<EnvVars>
+<EnvVar name="SUPABASE_URL" type="url" required>Supabase project URL.</EnvVar>
+<EnvVar name="SUPABASE_ANON_KEY" type="string" required>Public anon key, browser-safe.</EnvVar>
+<EnvVar name="SUPABASE_SERVICE_ROLE_KEY" type="string" required>Service-role key, server only, never exposed to the client.</EnvVar>
+<EnvVar name="SUPABASE_DB_URL" type="url" required>Direct Postgres connection string.</EnvVar>
+<EnvVar name="SUPABASE_JWT_SECRET" type="string">Secret used to sign and verify session JWTs. Optional to the app, but the Supabase data plane needs it, so the self-hosting recipes always generate one.</EnvVar>
+</EnvVars>
+
+## Auth & sessions
+
+<EnvVars>
+<EnvVar name="SESSION_SECRET" type="string" required>Signs the session cookie. Carbon also derives its Web Push keys from it, so changing it makes each user's browser notifications re-subscribe on their next visit.</EnvVar>
+<EnvVar name="SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID" type="string">Google OAuth client id, when `google` is in `AUTH_PROVIDERS`.</EnvVar>
+<EnvVar name="SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_SECRET" type="string">Google OAuth client secret.</EnvVar>
+<EnvVar name="SUPABASE_AUTH_EXTERNAL_AZURE_CLIENT_ID" type="string">Azure OAuth client id, when `azure` is enabled.</EnvVar>
+<EnvVar name="SUPABASE_AUTH_EXTERNAL_AZURE_CLIENT_SECRET" type="string">Azure OAuth client secret.</EnvVar>
+<EnvVar name="DEV_BYPASS_EMAIL" type="string">Local only. Sign in as this email without a magic link.</EnvVar>
+</EnvVars>
+
+Enterprise [SAML single sign-on](/docs/reference/single-sign-on) adds two more:
+
+<EnvVars>
+<EnvVar name="SAML_ENABLED" type="boolean">Turns on the SAML engine in the auth service.</EnvVar>
+<EnvVar name="SAML_PRIVATE_KEY" type="string">SAML signing key — base64-encoded PKCS#1 DER RSA, minimum 2048-bit; the generation command is in `.env.example`.</EnvVar>
+</EnvVars>
+
+Outside Vercel, set both `CLOUDFLARE_TURNSTILE_SITE_KEY` and `CLOUDFLARE_TURNSTILE_SECRET_KEY` to enable Cloudflare Turnstile on login forms. Without them, only per-IP rate limits and per-account lockouts apply. Set `BOT_PROTECTION` to `turnstile`, or to `botid` for invisible Vercel BotID protection. BotID runs only on Vercel.
+
+## Jobs & cache
+
+<EnvVars>
+<EnvVar name="REDIS_URL" type="url" required>Redis connection (ioredis URL) for the permission cache and queues.</EnvVar>
+<EnvVar name="INNGEST_SIGNING_KEY" type="string">Signs requests to the Inngest jobs runner. Required in production.</EnvVar>
+<EnvVar name="INNGEST_EVENT_KEY" type="string">Key for sending events to Inngest. Required in production.</EnvVar>
+<EnvVar name="INNGEST_BASE_URL" type="url">Override the Inngest endpoint (self-hosted or dev).</EnvVar>
+</EnvVars>
+
+<Callout type="warn" title="Inngest keys are required in production">
+`INNGEST_SIGNING_KEY` and `INNGEST_EVENT_KEY` are optional only when `INNGEST_DEV=1`. In other environments, the application does not start if either is missing. A self-hosted Inngest server supplies both; the Docker with Caddy recipe generates them.
+</Callout>
+
+The database also sends events to Inngest directly, for the event queue, search embeddings and job notifications. Whenever the ERP registers its functions with Inngest (on each deploy, and on each start of a long-running server), it also stores the address for that in the database, built from `INNGEST_EVENT_KEY` and `INNGEST_BASE_URL`, so no extra step is needed.
+
+If the database reaches Inngest at a different address than the application does, set that address once:
+
+```sql
+SELECT public.set_inngest_event_url('https://inngest.example.com/e/<event key>');
+```
+
+The ERP keeps the address you set and only refreshes the event key in it, so a rotated key still reaches the database on the next deploy.
+
+## Email & billing
+
+<EnvVars>
+<EnvVar name="SMTP_HOST" type="string">SMTP server for transactional email. Unset disables email sending.</EnvVar>
+<EnvVar name="SMTP_PORT" type="number">SMTP port; 465 uses implicit TLS, 587 (default) uses STARTTLS.</EnvVar>
+<EnvVar name="SMTP_USER" type="string">SMTP username.</EnvVar>
+<EnvVar name="SMTP_PASSWORD" type="string">SMTP password.</EnvVar>
+<EnvVar name="SMTP_FROM" type="string">From-address for outgoing email, e.g. `Carbon <no-reply@example.com>`.</EnvVar>
+<EnvVar name="RESEND_API_KEY" type="string">Optional. Resend marketing-contacts API; also a legacy SMTP fallback when `SMTP_*` is unset.</EnvVar>
+<EnvVar name="STRIPE_SECRET_KEY" type="string">Stripe secret key, Cloud / Enterprise billing.</EnvVar>
+<EnvVar name="STRIPE_WEBHOOK_SECRET" type="string">Verifies inbound Stripe webhooks.</EnvVar>
+<EnvVar name="STRIPE_CONNECT_WEBHOOK_SECRET" type="string">Verifies inbound Stripe Connect webhooks (connected-account events, signed with a separate secret).</EnvVar>
+</EnvVars>
+
+## AI & analytics
+
+<EnvVars>
+<EnvVar name="OPENAI_API_KEY" type="string">Powers AI features (embeddings, assist).</EnvVar>
+<EnvVar name="ANTHROPIC_API_KEY" type="string">Anthropic key for Claude-backed features.</EnvVar>
+<EnvVar name="POSTHOG_API_HOST" type="url">PostHog host for product analytics.</EnvVar>
+<EnvVar name="POSTHOG_PROJECT_PUBLIC_KEY" type="string">PostHog project key.</EnvVar>
+</EnvVars>
+
+## Integrations
+
+OAuth credentials for each connector, all optional, set only the ones you use.
+
+<EnvVars>
+<EnvVar name="XERO_CLIENT_ID" type="string">Xero OAuth client id.</EnvVar>
+<EnvVar name="XERO_CLIENT_SECRET" type="string">Xero OAuth client secret.</EnvVar>
+<EnvVar name="XERO_WEBHOOK_SECRET" type="string">Verifies inbound Xero webhooks.</EnvVar>
+<EnvVar name="QUICKBOOKS_CLIENT_ID" type="string">QuickBooks OAuth client id.</EnvVar>
+<EnvVar name="QUICKBOOKS_CLIENT_SECRET" type="string">QuickBooks OAuth client secret.</EnvVar>
+<EnvVar name="JIRA_CLIENT_ID" type="string">Jira OAuth client id.</EnvVar>
+<EnvVar name="JIRA_CLIENT_SECRET" type="string">Jira OAuth client secret.</EnvVar>
+<EnvVar name="SLACK_CLIENT_ID" type="string">Slack OAuth client id.</EnvVar>
+<EnvVar name="SLACK_CLIENT_SECRET" type="string">Slack OAuth client secret.</EnvVar>
+<EnvVar name="ONSHAPE_CLIENT_ID" type="string">Onshape OAuth client id.</EnvVar>
+<EnvVar name="ONSHAPE_CLIENT_SECRET" type="string">Onshape OAuth client secret.</EnvVar>
+<EnvVar name="EXCHANGE_RATES_API_KEY" type="string">Currency exchange-rate feed.</EnvVar>
+<EnvVar name="GOOGLE_PLACES_API_KEY" type="string">Address autocomplete.</EnvVar>
+</EnvVars>
+
+## Infrastructure — SST
+
+Read by `sst.config.ts` at deploy time, not by the app.
+
+<EnvVars>
+<EnvVar name="AWS_REGION" type="string" required>Region to deploy into.</EnvVar>
+<EnvVar name="AWS_ACCOUNT_ID" type="string" required>Target AWS account.</EnvVar>
+<EnvVar name="IMAGE_TAG" type="string" required>ECR image tag to deploy.</EnvVar>
+<EnvVar name="CERT_ARN_ERP" type="string">ACM certificate ARN for the ERP domain.</EnvVar>
+<EnvVar name="CERT_ARN_MES" type="string">ACM certificate ARN for the MES domain.</EnvVar>
+<EnvVar name="URL_ERP" type="url">Custom ERP domain, overrides the default.</EnvVar>
+<EnvVar name="URL_MES" type="url">Custom MES domain, overrides the default.</EnvVar>
+</EnvVars>
+
+<Callout type="warn">
+`TRIGGER_*` and `UPSTASH_REDIS_*` variables are obsolete. Jobs use Inngest, and the cache uses `REDIS_URL`.
+</Callout>

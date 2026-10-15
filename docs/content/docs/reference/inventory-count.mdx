@@ -1,0 +1,123 @@
+---
+title: Inventory counts
+description: Count real stock against a frozen snapshot, review the variances, and post the differences as adjustments.
+---
+
+An inventory count compares a frozen on-hand snapshot with physical stock and posts the variance. Select a location and optionally filter by storage unit or item type. Carbon creates count lines from the snapshot, counters enter observed quantities, and posting records each difference as an inventory adjustment in the <Term id="item-ledger">item ledger</Term>.
+
+## The count lifecycle
+
+A count moves through three statuses in order. Posting is atomic, so a count is never left half-applied.
+
+<StatusFlow entity="inventoryCount">
+  <Status name="Draft">
+    The count is being set up and counted. Carbon has snapshotted on-hand into the lines, and counters enter what they physically find. Lines can still be regenerated from scratch while the count is Draft.
+  </Status>
+  <Status name="Pending">
+    Counting is confirmed and the count is queued to post. The entered quantities are locked in for review; nothing has hit the ledger yet.
+  </Status>
+  <Status name="Posted" accent>
+    Every non-zero variance has been booked as a Positive or Negative Adjustment, tracked-entity quantities updated, and a journal written. This is the pivotal transition.
+  </Status>
+</StatusFlow>
+
+A Posted count cannot be reopened. To fix an incorrect posted movement, use **Correct Quantity** on the Stock Movements screen. Carbon posts an offsetting movement for the difference, links it to the original, and uses the original posting date. Both entries remain visible.
+
+## Creating a count
+
+Every count is scoped to one **location**. From there you can narrow it two ways, both optional:
+
+<FieldTable>
+  <Field name="Storage units">
+    Limit the count to specific bins. Leave it empty to count the whole location.
+  </Field>
+  <Field name="Item type">
+    Restrict to one of `Part`, `Material`, `Tool`, or `Consumable` — the stockable item types. Services are never counted (they hold no inventory).
+  </Field>
+  <Field name="Blind count" type="boolean">
+    When on, the counter doesn't see the expected quantity while counting. Use it so the system number can't bias what they write down.
+  </Field>
+</FieldTable>
+
+A **full count** covers an entire location. A **cycle count** covers selected bins or one item type. Scope determines which lines Carbon generates; both use the same count document and lifecycle.
+
+When you generate the lines, Carbon aggregates on-hand from the item ledger into one line per item, storage unit, and lot. It **excludes Rejected and Consumed lots** — a count never lists stock that has already been scrapped or used up. Each line records the frozen **system quantity**; that snapshot is what the variance is measured against later, not live on-hand.
+
+## Counting
+
+A counter walks the lines and enters what they find. Two rules matter:
+
+<Callout type="note">
+A **blank** counted quantity means "not counted" and is skipped at post — it leaves that stock untouched. An explicit **0** is a real count that zeroes the line. The two are different: don't leave a line blank when you mean the shelf is empty.
+</Callout>
+
+<Callout type="warn">
+Serial-tracked lines can only be counted **0 or 1** — a serial number is a single unique unit. Enter anything else and the post is blocked, with the offending rows flagged so you can fix them before trying again.
+</Callout>
+
+Counted quantities are non-negative, so a count can never drive on-hand below zero.
+
+## What posting does
+
+Posting reconciles against the **frozen snapshot**, not live on-hand. For each counted line Carbon computes the variance as `counted − systemQuantity` and posts a single adjustment for it:
+
+- A shortfall books a **"Negative Adjmt."**, an overage a **"Positive Adjmt."**, written to the <Term id="item-ledger">item ledger</Term> with the document type **"Inventory Count"**.
+- Cost layers are maintained on every variance. One journal is written for the whole post, debiting or crediting inventory against the inventory adjustment variance account, valued at the item's current cost. Before the company has [set up accounting](/docs/reference/accounting#setting-up-accounting), that journal is Provisional and counts in no balance.
+- For a tracked lot, the same variance is applied to the entity's quantity — the delta is added, not set — so any receipt or shipment that posted between the snapshot and the post survives the count rather than being clobbered.
+
+<Callout type="info">
+Reconciling against the snapshot delta (not live on-hand) is deliberate. If a <Term id="receipt">receipt</Term> or <Term id="shipment">shipment</Term> lands while the count is open, the correction is applied *on top of* it instead of erasing it. The counter's variance is exactly what they reviewed.
+</Callout>
+
+## Count vs. a direct adjustment
+
+Both end in the same place — a Positive or Negative Adjustment on the ledger, and the same <Term id="journal">journal</Term>. The difference is the workflow:
+
+<FieldTable>
+  <Field name="Inventory count">
+    A **bulk, reviewable document**. Snapshot many lots at once, count them, review the variances, then post them all in one atomic transaction. It has a Draft → Pending → Posted lifecycle.
+  </Field>
+  <Field name="Manual adjustment">
+    A **single, immediate movement** on one item in one storage unit. No snapshot, no review step, no lifecycle — you enter a delta or a *Set Quantity* target and it posts on the spot.
+  </Field>
+</FieldTable>
+
+Use a count to reconcile multiple items or an area. Use a manual adjustment to correct one known quantity.
+
+## Related
+
+<Cards>
+  <Card title="Inventory & locations" href="/docs/reference/inventory">
+    On-hand as a ledger, storage units, and the manual adjustment a count is the bulk version of.
+  </Card>
+  <Card title="Traceability" href="/docs/reference/traceability">
+    How serial and batch lots are tracked — the entities a count snapshots and adjusts.
+  </Card>
+</Cards>
+
+<AgentContext>
+## Troubleshooting
+
+Exact errors from counting and posting.
+
+### "… serial line(s) must be counted as 0 or 1 — a serial number is a single unit."
+The post found serial-tracked lines counted to something other than 0 or 1. A serial number is one unique unit, so it's either present (1) or not (0). The message counts the offending lines and the post returns their ids so those rows are flagged — fix them and post again.
+
+### "Counted quantity cannot be negative"
+A line was given a negative counted quantity. Counts can never drive on-hand below zero. Enter 0 for an empty shelf (a real count), or leave the field **blank** to mean "not counted" and skip it at post.
+
+### "Only a confirmed (pending) count can be made effective"
+Post was attempted on a count that isn't **"Pending"**. Confirm the count first (Draft → Pending), then post it.
+
+### "Only a draft count can be confirmed"
+Confirm was attempted on a count that isn't **"Draft"**. Only a Draft count moves to Pending.
+
+### "Only a pending count can be reopened"
+Reopen (Pending → Draft) only works from **"Pending"**. A **Posted** count is final — to fix a posted movement, correct that movement from the stock-movements screen instead.
+
+### "Inventory count is no longer pending"
+A concurrent post already moved the count out of **"Pending"** while this post was running. Reload the count to see its current state before acting again.
+
+### The post's journal is not in the balances
+Every post writes its journal. Before the company sets up accounting (no `companySettings.accountingCutoverDate`), the journal is **Provisional**, and no balance or report counts it. All post actions require the **inventory update** permission.
+</AgentContext>

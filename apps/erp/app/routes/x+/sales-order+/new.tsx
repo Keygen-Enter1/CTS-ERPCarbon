@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { ActionFunctionArgs } from "react-router";
+import { NewRecordPage } from "~/components/NewRecordPage";
+import { useUrlParams, useUser } from "~/hooks";
+import { insertSalesOrder, salesOrderValidator } from "~/modules/sales";
+import { SalesOrderForm } from "~/modules/sales/ui/SalesOrder";
+import { requireCompanyRecord } from "~/modules/shared/shared.server";
+import { setCustomFields } from "~/utils/form";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: msg`Orders`,
+  to: path.to.salesOrders
+};
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, companyGroupId, userId } =
+    await requirePermissions(request, {
+      create: "sales",
+      bypassRls: true
+    });
+
+  const formData = await request.formData();
+  const validation = await validator(salesOrderValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const { id: _id, ...data } = validation.data;
+
+  // bypassRls hands back the service role, and insertSalesOrder copies the
+  // customer's payment and shipping defaults by these form ids.
+  await Promise.all([
+    requireCompanyRecord(client, "customer", companyId, {
+      id: data.customerId
+    }),
+    requireCompanyRecord(client, "location", companyId, {
+      id: data.locationId
+    }),
+    data.customerLocationId
+      ? requireCompanyRecord(client, "customerLocation", companyId, {
+          id: data.customerLocationId
+        })
+      : null,
+    data.customerContactId
+      ? requireCompanyRecord(client, "customerContact", companyId, {
+          id: data.customerContactId
+        })
+      : null,
+    data.customerEngineeringContactId
+      ? requireCompanyRecord(client, "customerContact", companyId, {
+          id: data.customerEngineeringContactId
+        })
+      : null,
+    data.quoteId
+      ? requireCompanyRecord(client, "quote", companyId, { id: data.quoteId })
+      : null
+  ]);
+
+  const result = await insertSalesOrder(client, {
+    ...data,
+    salesOrderId: data.salesOrderId || undefined,
+    companyId,
+    companyGroupId,
+    createdBy: userId,
+    customFields: setCustomFields(formData)
+  });
+
+  // A typed number another sales order already has: keep the user on the form.
+  if (
+    result.error?.code === "23505" &&
+    result.error.details?.includes("salesOrderId") &&
+    data.salesOrderId
+  ) {
+    return validationError({
+      fieldErrors: {
+        salesOrderId: `Sales order ${data.salesOrderId} already exists`
+      }
+    });
+  }
+
+  if (result.error || !result.data) {
+    throw redirect(
+      path.to.salesOrders,
+      await flash(request, error(result.error, "Failed to insert sales order"))
+    );
+  }
+
+  throw redirect(path.to.salesOrder(result.data.id));
+}
+
+export default function SalesOrderNewRoute() {
+  const [params] = useUrlParams();
+  const customerId = params.get("customerId");
+  const { id: userId, company, defaults } = useUser();
+
+  const initialValues = {
+    id: undefined,
+    salesOrderId: undefined,
+    customerId: customerId ?? "",
+    orderDate: "",
+    status: "Draft" as const,
+    currencyCode: company?.baseCurrencyCode ?? "USD",
+    locationId: defaults?.locationId ?? "",
+    salesPersonId: userId,
+    exchangeRate: undefined,
+    exchangeRateUpdatedAt: "",
+    originatedFromQuote: false,
+    digitalQuoteAcceptedBy: undefined,
+    digitalQuoteAcceptedByEmail: undefined
+  };
+
+  return (
+    <NewRecordPage>
+      <SalesOrderForm initialValues={initialValues} />
+    </NewRecordPage>
+  );
+}

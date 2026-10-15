@@ -1,0 +1,672 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+import {
+  ApiKeyNotFoundError,
+  checkApiKeyRateLimit
+} from "@carbon/database/ratelimit";
+import { redis } from "@carbon/kv";
+import { getLogger } from "@carbon/logger";
+import { oncePerRequest } from "@carbon/logger/middleware.server";
+import { annotateRequestSpan } from "@carbon/logger/tracing.server";
+import { Edition, getClientIp, Plan, redirect, safePath } from "@carbon/utils";
+import type {
+  AuthSession as SupabaseAuthSession,
+  SupabaseClient
+} from "@supabase/supabase-js";
+import { createHash } from "crypto";
+import {
+  CarbonEdition,
+  IS_LOCAL_DEV,
+  REFRESH_ACCESS_TOKEN_THRESHOLD,
+  STRIPE_BYPASS_COMPANY_IDS,
+  SUPABASE_ANON_KEY,
+  VERCEL_URL
+} from "../config/env";
+import { getCarbon } from "../lib/supabase";
+import { getCarbonAPIKeyClient, getCarbonClient } from "../lib/supabase/client";
+import {
+  getCarbonServiceRole,
+  requestFetch
+} from "../lib/supabase/client.server";
+import type { AuthSession } from "../types";
+import { path } from "../utils/path";
+import { error } from "../utils/result";
+import { type ApiKeyRecord, getApiKeyRecord } from "./api-key.server";
+import { logAuthEvent } from "./auth-events.server";
+import { getCompanyPlanId, isCarbonOwnedCompany } from "./company.server";
+import { resolveConsolePinIn } from "./console-pin.server";
+import {
+  destroyAuthSession,
+  flash,
+  requireAuthSession
+} from "./session.server";
+import { getCompaniesForUser } from "./users";
+import { getUserClaims } from "./users.server";
+
+const log = getLogger("auth");
+
+export { logAuthEvent } from "./auth-events.server";
+
+// Each matched loader used to build its own Supabase client for identical
+// credentials; `createClient` is not free and they are interchangeable. Both are
+// bound to the request (`requestFetch`).
+const carbonForRequest = (accessToken: string, request: Request) =>
+  oncePerRequest(`carbon:${accessToken}`, () =>
+    getCarbonClient(SUPABASE_ANON_KEY!, accessToken, requestFetch(request))
+  );
+
+const serviceRoleForRequest = () =>
+  oncePerRequest("carbon:service-role", () => getCarbonServiceRole());
+
+export async function createEmailAuthAccount(
+  email: string,
+  password: string,
+  meta?: Record<string, unknown>
+) {
+  const { data, error } = await getCarbonServiceRole().auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    app_metadata: {
+      ...meta
+    }
+  });
+
+  if (!data.user || error) return null;
+
+  return data.user;
+}
+
+export async function deleteAuthAccount(
+  client: SupabaseClient<Database>,
+  userId: string
+) {
+  // Sequential: a failed auth delete leaves both records intact and retryable.
+  const supabaseDelete = await client.auth.admin.deleteUser(userId);
+  if (supabaseDelete.error) return null;
+
+  const carbonDelete = await client.from("user").delete().eq("id", userId);
+  if (carbonDelete.error) {
+    // Auth user is gone but the app row remains; log so it can be found and cleaned up.
+    log.error(
+      "deleteAuthAccount: user table cleanup failed after auth delete",
+      {
+        userId,
+        error: carbonDelete.error
+      }
+    );
+    return null;
+  }
+
+  return true;
+}
+
+export async function getAuthAccountByAccessToken(accessToken: string) {
+  const { data, error } =
+    await getCarbonServiceRole().auth.getUser(accessToken);
+
+  if (!data.user || error) return null;
+
+  return data.user;
+}
+
+/** Hash an OAuth token or secret using SHA-256 for secure storage/lookup */
+export function hashOAuthSecret(raw: string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+// The API-key record cache lives in its own module; re-exported here so
+// `@carbon/auth/auth.server` stays the only subpath consumers import.
+export {
+  type ApiKeyRecord,
+  apiKeyCacheKey,
+  bustApiKeyCache,
+  getApiKeyRecord,
+  hashApiKey
+} from "./api-key.server";
+
+// Exported so the Carbon API v1 surface can read a key's scopes for its per-operation
+// scope gate (the gate lives in oRPC middleware, not in requirePermissions). The
+// carbon-key branch of requirePermissions already covers client/rate-limit/plan/expiry.
+// Kept as `{ data, error }` for its existing callers; the row now comes through the
+// ~30s Redis cache (with per-request memoization) in api-key.server.ts.
+export async function getCompanyIdFromAPIKey(apiKey: string) {
+  const data = await getApiKeyRecord(apiKey);
+  return { data, error: data ? null : new Error("API key not found") };
+}
+
+export function makeAuthSession(
+  supabaseSession: SupabaseAuthSession | null,
+  companyId: string,
+  companyGroupId: string,
+  options?: { mfaVerified?: boolean }
+): AuthSession | null {
+  if (!supabaseSession) return null;
+
+  if (!supabaseSession.refresh_token)
+    throw new Error("User should have a refresh token");
+
+  if (!supabaseSession.user?.email)
+    throw new Error("User should have an email");
+
+  return {
+    accessToken: supabaseSession.access_token,
+    companyId,
+    companyGroupId,
+    refreshToken: supabaseSession.refresh_token,
+    userId: supabaseSession.user.id,
+    email: supabaseSession.user.email,
+    expiresIn:
+      (supabaseSession.expires_in ?? 3000) - REFRESH_ACCESS_TOKEN_THRESHOLD,
+    expiresAt: supabaseSession.expires_at ?? -1,
+    // Session-lock/termination clocks (NIST 3.1.10/3.1.11). Stamped at every mint
+    // AND on the refresh rebuild; refreshAuthSession then re-preserves the original
+    // createdAt/lastActiveAt so a silent token refresh never resets either clock.
+    createdAt: Date.now(),
+    lastActiveAt: Date.now(),
+    ...(options?.mfaVerified ? { mfaVerified: true } : {})
+  };
+}
+
+/**
+ * Determines the effective user based on console mode and pin-in state.
+ * If console mode is on and an operator is pinned in, returns
+ * the operator's ID. Otherwise returns the session user's ID.
+ *
+ * Console mode is read from the auth session; the pin-in from the SIGNED
+ * `console-pin-{companyId}` cookie, re-validated against the database on every
+ * request (`resolveConsolePinIn`): a forged, legacy, stale or foreign cookie,
+ * a pinned user who is not an active employee of this company, or console mode
+ * switched off for the company all fall back to the session user.
+ */
+async function getEffectiveUser(
+  request: Request,
+  companyId: string,
+  sessionUserId: string,
+  consoleMode: boolean
+): Promise<string> {
+  if (!consoleMode) return sessionUserId;
+  const pinIn = await resolveConsolePinIn(request, companyId, sessionUserId);
+  return pinIn?.userId ?? sessionUserId;
+}
+
+export async function requirePermissions(
+  request: Request,
+  requiredPermissions: {
+    view?: string | string[];
+    create?: string | string[];
+    update?: string | string[];
+    delete?: string | string[];
+    role?: string;
+    bypassRls?: boolean;
+    /**
+     * Also admit customer and supplier portal accounts. Only for routes that
+     * act on the signed-in user's own identity (onboarding); everything else
+     * holds company data they must not reach.
+     */
+    allowPortalAccounts?: boolean;
+  }
+): Promise<{
+  client: SupabaseClient<Database>;
+  companyId: string;
+  companyGroupId: string;
+  email: string;
+  userId: string;
+  sessionUserId: string;
+  consoleMode: boolean;
+}> {
+  const apiKey = request.headers.get("carbon-key");
+
+  if (apiKey) {
+    const company = await getCompanyIdFromAPIKey(apiKey);
+    // A caller presenting a key is on the machine path: 401, never the /login
+    // redirect requireAuthSession would answer with below.
+    if (!company.data) {
+      throw new Response("Invalid API key", { status: 401 });
+    }
+    if (company.data) {
+      // Lets traces tell a script from a person at the keyboard.
+      annotateRequestSpan({ "carbon.caller": "apiKey" });
+      const apiKeyData = company.data as unknown as ApiKeyRecord;
+      const companyId = apiKeyData.companyId;
+      const companyGroupId = apiKeyData.companyGroupId;
+      const userId = apiKeyData.createdBy;
+
+      // Check expiration
+      if (apiKeyData.expiresAt && new Date(apiKeyData.expiresAt) < new Date()) {
+        throw new Response("API key has expired", { status: 401 });
+      }
+
+      // Check rate limit via Postgres function
+      const serviceRole = getCarbonServiceRole();
+      let rl: Awaited<ReturnType<typeof checkApiKeyRateLimit>>;
+      try {
+        rl = await checkApiKeyRateLimit(
+          serviceRole,
+          apiKeyData.id,
+          apiKeyData.rateLimit,
+          apiKeyData.rateLimitWindow
+        );
+      } catch (err) {
+        // The key was deleted while its auth record was still cached — that is a
+        // revoked credential, not a server error.
+        if (err instanceof ApiKeyNotFoundError) {
+          throw new Response("Invalid API key", { status: 401 });
+        }
+        throw err;
+      }
+      if (!rl.success) {
+        throw new Response("Rate limit exceeded", {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "X-RateLimit-Limit": rl.limit.toString(),
+            "X-RateLimit-Remaining": rl.remaining.toString(),
+            "X-RateLimit-Reset": rl.resetAt.toString(),
+            "Retry-After": Math.ceil(
+              (rl.resetAt - Date.now()) / 1000
+            ).toString()
+          }
+        });
+      }
+
+      // Check scopes against required permissions
+      const scopes = apiKeyData.scopes ?? {};
+      const scopeCheckPassed = Object.entries(requiredPermissions).every(
+        ([action, permission]) => {
+          if (
+            action === "bypassRls" ||
+            action === "role" ||
+            action === "allowPortalAccounts"
+          )
+            return true;
+          if (typeof permission === "string") {
+            const scopeKey = `${permission}_${action}`;
+            return scopeKey in scopes && scopes[scopeKey]?.includes(companyId);
+          } else if (Array.isArray(permission)) {
+            return permission.every((p) => {
+              const scopeKey = `${p}_${action}`;
+              return (
+                scopeKey in scopes && scopes[scopeKey]?.includes(companyId)
+              );
+            });
+          }
+          return false;
+        }
+      );
+
+      if (!scopeCheckPassed) {
+        throw new Response("API key lacks required permissions", {
+          status: 403
+        });
+      }
+
+      // Plan gate: API access is a Business-tier feature. Block Starter
+      // companies from authenticating with their API key. Self-hosted editions
+      // and bypass-listed companies are never gated.
+      if (CarbonEdition === Edition.Cloud) {
+        const isBypass = STRIPE_BYPASS_COMPANY_IDS
+          ? STRIPE_BYPASS_COMPANY_IDS.split(",")
+              .map((id: string) => id.trim())
+              .includes(companyId)
+          : false;
+
+        if (!isBypass) {
+          if (
+            (await getCompanyPlanId(companyId)) === Plan.Starter &&
+            !(await isCarbonOwnedCompany(companyId))
+          ) {
+            throw new Response(
+              "API access requires the Business plan and above. Please upgrade your plan to use API keys.",
+              { status: 403 }
+            );
+          }
+        }
+      }
+
+      const client = getCarbonAPIKeyClient(apiKey, requestFetch(request));
+
+      return {
+        client,
+        companyId,
+        companyGroupId,
+        userId,
+        sessionUserId: userId,
+        email: "",
+        consoleMode: false
+      };
+    }
+  }
+
+  const authSession = await requireAuthSession(request);
+  const { accessToken, companyId, companyGroupId, email, userId } = authSession;
+  const consoleMode = authSession.console === companyId;
+
+  const myClaims = await getUserClaims(userId, companyId);
+
+  // A customer or supplier portal account is a member of the company too, and
+  // holds a few permissions (documents, parts, sales/purchasing view), but no
+  // route in the apps is theirs — portal pages are share links served with the
+  // service role. Before this check, `{}` and those permissions admitted them to
+  // every route that then reads with the service role (file previews, job
+  // travelers, order and quote pages). A 403, not a redirect: the MES shell calls
+  // requirePermissions itself, so a redirect to it would loop.
+  if (
+    (myClaims.role === "customer" || myClaims.role === "supplier") &&
+    !requiredPermissions.allowPortalAccounts
+  ) {
+    logAuthEvent("permission_denied", {
+      userId,
+      actor: email,
+      companyId,
+      ip: getClientIp(request) ?? undefined,
+      reason: `${myClaims.role} portal account`
+    });
+    throw new Response("Forbidden", { status: 403 });
+  }
+
+  // early exit if no requiredPermissions are required
+  if (Object.keys(requiredPermissions).length === 0) {
+    return {
+      client:
+        requiredPermissions.bypassRls && myClaims.role === "employee"
+          ? serviceRoleForRequest()
+          : carbonForRequest(accessToken, request),
+      companyId,
+      companyGroupId,
+      email,
+      userId: await getEffectiveUser(request, companyId, userId, consoleMode),
+      sessionUserId: userId,
+      consoleMode
+    };
+  }
+
+  const hasRequiredPermissions = Object.entries(requiredPermissions).every(
+    ([action, permission]) => {
+      if (action === "bypassRls" || action === "allowPortalAccounts")
+        return true;
+      if (typeof permission === "string") {
+        if (action === "role") {
+          return myClaims.role === permission;
+        }
+        if (!(permission in myClaims.permissions)) return false;
+        const permissionForCompany =
+          myClaims.permissions[permission]?.[
+            action as "view" | "create" | "update" | "delete"
+          ];
+        return permissionForCompany?.includes(companyId) || false;
+      } else if (Array.isArray(permission)) {
+        return permission.every((p) => {
+          const permissionForCompany =
+            myClaims.permissions[p]?.[
+              action as "view" | "create" | "update" | "delete"
+            ];
+          return permissionForCompany?.includes(companyId) ?? false;
+        });
+      } else {
+        return false;
+      }
+    }
+  );
+
+  if (!hasRequiredPermissions) {
+    logAuthEvent("permission_denied", {
+      userId,
+      actor: email,
+      companyId,
+      ip: getClientIp(request) ?? undefined,
+      reason: JSON.stringify(requiredPermissions)
+    });
+    if (myClaims.role === null) {
+      throw redirect("/", await destroyAuthSession(request));
+    }
+    throw redirect(
+      path.to.authenticatedRoot,
+      await flash(
+        request,
+        error({ myClaims: myClaims, requiredPermissions }, "Access Denied")
+      )
+    );
+  }
+
+  return {
+    client:
+      !!requiredPermissions.bypassRls && myClaims.role === "employee"
+        ? serviceRoleForRequest()
+        : carbonForRequest(accessToken, request),
+    companyId,
+    companyGroupId,
+    email,
+    userId: await getEffectiveUser(request, companyId, userId, consoleMode),
+    sessionUserId: userId,
+    consoleMode
+  };
+}
+
+export async function resetPassword(accessToken: string, password: string) {
+  const { error } = await getCarbon(accessToken).auth.updateUser({
+    password
+  });
+
+  if (error) return null;
+
+  return true;
+}
+
+export async function sendInviteByEmail(
+  email: string,
+  data?: Record<string, unknown>
+) {
+  return getCarbonServiceRole().auth.admin.inviteUserByEmail(email, {
+    redirectTo: `${VERCEL_URL}/callback`,
+    data
+  });
+}
+
+export async function sendMagicLink(
+  email: string,
+  // The app's own origin. VERCEL_URL is only correct for the app it was set
+  // for — in local dev crbn writes the ERP url (or a localhost fallback) into
+  // .env.local, so an MES started outside `crbn up` would send its first-login
+  // magic link back to the wrong origin. MES passes getMESUrl().
+  origin?: string,
+  // Where the user was headed before they were sent to log in.
+  redirectTo?: string
+) {
+  const destination = safePath(redirectTo, "");
+  return getCarbonServiceRole().auth.signInWithOtp({
+    email,
+    options: {
+      emailRedirectTo: `${origin ?? VERCEL_URL}/callback${
+        destination ? `?redirectTo=${encodeURIComponent(destination)}` : ""
+      }`
+    }
+  });
+}
+
+export {
+  type BotProtection,
+  botProtection,
+  verifyBotProtection
+} from "./bot-protection.server";
+
+export function getMagicLinkErrorMessage(error: { code?: string }): string {
+  switch (error.code) {
+    case "over_email_send_rate_limit":
+    case "over_request_rate_limit":
+      return "Too many sign-in attempts. Please try again later.";
+    default:
+      return "Failed to send magic link";
+  }
+}
+
+// DEV_BYPASS_EMAIL signs a developer in with no magic link, so it is a local
+// stack's convenience and nothing else: refuse it anywhere the env says this
+// is a real deployment (production, preview, or self-hosted), whatever the
+// variable happens to be set to there.
+export async function signInWithBypassEmail(
+  email: string
+): Promise<AuthSession | null> {
+  if (!IS_LOCAL_DEV) {
+    log.error("DEV_BYPASS_EMAIL sign-in refused outside local development", {
+      actor: email
+    });
+    return null;
+  }
+  const client = getCarbonServiceRole();
+
+  const { data: linkData, error: linkError } =
+    await client.auth.admin.generateLink({ type: "magiclink", email });
+
+  if (linkError || !linkData?.properties?.hashed_token) return null;
+
+  const { data: sessionData, error: verifyError } = await client.auth.verifyOtp(
+    { token_hash: linkData.properties.hashed_token, type: "magiclink" }
+  );
+
+  if (verifyError || !sessionData?.session) return null;
+
+  const companies = await getCompaniesForUser(
+    client,
+    sessionData.session.user.id
+  );
+  const { data: companyRecord } = await client
+    .from("company")
+    .select("companyGroupId")
+    .eq("id", companies?.[0] ?? "")
+    .single();
+
+  // Local-dev shortcut only — never challenged, so mark it verified up front
+  // or the MFA re-check would bounce a bypass user who has a factor enrolled.
+  return makeAuthSession(
+    sessionData.session,
+    companies?.[0] ?? "",
+    companyRecord?.companyGroupId ?? "",
+    { mfaVerified: true }
+  );
+}
+
+export async function signInWithEmail(email: string, password: string) {
+  const client = getCarbonServiceRole();
+  const { data, error } = await client.auth.signInWithPassword({
+    email,
+    password
+  });
+
+  if (!data.session || error) return null;
+  const companies = await getCompaniesForUser(client, data.user.id);
+
+  const { data: companyRecord } = await client
+    .from("company")
+    .select("companyGroupId")
+    .eq("id", companies?.[0] ?? "")
+    .single();
+
+  return makeAuthSession(
+    data.session,
+    companies?.[0] ?? "",
+    companyRecord?.companyGroupId ?? ""
+  );
+}
+
+export async function refreshAccessToken(
+  refreshToken?: string,
+  companyId?: string,
+  companyGroupId?: string
+): Promise<AuthSession | null> {
+  if (!refreshToken) return null;
+
+  const client = getCarbonServiceRole();
+
+  const { data, error } = await client.auth.refreshSession({
+    refresh_token: refreshToken
+  });
+
+  if (!data.session || error) return null;
+
+  return makeAuthSession(data.session, companyId!, companyGroupId!);
+}
+
+// `requireAuthSession(request, { verify: true })` costs a full GoTrue round-trip
+// on the critical path of every authenticated request, and the ERP/MES shells
+// re-run it on every navigation. 60s takes it off the hot path while bounding
+// how long a revoked account keeps being accepted. (Signing out doesn't revoke
+// an access token either way — a JWT stays valid until it expires — so the
+// window that actually matters here is admin deletion/deactivation.)
+const AUTH_VERIFY_CACHE_TTL_SECONDS = 60;
+
+function getAuthVerifyCacheKey(accessToken: string) {
+  return `auth:verify:${createHash("sha256")
+    .update(accessToken)
+    .digest("hex")}`;
+}
+
+export async function verifyAuthSession(authSession: AuthSession) {
+  const cacheKey = getAuthVerifyCacheKey(authSession.accessToken);
+
+  try {
+    if (await redis.get(cacheKey)) return true;
+  } catch (e) {
+    log.error("Failed to read cached auth verification", { error: e });
+  }
+
+  const authAccount = await getAuthAccountByAccessToken(
+    authSession.accessToken
+  );
+  const isValid = Boolean(authAccount);
+
+  // Only positive verdicts are cached. `getAuthAccountByAccessToken` also
+  // returns null on a transient network error, so caching a failure would turn
+  // one blip into a minute of forced logouts.
+  if (isValid) {
+    try {
+      await redis.set(cacheKey, "1", "EX", AUTH_VERIFY_CACHE_TTL_SECONDS);
+    } catch (e) {
+      log.error("Failed to cache auth verification", { error: e });
+    }
+  }
+
+  return isValid;
+}
+
+export async function signInWithPasskey(
+  userId: string,
+  email: string
+): Promise<AuthSession | null> {
+  const serviceRole = getCarbonServiceRole();
+
+  // Generate a one-time magic link without sending an email
+  const { data: linkData, error: linkError } =
+    await serviceRole.auth.admin.generateLink({
+      type: "magiclink",
+      email,
+      options: { redirectTo: VERCEL_URL }
+    });
+
+  if (linkError || !linkData.properties?.hashed_token) return null;
+
+  // Verify the token server-side to obtain a Supabase session
+  const { data: sessionData, error: sessionError } =
+    await serviceRole.auth.verifyOtp({
+      token_hash: linkData.properties.hashed_token,
+      type: "magiclink"
+    });
+
+  if (sessionError || !sessionData.session) return null;
+
+  const companies = await getCompaniesForUser(serviceRole, userId);
+  const { data: companyRecord } = await serviceRole
+    .from("company")
+    .select("companyGroupId")
+    .eq("id", companies?.[0] ?? "")
+    .single();
+
+  return makeAuthSession(
+    sessionData.session,
+    companies?.[0] ?? "",
+    companyRecord?.companyGroupId ?? ""
+  );
+}

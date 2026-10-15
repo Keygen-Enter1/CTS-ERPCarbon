@@ -1,0 +1,34 @@
+---
+title: Email
+description: Send outbound email through Carbon-managed Resend or your own SMTP server.
+---
+
+## Email
+
+Carbon uses email for transactional messages such as order confirmations and notifications. Email is available on **every plan** and supports Resend or SMTP delivery.
+
+<Steps>
+  <Step>
+  ### Choose a provider
+
+  Select **Resend** or **SMTP**. The configuration fields change for the selected provider.
+  </Step>
+  <Step>
+  ### Fill in the provider fields
+
+  For **Resend**, enter the API key. For **SMTP**, enter the host, port, credentials, and TLS setting. Configure the **from address** for either provider.
+  </Step>
+</Steps>
+
+<FieldTable>
+  <Field name="Provider">**Resend** (Carbon-managed) or **SMTP** (your own server).</Field>
+  <Field name="From address">The address outbound mail is sent from.</Field>
+  <Field name="API key">*(Resend)* Your Resend API key.</Field>
+  <Field name="Host / Port">*(SMTP)* Your mail server and port (default `587`).</Field>
+  <Field name="Username / Password">*(SMTP)* Credentials for the SMTP server.</Field>
+  <Field name="Secure">*(SMTP)* Whether to connect over TLS.</Field>
+</FieldTable>
+
+<Callout type="note">
+Carbon displays only the fields for the selected provider.
+</Callout>

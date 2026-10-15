@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs } from "react-router";
+import { attributeValidator, updateAttribute } from "~/modules/people";
+import { path } from "~/utils/path";
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, userId } = await requirePermissions(request, {
+    update: "people"
+  });
+
+  const validation = await validator(attributeValidator).validate(
+    await request.formData()
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const update = await updateAttribute(client, {
+    ...validation.data,
+    updatedBy: userId
+  });
+  if (update.error)
+    redirect(
+      path.to.attributes,
+      await flash(request, error(update.error, "Failed to update attribute"))
+    );
+
+  throw redirect(
+    path.to.attributeCategoryList(validation.data.userAttributeCategoryId),
+    await flash(request, success("Successfully updated attribtue"))
+  );
+}

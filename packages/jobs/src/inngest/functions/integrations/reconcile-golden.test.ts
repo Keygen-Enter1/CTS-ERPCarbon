@@ -1,0 +1,951 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+/**
+ * v5 golden decision matrix (spec Step A):
+ * .ai/specs/2026-08-12-accounting-sync-reconciler-unification.md
+ *
+ * Pins the translation from the LEGACY decision sites (event-shaped
+ * getJournalPostingDecision / getPaymentPushDecision, the sweep's
+ * shouldEnqueueMissingDocument + re-drive conditions, the master-data
+ * enqueue-always rule bounded by the cooldown) onto the state-shaped
+ * computeReconcileDecision. Where the two deliberately differ, the scenario
+ * says so explicitly — every difference is a documented fix, never an
+ * accident:
+ *
+ *  FIX-1  Draft/mid-posting documents reconcile to nothing (legacy event
+ *         path enqueued them, producing drain-skip churn and the F5 race).
+ *  FIX-2  A parked Failed/Warning document re-enqueues only when the row
+ *         actually changed after the failure (legacy event path retried on
+ *         ANY touch; the sweep never did).
+ *  FIX-3  Master data uses updatedAt vs lastSyncedAt instead of the 60s
+ *         completed-row cooldown (no window to swallow a real change, no
+ *         window to wait out for a no-op).
+ *  FIX-4  Native Rillet voids reconcile from durable active mapping state;
+ *         unsupported providers preserve their prior disposition behavior.
+ *
+ * The journal POLICY routing itself (push vs Excluded vs Warning, metadata,
+ * granularity) is shared by construction — both the legacy path and the
+ * reconciler call planJournalPostingFromState — so these tests pin the
+ * GATE translation (which states produce a plan at all), not the policy
+ * table.
+ */
+import { resolvePostingSyncSettings } from "@carbon/ee/accounting";
+import { asCarbonOwnedSettings } from "@carbon/ee/sync";
+import { describe, expect, it } from "vitest";
+import {
+  getJournalPostingDecision,
+  shouldEnqueueMissingDocument
+} from "./accounting-sync-operations";
+import {
+  computeReconcileDecision,
+  type ReconcileContext,
+  type ReconcileEntityInput
+} from "./reconcile";
+
+const settings = resolvePostingSyncSettings({
+  settings: { postingSync: { enabled: true } }
+});
+
+const baseContext: ReconcileContext = {
+  journalEntryPushEnabled: true,
+  entityPushEnabled: true,
+  providerSupportsPaymentPush: true,
+  settings: asCarbonOwnedSettings(settings),
+  docSync: {
+    invoiceEnabled: true,
+    billEnabled: true,
+    chargeEnabled: true,
+    chargeCreditEnabled: false
+  },
+  inventoryAdjustmentEnabled: false,
+  paymentFamily: null
+};
+
+function input(
+  overrides: Partial<ReconcileEntityInput> & {
+    entityType: ReconcileEntityInput["entityType"];
+  }
+): ReconcileEntityInput {
+  return {
+    entityId: "entity_1",
+    snapshot: null,
+    hasMappingWithExternalId: false,
+    lastSyncedAt: null,
+    hasLiveOperation: false,
+    latestOperation: null,
+    context: baseContext,
+    ...overrides
+  };
+}
+
+function kinds(decision: ReturnType<typeof computeReconcileDecision>) {
+  return decision.actions.map((action) => action.kind);
+}
+
+// ── Journals ────────────────────────────────────────────────────────────────
+
+describe("golden: journals", () => {
+  it("posted + uncovered ⇔ legacy INSERT-born-Posted enqueue", () => {
+    // Legacy gate:
+    expect(
+      getJournalPostingDecision({
+        operation: "INSERT",
+        recordId: "je_1",
+        new: { status: "Posted", reversalOfId: null },
+        old: null
+      }).action
+    ).toBe("enqueue");
+
+    // Reconcile (Purchase Receipt is push-enabled by policy default):
+    const decision = computeReconcileDecision(
+      input({
+        entityType: "journalEntry",
+        entityId: "je_1",
+        snapshot: { status: "Posted", sourceType: "Purchase Receipt" },
+        journalCoverage: { normalCovered: false, reversalCovered: false }
+      })
+    );
+    expect(kinds(decision)).toEqual(["enqueue"]);
+    const action = decision.actions[0];
+    if (action?.kind === "enqueue") {
+      expect(action.request.entityId).toBe("je_1");
+      expect(action.request.metadata).toMatchObject({
+        sourceType: "Purchase Receipt"
+      });
+    }
+  });
+
+  it("doc-backed source type ⇔ legacy terminal Excluded", () => {
+    const decision = computeReconcileDecision(
+      input({
+        entityType: "journalEntry",
+        entityId: "je_1",
+        snapshot: { status: "Posted", sourceType: "Purchase Invoice" },
+        journalCoverage: { normalCovered: false, reversalCovered: false }
+      })
+    );
+    expect(kinds(decision)).toEqual(["record-terminal"]);
+    const action = decision.actions[0];
+    if (action?.kind === "record-terminal") {
+      expect(action.request.status).toBe("Excluded");
+      expect(action.request.errorCode).toBe("DOC_BACKED");
+    }
+  });
+
+  it("posted + covered ⇔ legacy same-status-UPDATE skip", () => {
+    expect(
+      getJournalPostingDecision({
+        operation: "UPDATE",
+        recordId: "je_1",
+        new: { status: "Posted" },
+        old: { status: "Posted" }
+      }).action
+    ).toBe("skip");
+
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "journalEntry",
+            entityId: "je_1",
+            snapshot: { status: "Posted", sourceType: "Purchase Receipt" },
+            journalCoverage: { normalCovered: true, reversalCovered: false }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("reversed + only reversal uncovered ⇔ legacy Reversed-transition enqueue of the :reversal id", () => {
+    expect(
+      getJournalPostingDecision({
+        operation: "UPDATE",
+        recordId: "je_1",
+        new: { status: "Reversed" },
+        old: { status: "Posted" }
+      })
+    ).toMatchObject({ action: "enqueue", entityId: "je_1:reversal" });
+
+    const decision = computeReconcileDecision(
+      input({
+        entityType: "journalEntry",
+        entityId: "je_1",
+        snapshot: { status: "Reversed", sourceType: "Purchase Receipt" },
+        journalCoverage: { normalCovered: true, reversalCovered: false }
+      })
+    );
+    expect(kinds(decision)).toEqual(["enqueue"]);
+    const action = decision.actions[0];
+    if (action?.kind === "enqueue") {
+      expect(action.request.entityId).toBe("je_1:reversal");
+      expect(action.request.metadata).toMatchObject({ reversal: true });
+    }
+  });
+
+  it("reversed + fully uncovered produces BOTH dispositions (sweep-heal semantics)", () => {
+    const decision = computeReconcileDecision(
+      input({
+        entityType: "journalEntry",
+        entityId: "je_1",
+        snapshot: { status: "Reversed", sourceType: "Purchase Receipt" },
+        journalCoverage: { normalCovered: false, reversalCovered: false }
+      })
+    );
+    expect(kinds(decision)).toEqual(["enqueue", "enqueue"]);
+  });
+
+  it("reversal entry row ⇔ legacy reversalOfId-INSERT skip", () => {
+    expect(
+      getJournalPostingDecision({
+        operation: "INSERT",
+        recordId: "je_2",
+        new: { status: "Posted", reversalOfId: "je_1" },
+        old: null
+      }).action
+    ).toBe("skip");
+
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "journalEntry",
+            entityId: "je_2",
+            snapshot: {
+              status: "Posted",
+              sourceType: "Purchase Receipt",
+              reversalOfId: "je_1"
+            }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("draft journal ⇔ legacy draft-INSERT skip", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "journalEntry",
+            entityId: "je_1",
+            snapshot: { status: "Draft", sourceType: "Purchase Receipt" }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("posting sync disabled ⇔ legacy handler gate skip", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "journalEntry",
+            entityId: "je_1",
+            snapshot: { status: "Posted", sourceType: "Purchase Receipt" },
+            journalCoverage: { normalCovered: false, reversalCovered: false },
+            context: { ...baseContext, journalEntryPushEnabled: false }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+});
+
+// ── Documents ───────────────────────────────────────────────────────────────
+
+describe("golden: charges", () => {
+  // A Charge/Credit charge as a provider charge object — the same
+  // document rules as bills/invoices, with the card statuses.
+  const postedCharge = { status: "Posted", updatedAt: "2026-08-12T01:00:00Z" };
+
+  it("posted + lost event (no ops, no mapping) ⇔ enqueue", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({ entityType: "charge", snapshot: postedCharge })
+        )
+      )
+    ).toEqual(["enqueue"]);
+  });
+
+  it("phantom success (latest Completed, no mapping) ⇔ enqueue", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "charge",
+            snapshot: postedCharge,
+            latestOperation: {
+              id: "op_1",
+              status: "Completed",
+              errorCode: null,
+              attemptCount: 1,
+              createdAt: "2026-08-12T00:00:00Z"
+            }
+          })
+        )
+      )
+    ).toEqual(["enqueue"]);
+  });
+
+  it("mapped ⇔ nothing", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "charge",
+            snapshot: postedCharge,
+            hasMappingWithExternalId: true
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("Draft ⇔ nothing (only Posted pushes)", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "charge",
+            snapshot: { status: "Draft", updatedAt: "2026-08-12T01:00:00Z" }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("charge push disabled ⇔ nothing", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "charge",
+            snapshot: postedCharge,
+            context: { ...baseContext, entityPushEnabled: false }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("a Charge's own journal records DOC_BACKED terminal instead of pushing", () => {
+    const decision = computeReconcileDecision(
+      input({
+        entityType: "journalEntry",
+        snapshot: {
+          status: "Posted",
+          sourceType: "Charge",
+          reversalOfId: null
+        },
+        charge: { type: "Charge", hasSupplier: true }
+      })
+    );
+    expect(kinds(decision)).toEqual(["record-terminal"]);
+  });
+
+  it("a statement Payment's journal still pushes", () => {
+    const decision = computeReconcileDecision(
+      input({
+        entityType: "journalEntry",
+        snapshot: {
+          status: "Posted",
+          sourceType: "Charge",
+          reversalOfId: null
+        },
+        charge: { type: "Payment", hasSupplier: false }
+      })
+    );
+    expect(kinds(decision)).toEqual(["enqueue"]);
+  });
+});
+
+describe("golden: documents", () => {
+  const openBill = { status: "Open", updatedAt: "2026-08-12T01:00:00Z" };
+
+  it("posted + lost event (no ops, no mapping) ⇔ sweep diff enqueue", () => {
+    expect(
+      shouldEnqueueMissingDocument({
+        hasMapping: false,
+        hasLiveOperation: false,
+        latestOperationStatus: null
+      })
+    ).toBe(true);
+
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({ entityType: "bill", snapshot: openBill })
+        )
+      )
+    ).toEqual(["enqueue"]);
+  });
+
+  it("phantom success (latest Completed, no mapping) ⇔ sweep diff enqueue", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "bill",
+            snapshot: openBill,
+            latestOperation: {
+              id: "op_1",
+              status: "Completed",
+              errorCode: null,
+              attemptCount: 1,
+              createdAt: "2026-08-12T00:00:00Z"
+            }
+          })
+        )
+      )
+    ).toEqual(["enqueue"]);
+  });
+
+  it("mapped ⇔ sweep diff nothing", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "bill",
+            snapshot: openBill,
+            hasMappingWithExternalId: true
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("live operation ⇔ absorbed", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "bill",
+            snapshot: openBill,
+            hasLiveOperation: true
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("Warning UNMAPPED_ACCOUNTS + backing journal now posted ⇔ sweep re-drive", () => {
+    const decision = computeReconcileDecision(
+      input({
+        entityType: "bill",
+        snapshot: openBill,
+        hasPostedBackingJournal: true,
+        latestOperation: {
+          id: "op_1",
+          status: "Warning",
+          errorCode: "UNMAPPED_ACCOUNTS",
+          attemptCount: 2,
+          createdAt: "2026-08-12T00:00:00Z"
+        }
+      })
+    );
+    expect(decision.actions).toEqual([
+      { kind: "re-drive", operationId: "op_1" }
+    ]);
+  });
+
+  it("re-drive respects the attempt cap and the missing-journal condition", () => {
+    const parked = {
+      id: "op_1",
+      status: "Warning",
+      errorCode: "UNMAPPED_ACCOUNTS",
+      attemptCount: 5,
+      createdAt: "2026-08-12T00:00:00Z"
+    };
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "bill",
+            snapshot: { status: "Open", updatedAt: "2026-08-11T00:00:00Z" },
+            hasPostedBackingJournal: true,
+            latestOperation: parked
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "bill",
+            snapshot: { status: "Open", updatedAt: "2026-08-11T00:00:00Z" },
+            hasPostedBackingJournal: false,
+            latestOperation: { ...parked, attemptCount: 1 }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("FIX-1: draft and mid-posting documents reconcile to nothing", () => {
+    for (const status of ["Draft", "Pending"]) {
+      expect(
+        kinds(
+          computeReconcileDecision(
+            input({ entityType: "bill", snapshot: { status } })
+          )
+        )
+      ).toEqual(["nothing"]);
+    }
+  });
+
+  it("FIX-2: a parked Failed document re-enqueues only when edited after the failure", () => {
+    const failed = {
+      id: "op_1",
+      status: "Failed",
+      errorCode: null,
+      attemptCount: 1,
+      createdAt: "2026-08-12T00:00:00Z"
+    };
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "bill",
+            snapshot: { status: "Open", updatedAt: "2026-08-12T01:00:00Z" },
+            latestOperation: failed
+          })
+        )
+      )
+    ).toEqual(["enqueue"]);
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "bill",
+            snapshot: { status: "Open", updatedAt: "2026-08-11T00:00:00Z" },
+            latestOperation: failed
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("push disabled ⇔ config-gate nothing", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "invoice",
+            snapshot: { status: "Submitted" },
+            context: { ...baseContext, entityPushEnabled: false }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+});
+
+// ── Payments ────────────────────────────────────────────────────────────────
+
+describe("golden: payments", () => {
+  it("posted + no ops ⇔ legacy Posted-transition enqueue / sweep no-op-rows rule", () => {
+    // Legacy oracle (getPaymentPushDecision, deleted with v5): a transition
+    // to Posted enqueued the payment row id — state-shaped, that is a
+    // Posted payment with no recorded push operation.
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "payment",
+            entityId: "pay_1",
+            snapshot: { status: "Posted" }
+          })
+        )
+      )
+    ).toEqual(["enqueue"]);
+  });
+
+  it("posted with a recorded op ⇔ covered", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "payment",
+            snapshot: { status: "Posted" },
+            latestOperation: {
+              id: "op_1",
+              status: "Skipped",
+              errorCode: null,
+              attemptCount: 1,
+              createdAt: "2026-08-12T00:00:00Z"
+            }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("draft ⇔ legacy draft-INSERT skip", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({ entityType: "payment", snapshot: { status: "Draft" } })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("provider without payment push ⇔ nothing", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "payment",
+            snapshot: { status: "Posted" },
+            context: { ...baseContext, providerSupportsPaymentPush: false }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("re-drives a payment parked UNSYNCED_DOCUMENT once its settled document is mapped", () => {
+    // The dependency-chain heal: invoice fails -> payment parks -> invoice
+    // syncs -> the payment must follow without a human retry (mirror of
+    // the bill UNMAPPED_ACCOUNTS re-drive).
+    const parked = {
+      id: "op_1",
+      status: "Warning",
+      errorCode: "UNSYNCED_DOCUMENT",
+      attemptCount: 3,
+      createdAt: "2026-08-12T00:00:00Z"
+    };
+    expect(
+      computeReconcileDecision(
+        input({
+          entityType: "payment",
+          snapshot: { status: "Posted" },
+          latestOperation: parked,
+          settledDocumentMapped: true
+        })
+      ).actions
+    ).toEqual([{ kind: "re-drive", operationId: "op_1" }]);
+
+    // Still unmapped -> stays parked; attempt cap respected
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "payment",
+            snapshot: { status: "Posted" },
+            latestOperation: parked,
+            settledDocumentMapped: false
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "payment",
+            snapshot: { status: "Posted" },
+            latestOperation: { ...parked, attemptCount: 5 },
+            settledDocumentMapped: true
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("unsupported native-void adapter preserves the prior payment disposition", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "payment",
+            snapshot: { status: "Voided" },
+            latestOperation: {
+              id: "op_1",
+              status: "Completed",
+              errorCode: null,
+              attemptCount: 1,
+              createdAt: "2026-08-12T00:00:00Z"
+            }
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+});
+
+// ── Master data ─────────────────────────────────────────────────────────────
+
+describe("golden: master data", () => {
+  it("no mapping ⇔ legacy enqueue-on-any-write", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "customer",
+            snapshot: { updatedAt: "2026-08-12T01:00:00Z" }
+          })
+        )
+      )
+    ).toEqual(["enqueue"]);
+  });
+
+  it("FIX-3: unchanged since last sync ⇔ nothing (replaces the 60s cooldown)", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "customer",
+            snapshot: { updatedAt: "2026-08-12T00:00:00Z" },
+            hasMappingWithExternalId: true,
+            lastSyncedAt: "2026-08-12T00:30:00Z"
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("FIX-3: changed after last sync ⇔ enqueue immediately (no cooldown window to swallow it)", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "customer",
+            snapshot: { updatedAt: "2026-08-12T01:00:00Z" },
+            hasMappingWithExternalId: true,
+            lastSyncedAt: "2026-08-12T00:30:00Z"
+          })
+        )
+      )
+    ).toEqual(["enqueue"]);
+  });
+
+  /**
+   * The executor loads `lastSyncedAt` through Kysely, where node-postgres
+   * decodes timestamptz as a `Date` while the generated types say `string`;
+   * `snapshot.updatedAt` arrives from supabase-js as a PostgREST string.
+   * Comparing those two directly coerces the string to NaN, so the check
+   * above silently never fired and every master-data row edited inside the
+   * 7-day sweep window re-enqueued a no-op push twice an hour. These pin the
+   * REAL argument shapes, not two matching ISO strings.
+   */
+  it("FIX-3: unchanged, with the Date the executor actually passes ⇔ nothing", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "vendor",
+            snapshot: { updatedAt: "2026-09-26T05:59:30.25629+00:00" },
+            hasMappingWithExternalId: true,
+            lastSyncedAt: new Date("2026-09-26T05:59:32.765Z")
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("FIX-3: changed, with the Date the executor actually passes ⇔ enqueue", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "vendor",
+            snapshot: { updatedAt: "2026-09-26T06:30:00.123456+00:00" },
+            hasMappingWithExternalId: true,
+            lastSyncedAt: new Date("2026-09-26T05:59:32.765Z")
+          })
+        )
+      )
+    ).toEqual(["enqueue"]);
+  });
+
+  it("FIX-3: same instant in two spellings ⇔ nothing", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({
+            entityType: "vendor",
+            snapshot: { updatedAt: "2026-09-26T05:59:32.765+00:00" },
+            hasMappingWithExternalId: true,
+            lastSyncedAt: new Date("2026-09-26T05:59:32.765Z")
+          })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+
+  it("deleted row ⇔ legacy DELETE skip", () => {
+    expect(
+      kinds(
+        computeReconcileDecision(
+          input({ entityType: "customer", snapshot: null })
+        )
+      )
+    ).toEqual(["nothing"]);
+  });
+});
+
+describe("Rillet mapped void reconciliation", () => {
+  it("parks an attempted but unmapped charge void for explicit remote verification", () => {
+    const source = input({
+      entityType: "charge",
+      snapshot: { status: "Voided" },
+      hasUnvoidedPushMapping: false,
+      context: { ...baseContext, providerSupportsNativeVoid: true },
+      latestOperation: {
+        id: "ambiguous-create",
+        status: "Failed",
+        errorCode: "API_ERROR",
+        attemptCount: 1,
+        createdAt: "2026-09-09T10:00:00Z"
+      }
+    });
+    expect(computeReconcileDecision(source).actions).toEqual([
+      {
+        kind: "record-terminal",
+        request: expect.objectContaining({
+          entityType: "charge",
+          status: "Warning",
+          errorCode: "UNCONFIRMED_REMOTE_VOID"
+        })
+      }
+    ]);
+    expect(
+      kinds(
+        computeReconcileDecision({
+          ...source,
+          latestOperation: {
+            ...source.latestOperation!,
+            status: "Warning",
+            errorCode: "UNCONFIRMED_REMOTE_VOID"
+          }
+        })
+      )
+    ).toEqual(["nothing"]);
+    expect(
+      kinds(computeReconcileDecision({ ...source, latestOperation: null }))
+    ).toEqual(["nothing"]);
+    expect(
+      kinds(computeReconcileDecision({ ...source, hasLiveOperation: true }))
+    ).toEqual(["nothing"]);
+  });
+
+  it.each([
+    "invoice",
+    "bill",
+    "payment"
+  ] as const)("enqueues %s void after Completed creation until all native mappings are voided", (entityType) => {
+    const source = input({
+      entityType,
+      snapshot: { status: "Voided" },
+      hasUnvoidedPushMapping: true,
+      context: { ...baseContext, providerSupportsNativeVoid: true },
+      latestOperation: {
+        id: "op-post",
+        status: "Completed",
+        errorCode: null,
+        attemptCount: 1,
+        createdAt: "2026-09-09T10:00:00Z"
+      }
+    });
+    expect(kinds(computeReconcileDecision(source))).toEqual(["enqueue"]);
+    expect(
+      kinds(computeReconcileDecision({ ...source, hasLiveOperation: true }))
+    ).toEqual(["nothing"]);
+    expect(
+      kinds(
+        computeReconcileDecision({ ...source, hasUnvoidedPushMapping: false })
+      )
+    ).toEqual(["nothing"]);
+    expect(
+      kinds(
+        computeReconcileDecision({
+          ...source,
+          context: { ...source.context, providerSupportsNativeVoid: false }
+        })
+      )
+    ).toEqual(["nothing"]);
+    expect(
+      kinds(
+        computeReconcileDecision({
+          ...source,
+          latestOperation: { ...source.latestOperation!, status: "Failed" }
+        })
+      )
+    ).toEqual(["re-drive"]);
+  });
+});
+
+// ── Credit memos / supplier credits ─────────────────────────────────────────
+
+describe("golden: credit memos and supplier credits", () => {
+  /**
+   * The bug this pins: both types were wired into the entity union, the snapshot
+   * tables, the table map, the subscriptions and the outbound sweep, but had no
+   * arm in `computeReconcileDecision` — so every ref fell through to `default`
+   * and returned `nothing("... is not reconciled")`. With the family in
+   * `documents` mode the memo's journal is excluded as DOC_BACKED at the same
+   * time, so the credit reached neither the provider's GL nor its subledger, and
+   * nothing failed. No test in this file referenced either type.
+   */
+  for (const entityType of ["creditMemo", "supplierCredit"] as const) {
+    it(`enqueues a posted unmapped ${entityType}`, () => {
+      const decision = computeReconcileDecision(
+        input({
+          entityType,
+          entityId: "memo_1",
+          snapshot: {
+            id: "memo_1",
+            status: "Posted",
+            updatedAt: "2026-09-01T00:00:00.000Z"
+          } as never
+        })
+      );
+      expect(kinds(decision)).toContain("enqueue");
+    });
+
+    it(`leaves a Draft ${entityType} alone`, () => {
+      const decision = computeReconcileDecision(
+        input({
+          entityType,
+          entityId: "memo_1",
+          snapshot: {
+            id: "memo_1",
+            status: "Draft",
+            updatedAt: "2026-09-01T00:00:00.000Z"
+          } as never
+        })
+      );
+      expect(kinds(decision)).toEqual(["nothing"]);
+      expect(decision.actions[0]).toMatchObject({
+        kind: "nothing",
+        reason: expect.stringMatching(/not posted/i)
+      });
+    });
+
+    it(`does not re-enqueue an already-mapped ${entityType}`, () => {
+      // Without `creditMemo`/`supplierCredit` in the executor's MAPPED_TYPES,
+      // `hasMappingWithExternalId` was always false and every pass duplicated
+      // the push.
+      const decision = computeReconcileDecision(
+        input({
+          entityType,
+          entityId: "memo_1",
+          hasMappingWithExternalId: true,
+          lastSyncedAt: "2026-09-02T00:00:00.000Z",
+          snapshot: {
+            id: "memo_1",
+            status: "Posted",
+            updatedAt: "2026-09-01T00:00:00.000Z"
+          } as never
+        })
+      );
+      expect(kinds(decision)).toEqual(["nothing"]);
+    });
+  }
+});

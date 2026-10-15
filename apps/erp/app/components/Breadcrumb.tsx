@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { Button, cn, getValidChildren, PrefetchLink } from "@carbon/react";
+import { useLingui } from "@lingui/react/macro";
+import type { ComponentProps } from "react";
+import { cloneElement, createContext, forwardRef, useContext } from "react";
+import type { LinkProps } from "react-router";
+
+const Breadcrumbs = forwardRef<
+  HTMLElement,
+  ComponentProps<"nav"> & {
+    useReactRouter?: boolean;
+  }
+>(({ className, children, useReactRouter = true, ...props }, ref) => {
+  const { t } = useLingui();
+  const validChildren = getValidChildren(children);
+  const count = validChildren.length;
+  const clones = validChildren.map((child, index) =>
+    cloneElement(child, {
+      isFirstChild: index === 0,
+      isLastChild: index === count - 1
+    })
+  );
+  return (
+    <nav
+      aria-label={t`Breadcrumb`}
+      ref={ref}
+      className={cn("reset flex", className)}
+      {...props}
+    >
+      <ol className="inline-flex items-center space-x-1">{clones}</ol>
+    </nav>
+  );
+});
+Breadcrumbs.displayName = "Breadcrumbs";
+
+// Whether the item a link sits in is the trail's last. Only the last crumb
+// (the current page) reads at full strength.
+const BreadcrumbPositionContext = createContext({ isLastChild: true });
+
+const BreadcrumbItem = forwardRef<
+  HTMLLIElement,
+  ComponentProps<"li"> & {
+    isFirstChild?: boolean;
+    isLastChild?: boolean;
+  }
+>(({ className, children, isFirstChild, isLastChild, ...props }, ref) => (
+  <li
+    ref={ref}
+    className={cn("inline-flex items-center", className)}
+    {...props}
+  >
+    {!isFirstChild && <span className="text-muted-foreground">/</span>}
+    <BreadcrumbPositionContext.Provider
+      value={{ isLastChild: isLastChild ?? true }}
+    >
+      {children}
+    </BreadcrumbPositionContext.Provider>
+  </li>
+));
+BreadcrumbItem.displayName = "BreadcrumbItem";
+
+const BreadcrumbLink = forwardRef<
+  HTMLAnchorElement,
+  LinkProps & {
+    isCurrentPage?: boolean;
+  }
+>(({ className, children, isCurrentPage, ...props }, ref) => {
+  const { isLastChild } = useContext(BreadcrumbPositionContext);
+  return (
+    <Button
+      variant="ghost"
+      className={cn(
+        "px-2 outline-none focus-visible:ring-transparent",
+        !isLastChild && "text-muted-foreground hover:text-foreground",
+        className
+      )}
+      asChild
+    >
+      {isCurrentPage ? (
+        <span aria-current="page" ref={ref} {...props}>
+          {children}
+        </span>
+      ) : (
+        <PrefetchLink ref={ref} {...props}>
+          {children}
+        </PrefetchLink>
+      )}
+    </Button>
+  );
+});
+BreadcrumbLink.displayName = "BreadcrumbLink";
+
+export { BreadcrumbItem, BreadcrumbLink, Breadcrumbs };

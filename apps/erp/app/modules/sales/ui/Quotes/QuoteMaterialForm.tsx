@@ -1,0 +1,320 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useCarbon } from "@carbon/auth";
+import { ValidatedForm } from "@carbon/form";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  Copy,
+  toast,
+  VStack
+} from "@carbon/react";
+import { getItemReadableId } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useCallback, useEffect, useState } from "react";
+import { useFetcher, useLocation, useNavigate, useParams } from "react-router";
+import type { z } from "zod";
+import {
+  DefaultMethodType,
+  Hidden,
+  InputControlled,
+  Item,
+  NumberControlled,
+  Select,
+  Submit,
+  UnitOfMeasure
+} from "~/components/Form";
+import { itemTypeLabel } from "~/components/Form/itemTypeLabel";
+import { usePermissions, useUrlParams } from "~/hooks";
+import { lookupBuyPrice as lookupBuyPriceAsync } from "~/modules/items";
+import type { MethodItemType, MethodType } from "~/modules/shared";
+import { useItems } from "~/stores";
+import { path } from "~/utils/path";
+import type { quoteOperationValidator } from "../../sales.models";
+import { quoteMaterialValidator } from "../../sales.models";
+
+type QuoteMaterialFormProps = {
+  initialValues: z.infer<typeof quoteMaterialValidator> & {
+    quoteMaterialMakeMethodId: string | null;
+    item?: { replenishmentSystem: string | null } | null;
+  };
+  operations: z.infer<typeof quoteOperationValidator>[];
+};
+
+const QuoteMaterialForm = ({
+  initialValues,
+  operations
+}: QuoteMaterialFormProps) => {
+  const { t, i18n } = useLingui();
+  const fetcher = useFetcher<{ id: string; methodType: MethodType }>();
+  const { carbon } = useCarbon();
+  const permissions = usePermissions();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const { quoteId, lineId, materialId } = useParams();
+  if (!quoteId) throw new Error("quoteId not found");
+  if (!lineId) throw new Error("lineId not found");
+  if (!materialId) throw new Error("materialId not found");
+
+  const [itemType, setItemType] = useState<MethodItemType>(
+    initialValues.itemType
+  );
+  const [itemData, setItemData] = useState<{
+    itemId: string;
+    methodType: MethodType;
+    description: string;
+    unitCost: number;
+    unitCostSource: "system" | "manual";
+    unitOfMeasureCode: string;
+    quantity: number;
+    itemReplenishmentSystem: string;
+  }>({
+    itemId: initialValues.itemId ?? "",
+    methodType: initialValues.methodType ?? "Pull from Inventory",
+    description: initialValues.description ?? "",
+    unitCost: initialValues.unitCost ?? 0,
+    unitCostSource:
+      initialValues.unitCostSource === "manual" ? "manual" : "system",
+    unitOfMeasureCode: initialValues.unitOfMeasureCode ?? "EA",
+    quantity: initialValues.quantity ?? 1,
+    itemReplenishmentSystem: initialValues.item?.replenishmentSystem ?? "Buy"
+  });
+
+  const onTypeChange = (value: MethodItemType | "Item") => {
+    if (value === itemType) return;
+    setItemType(value as MethodItemType);
+    setItemData({
+      itemId: "",
+      methodType: "" as "Pull from Inventory",
+      quantity: 1,
+      description: "",
+      unitCost: 0,
+      unitCostSource: "system",
+      unitOfMeasureCode: "EA",
+      itemReplenishmentSystem: "Buy"
+    });
+  };
+
+  const lookupBuyPrice = useCallback(
+    async (itemId: string, qty: number, fallbackCost: number) => {
+      return lookupBuyPriceAsync(carbon, itemId, qty, fallbackCost);
+    },
+    [carbon]
+  );
+
+  const onItemChange = async (itemId: string) => {
+    if (!carbon) return;
+
+    const [item, itemCost] = await Promise.all([
+      carbon
+        .from("item")
+        .select(
+          "name, readableIdWithRevision, unitOfMeasureCode, defaultMethodType, replenishmentSystem"
+        )
+        .eq("id", itemId)
+        .single(),
+      carbon.from("itemCost").select("unitCost").eq("itemId", itemId).single()
+    ]);
+
+    if (item.error) {
+      toast.error(t`Failed to load item details`);
+      return;
+    }
+
+    let unitCost = itemCost.data?.unitCost ?? 0;
+    const isBuyPart = item.data?.defaultMethodType === "Purchase to Order";
+
+    if (isBuyPart) {
+      unitCost = await lookupBuyPrice(itemId, itemData.quantity ?? 1, unitCost);
+    }
+
+    setItemData((d) => ({
+      ...d,
+      itemId,
+      description: item.data?.name ?? "",
+      unitCost,
+      unitCostSource: "system",
+      unitOfMeasureCode: item.data?.unitOfMeasureCode ?? "EA",
+      methodType: item.data?.defaultMethodType ?? "Purchase to Order",
+      itemReplenishmentSystem: item.data?.replenishmentSystem ?? "Buy"
+    }));
+  };
+
+  const onQuantityChange = useCallback(
+    async (newQty: number) => {
+      setItemData((d) => ({ ...d, quantity: newQty }));
+
+      if (itemData.methodType !== "Purchase to Order" || !itemData.itemId)
+        return;
+      // A typed cost survives a quantity change.
+      if (itemData.unitCostSource === "manual") return;
+      if (!carbon) return;
+
+      const itemCost = await carbon
+        .from("itemCost")
+        .select("unitCost")
+        .eq("itemId", itemData.itemId)
+        .single();
+
+      const fallbackCost = itemCost.data?.unitCost ?? 0;
+      const unitCost = await lookupBuyPrice(
+        itemData.itemId,
+        newQty,
+        fallbackCost
+      );
+
+      // Re-checked here because the guard above reads a captured value, and a
+      // cost can be typed while the awaits are in flight.
+      setItemData((d) =>
+        d.unitCostSource === "manual" ? d : { ...d, unitCost }
+      );
+    },
+    [
+      carbon,
+      itemData.methodType,
+      itemData.itemId,
+      itemData.unitCostSource,
+      lookupBuyPrice
+    ]
+  );
+
+  const [, setSearchParams] = useUrlParams();
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  useEffect(() => {
+    const newPath = path.to.quoteLineMakeMethod(
+      quoteId,
+      lineId,
+      initialValues.quoteMaterialMakeMethodId!
+    );
+
+    setSearchParams({ materialId: initialValues.id ?? null });
+    navigate(newPath);
+  }, [
+    fetcher.data,
+    initialValues,
+    initialValues.id,
+    initialValues.methodType,
+    initialValues.quoteMaterialMakeMethodId,
+    lineId,
+    location.pathname,
+    navigate,
+    quoteId
+  ]);
+
+  const [items] = useItems();
+  const itemReadableId = getItemReadableId(items, itemData.itemId);
+
+  return (
+    <Card>
+      <ValidatedForm
+        method="post"
+        action={path.to.quoteMaterial(quoteId, lineId, initialValues?.id!)}
+        defaultValues={initialValues}
+        fetcher={fetcher}
+        validator={quoteMaterialValidator}
+      >
+        <CardHeader>
+          <CardTitle className="line-clamp-2">{itemData.description}</CardTitle>
+          <CardDescription className="flex items-center gap-2">
+            {itemReadableId} <Copy text={itemReadableId ?? ""} />
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Hidden name="quoteMakeMethodId" />
+
+          {itemData.methodType === "Make to Order" && (
+            <Hidden name="unitCost" value={itemData.unitCost} />
+          )}
+          <Hidden name="order" />
+          <Hidden name="unitCostSource" value={itemData.unitCostSource} />
+          <VStack className="pt-4">
+            <div className="grid w-full gap-x-8 gap-y-4 grid-cols-1 lg:grid-cols-3">
+              <Item
+                name="itemId"
+                label={i18n._(itemTypeLabel(itemType))}
+                type={itemType}
+                includeInactive
+                onChange={(value) => {
+                  onItemChange(value?.value as string);
+                }}
+                onTypeChange={onTypeChange}
+              />
+              <InputControlled
+                name="description"
+                label={t`Description`}
+                value={itemData.description}
+                onChange={(newValue) => {
+                  setItemData((d) => ({ ...d, description: newValue }));
+                }}
+              />
+              <Select
+                name="quoteOperationId"
+                label={t`Operation`}
+                isClearable
+                options={operations.map((o) => ({
+                  value: o.id!,
+                  label: o.description
+                }))}
+                termId="operation"
+              />
+
+              <DefaultMethodType
+                name="methodType"
+                label={t`Method Type`}
+                value={itemData.methodType}
+                replenishmentSystem={itemData.itemReplenishmentSystem}
+                termId="method-type"
+              />
+              <NumberControlled
+                name="quantity"
+                label={t`Quantity per Parent`}
+                value={itemData.quantity}
+                onChange={onQuantityChange}
+              />
+              <UnitOfMeasure
+                name="unitOfMeasureCode"
+                value={itemData.unitOfMeasureCode}
+                onChange={(newValue) =>
+                  setItemData((d) => ({
+                    ...d,
+                    unitOfMeasureCode: newValue?.value ?? "EA"
+                  }))
+                }
+              />
+              {itemData.methodType !== "Make to Order" && (
+                <NumberControlled
+                  name="unitCost"
+                  label={t`Unit Cost`}
+                  value={itemData.unitCost}
+                  minValue={0}
+                  onChange={(newValue) =>
+                    setItemData((d) => ({
+                      ...d,
+                      unitCost: newValue,
+                      unitCostSource: "manual"
+                    }))
+                  }
+                />
+              )}
+            </div>
+          </VStack>
+        </CardContent>
+        <CardFooter>
+          <Submit isDisabled={!permissions.can("update", "sales")}>
+            <Trans>Save</Trans>
+          </Submit>
+        </CardFooter>
+      </ValidatedForm>
+    </Card>
+  );
+};
+
+export default QuoteMaterialForm;

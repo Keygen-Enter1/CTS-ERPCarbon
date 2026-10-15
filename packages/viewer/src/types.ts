@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+/**
+ * Shared contracts for animated work instructions. This file IS the contract:
+ * the geometry service writes these shapes into plan.json, the ERP/Inngest
+ * layer stores them on steps, and the player animates them. Change a shape the
+ * geometry service emits only by updating it, the ERP/Inngest layer, and this
+ * package together. `waypoints` is editor-only — the geometry service never
+ * reads or writes it.
+ */
+
+export type Vec3 = [number, number, number];
+
+/** Quaternion as [x, y, z, w] */
+export type Quat = [number, number, number, number];
+
+/** Linear insertion along a vector. Distances in mm, GLB world space. */
+export type LinearMotion = {
+  type: "linear";
+  direction: Vec3;
+  distance: number;
+};
+
+/** Two-segment motion: travel1 then travel2 (insertion order), e.g. slide then drop. */
+export type LMotion = {
+  type: "L";
+  segments: { direction: Vec3; distance: number }[];
+};
+
+/**
+ * Threaded fastener: linear approach along `axis`, then `turns` rotations about
+ * `axis` (through `origin`) advancing `pitch` mm per turn until seated.
+ */
+export type HelixMotion = {
+  type: "helix";
+  axis: Vec3;
+  origin: Vec3;
+  pitch: number;
+  turns: number;
+  /** Linear travel (mm) along `axis` before threading begins */
+  approach: number;
+};
+
+/**
+ * Explicit keyframe path (planner tier 5 / manual freeform).
+ * Keyframes are absolute world poses for the component; `t` is normalized 0..1 and
+ * must be strictly increasing. The last keyframe must equal the component's final
+ * (seated) pose.
+ */
+export type PathMotion = {
+  type: "path";
+  keyframes: { t: number; position: Vec3; quaternion: Quat }[];
+};
+
+/**
+ * Editor-authored path with rotation. Poses are RELATIVE to the moving set's
+ * seated pose: each waypoint turns the set by `rotation` about its seated
+ * center, then shifts it by `offset`. So one motion applies to a single part,
+ * a rigid group, or a whole sub-assembly. First = start, last = seat
+ * (offset [0,0,0], rotation [0,0,0,1]).
+ */
+export type WaypointsMotion = {
+  type: "waypoints";
+  waypoints: { offset: Vec3; rotation: Quat }[];
+};
+
+/** No geometry motion (process-only step: cure, inspect, torque pattern). */
+export type NoneMotion = {
+  type: "none";
+};
+
+/**
+ * Describes the insertion motion of a step's components into the assembly. The
+ * viewer derives removal (the reverse) and start poses from it. The demo
+ * datasets restate the shapes they seed as `AssemblyStepMotionSpec`
+ * (@carbon/database cannot import this package).
+ */
+export type Motion =
+  | LinearMotion
+  | LMotion
+  | HelixMotion
+  | PathMotion
+  | WaypointsMotion
+  | NoneMotion;
+
+/** Step camera. `null` on a step means the viewer auto-frames the active components. */
+export type CameraPose = {
+  position: Vec3;
+  target: Vec3;
+  fov: number;
+};
+
+/**
+ * Planner-baked camera hint: a mesh-precise view DIRECTION (target→eye, unit)
+ * chosen with sight lines against the real triangles of everything installed
+ * earlier. The viewer supplies the rest live — target, standing distance, and
+ * frustum fit at the actual viewport aspect. Distinct from a manual
+ * {@link CameraPose}, which is applied verbatim.
+ */
+export type PlanViewHint = {
+  source: "plan";
+  direction: Vec3;
+};
+
+/** Fastener callout for a step. All fields optional. */
+export type Fastener = {
+  spec?: string;
+  count?: number;
+  torqueNm?: number;
+  tool?: string;
+};
+
+export type AssemblyStep = {
+  id: string;
+  title: string | null;
+  instructionText: string | null;
+  /** Components installed in this step (stable nodeIds from glTF extras/graph.json) */
+  componentNodeIds: string[];
+  motion: Motion;
+  camera: CameraPose | PlanViewHint | null;
+  fastener: Fastener | null;
+  /** Optional authored override for the step's timeline length (seconds) */
+  durationSeconds?: number | null;
+  /**
+   * The planner proved no collision-free path for these components. The player
+   * fades them in at the seated pose instead of synthesizing a fallback
+   * motion — a fabricated path would animate straight through geometry.
+   */
+  flagged?: boolean;
+  /**
+   * Components the author hid on THIS step only (tooling, fixtures, installed
+   * parts blocking the view). Not drawn while this step is active; they return
+   * on the next step. Never applied to the step's own `componentNodeIds`.
+   */
+  hiddenComponentNodeIds?: string[];
+  /**
+   * This row is a sub-assembly (a header): the steps whose `parentStepId` is
+   * its id are built on their own, directly before it. See `subassembly.ts`.
+   */
+  isSubAssembly?: boolean;
+  /** The sub-assembly this step belongs to. `null`/absent = top level. */
+  parentStepId?: string | null;
+  /**
+   * On a header: the later step that fits the finished sub-assembly.
+   * `null`/absent = it joins the main build at the header itself.
+   */
+  usedInStepId?: string | null;
+  /**
+   * The build's orientation from this step on (see `orientation.ts`): a unit
+   * quaternion turning the model frame into the bench frame. `null`/absent =
+   * the same as the previous step in this build.
+   */
+  orientation?: Quat | null;
+};
+
+/** One node of the assembly tree in graph.json. */
+export type AssemblyGraphNode = {
+  /** sha1(geometryHash : parentPath : siblingOrdinal)[:16] */
+  nodeId: string;
+  name: string;
+  isAssembly: boolean;
+  /** null for assemblies */
+  geometryHash: string | null;
+  /** Local transform, column-major 4x4 */
+  transform: number[];
+  /** World-space bounds, mm */
+  bbox: { min: Vec3; max: Vec3 };
+  /** mm^3, leaf nodes only (null for assemblies) */
+  volume: number | null;
+  /** RGBA 0-1 or null */
+  color: [number, number, number, number] | null;
+  children: AssemblyGraphNode[];
+};
+
+/** graph.json as written by the geometry service /convert endpoint. */
+export type AssemblyGraph = {
+  version: 1;
+  /** Normalized output unit (always mm in Phase 0) */
+  unit: "mm";
+  /** Unit declared in the STEP file */
+  sourceUnit: string;
+  /** Count of leaf instances */
+  componentCount: number;
+  /** Assembly tree; root has no geometry */
+  root: AssemblyGraphNode;
+};

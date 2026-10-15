@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { onShapeDataValidator } from "@carbon/ee/onshape";
+import { getLogger } from "@carbon/logger";
+import { serverFns } from "@carbon/server-functions";
+import type { ActionFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { getDatabaseClient } from "~/services/database.server";
+
+const logger = getLogger("erp", "integrations-onshape-sync");
+
+export async function action({ request }: ActionFunctionArgs) {
+  const { client, companyId, userId } = await requirePermissions(request, {
+    update: "parts"
+  });
+
+  const formData = await request.formData();
+  const documentId = formData.get("documentId");
+  const versionId = formData.get("versionId");
+  const elementId = formData.get("elementId");
+
+  const makeMethodId = formData.get("makeMethodId");
+  const rows = formData.get("rows");
+
+  if (!makeMethodId || !rows) {
+    return data(
+      { success: false, message: "Missing required fields" },
+      { status: 400 }
+    );
+  }
+
+  const record = await client
+    .from("makeMethod")
+    .select("itemId, companyId")
+    .eq("id", makeMethodId as string)
+    .single();
+
+  if (record.data?.companyId !== companyId) {
+    return data(
+      { success: false, message: "Invalid make method id" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const parsed = onShapeDataValidator.parse(JSON.parse(rows as string));
+    const serviceRole = await getCarbonServiceRole();
+
+    const synced = await serverFns
+      .system({ db: getDatabaseClient(), companyId, userId })
+      .invoke("sync", {
+        type: "onshape",
+        makeMethodId: makeMethodId as string,
+        data: parsed
+      });
+
+    if (synced.error) {
+      logger.info("Failed to sync onshape data", { error: synced.error });
+      return data(
+        { success: false, message: "Failed to sync onshape data" },
+        { status: 400 }
+      );
+    }
+
+    const itemId = record.data?.itemId as string;
+
+    // Upsert the OnShape mapping in externalIntegrationMapping
+    await serviceRole
+      .from("externalIntegrationMapping")
+      .delete()
+      .eq("entityType", "item")
+      .eq("entityId", itemId)
+      .eq("integration", "onshape")
+      .eq("companyId", companyId);
+
+    await client.from("externalIntegrationMapping").insert({
+      entityType: "item",
+      entityId: itemId,
+      integration: "onshape",
+      metadata: {
+        documentId: documentId as string,
+        versionId: versionId as string,
+        elementId: elementId as string
+      },
+      lastSyncedAt: new Date().toISOString(),
+      companyId
+    });
+  } catch (error) {
+    logger.error("Failed to sync onshape data", { error: error });
+    return data(
+      { success: false, message: "Invalid rows data" },
+      { status: 400 }
+    );
+  }
+
+  return { success: true, message: "Synced successfully" };
+}

@@ -1,0 +1,16 @@
+name: Labeler
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  - pull_request
+
+jobs:
+  labeler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v6
+        with:
+          sync-labels: true

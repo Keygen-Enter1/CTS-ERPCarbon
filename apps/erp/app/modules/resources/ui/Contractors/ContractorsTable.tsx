@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Avatar,
+  HStack,
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo } from "react";
+import { LuPencil, LuTrash } from "react-icons/lu";
+import { useNavigate } from "react-router";
+import { Hyperlink, New, SupplierAvatar, Table } from "~/components";
+import { usePermissions, useUrlParams } from "~/hooks";
+import { useCustomColumns } from "~/hooks/useCustomColumns";
+import type { Contractor } from "~/modules/resources";
+import { useSuppliers } from "~/stores";
+import { path } from "~/utils/path";
+
+type ContractorsTableProps = {
+  data: Contractor[];
+  count: number;
+  // abilities: Partial<Ability>[];
+};
+
+const ContractorsTable = memo(({ data, count }: ContractorsTableProps) => {
+  const { t } = useLingui();
+  const navigate = useNavigate();
+  const permissions = usePermissions();
+  const [params] = useUrlParams();
+
+  const [suppliers] = useSuppliers();
+
+  const customColumns = useCustomColumns<Contractor>("contractor");
+  const columns = useMemo<ColumnDef<Contractor>[]>(() => {
+    const defaultColumns: ColumnDef<Contractor>[] = [
+      {
+        header: t`Contractor`,
+        cell: ({ row }) => (
+          <HStack>
+            <Avatar
+              size="sm"
+              name={row.original.fullName ?? row.original.email ?? "Unknown"}
+            />
+            <Hyperlink
+              to={`${path.to.contractor(
+                row.original.supplierContactId!
+              )}?${params.toString()}`}
+            >
+              {row.original.fullName ?? row.original.email ?? "Unknown"}
+            </Hyperlink>
+          </HStack>
+        ),
+        meta: { mobile: "P1" }
+      },
+      {
+        id: "supplierId",
+        header: t`Supplier`,
+        cell: ({ row }) => (
+          <SupplierAvatar supplierId={row.original.supplierId} />
+        ),
+        meta: {
+          mobile: "P3",
+          filter: {
+            type: "static",
+            options: suppliers.map((supplier) => ({
+              value: supplier.id,
+              label: supplier.name
+            }))
+          }
+        }
+      },
+
+      // {
+      //   id: "abilityIds",
+      //   header: "Abilities",
+      //   cell: ({ row }) => {
+      //     if (!row.original.abilityIds) {
+      //       return null;
+      //     } else if (
+      //       row.original.abilityIds &&
+      //       row.original.abilityIds.length === 1
+      //     ) {
+      //       const ability = abilities.find(
+      //         (a) => a.id === row.original.abilityIds![0]
+      //       );
+      //       return <Enumerable value={ability?.name ?? ""} />;
+      //     } else if (
+      //       row.original.abilityIds &&
+      //       row.original.abilityIds.length > 1
+      //     ) {
+      //       return "Multiple Abilities";
+      //     }
+      //   },
+      //   meta: {
+      //     filter: {
+      //       type: "static",
+      //       options: abilities.map((a) => ({
+      //         value: a.id!,
+      //         label: <Enumerable value={a.name!} />,
+      //       })),
+      //       isArray: true,
+      //     },
+      //     pluralHeader: "Abilities",
+      //   },
+      // },
+      {
+        accessorKey: "hoursPerWeek",
+        header: t`Hours per Week`,
+        cell: (item) => item.getValue(),
+        meta: { mobile: "P2" }
+      }
+    ];
+
+    return [...defaultColumns, ...customColumns];
+  }, [suppliers, customColumns, params, t]);
+
+  const renderContextMenu = useCallback(
+    (row: Contractor) => {
+      return (
+        <>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.edit}
+            onClick={() => {
+              navigate(
+                `${path.to.contractor(
+                  row.supplierContactId!
+                )}?${params.toString()}`
+              );
+            }}
+          >
+            <MenuIcon icon={<LuPencil />} />
+            <Trans>Edit Contractor</Trans>
+          </MenuItem>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.delete}
+            destructive
+            disabled={!permissions.can("delete", "resources")}
+            onClick={() => {
+              navigate(
+                `${path.to.deleteContractor(
+                  row.supplierContactId!
+                )}?${params.toString()}`
+              );
+            }}
+          >
+            <MenuIcon icon={<LuTrash />} />
+            <Trans>Delete Contractor</Trans>
+          </MenuItem>
+        </>
+      );
+    },
+    [navigate, params, permissions]
+  );
+
+  return (
+    <Table<Contractor>
+      data={data}
+      count={count}
+      columns={columns}
+      primaryAction={
+        permissions.can("create", "resources") && (
+          <New label={t`Contractor`} to={`new?${params.toString()}`} />
+        )
+      }
+      renderContextMenu={renderContextMenu}
+      title={t`Contractors`}
+    />
+  );
+});
+
+ContractorsTable.displayName = "ContractorsTable";
+export default ContractorsTable;

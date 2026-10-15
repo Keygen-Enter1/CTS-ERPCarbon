@@ -1,0 +1,312 @@
+---
+paths:
+  - "packages/database/**"
+  - "apps/erp/app/modules/**/*.service.ts"
+  - "apps/mes/app/services/**/*.service.ts"
+---
+
+# Database Access Patterns
+
+How Carbon talks to its database. The DB is **Postgres via Supabase**. Two clients are used:
+
+1. **supabase-js** (`@supabase/supabase-js`) — the default for almost all reads/writes. Goes
+   through PostgREST and is subject to **RLS**.
+2. **Kysely** (`kysely` + `kysely-supabase`) — a typed query builder over a raw `pg` pool.
+   Used only for **multi-row transactions**. **Bypasses RLS** — auth must be enforced at the route.
+
+There is no Prisma/Drizzle/TypeORM here. Do not introduce another ORM.
+
+## Clients (`@carbon/auth`)
+
+All client factories live in `packages/auth/src/lib/supabase/`.
+
+| Factory | Source | RLS? | Use |
+| --- | --- | --- | --- |
+| `getCarbon(accessToken?)` | `client.ts` (anon key + user JWT) | Yes (acts as the user) | Default request-scoped client |
+| `getCarbonServiceRole()` | `client.server.ts` (service role key) | No (bypasses RLS) | Server-only privileged ops, jobs, server functions |
+| `getCarbonAPIKeyClient(apiKey)` | `client.ts` (`carbon-key` header) | Yes | Public API key auth |
+
+`createClient` is configured with `autoRefreshToken: false`, `persistSession: false` and
+`db: { timeout: 25_000 }`. Database retries are supabase-js's own (a read is retried up to three
+times on a rejected fetch, 503 or 520; a write is never replayed; a timed-out call is not retried).
+Storage reads get the same through `global.fetch: storageReadFetch` (`client.ts`): a GET, HEAD or
+listing waits at most 25 s for headers (the body is not timed) and is retried twice on a 5xx or a
+dropped connection; uploads, deletes, auth and function calls pass straight through. Do not
+re-create this config ad hoc, and do not widen that wrapper to database calls: it would multiply
+the SDK's retries.
+
+**Every Supabase client built while handling a request is bound to it** (`requestFetch` in
+`client.server.ts`). `requirePermissions` passes its `Request`; anything else — a
+`getCarbonServiceRole()` deep in a service, the API-key client, `getUserScopedClient` — finds
+it through `currentRequest()` (`@carbon/logger`, set by `requestMiddleware`). Inngest
+steps run as requests to `/api/inngest`, so their clients are bound too (they are POSTs, so
+never cancelled). Outside a request (scripts, module-level clients) nothing is bound.
+
+- **At most 8 calls in flight per request, across all its clients.** Every call waits for one of
+  `REQUEST_CONCURRENCY` slots of one limiter per request (`async.limit`, memoized with
+  `oncePerRequest`), like an HTTP agent's `maxSockets`, so `Promise.all` over a page's queries
+  cannot take every PostgREST connection. A call never waits on another call, so this cannot
+  deadlock.
+- **On a read (GET/HEAD), `request.signal` cancels reads.** When the browser disconnects before
+  the response is done, selects, RPCs and storage reads in flight are cancelled and later ones
+  fail at once with an `AbortError` in `{ error }`, never retried. Not tied to the signal:
+  actions, table writes even on a GET (an OAuth callback saving its tokens), auth and
+  edge-function calls. Error and warning logs from such an abandoned read are dropped
+  (`liveRequest` filter in `@carbon/logger`'s `config.server.ts`), the stance `handleError`
+  already takes. **On Vercel the signal never aborts**: Vercel only aborts it with
+  `supportsCancellation` in `vercel.json`, which also terminates the function when the client
+  disconnects — the app is one function, so actions would die mid-write. Do not enable it.
+  Cancellation therefore applies on ECS and self-hosted only.
+
+Kysely has neither: it is bounded by the process pool below.
+
+### Getting a client in a route
+
+Loaders/actions never construct a client directly. They call `requirePermissions`
+(`packages/auth/src/services/auth.server.ts`), which authenticates the request and returns the
+right client plus context:
+
+```typescript
+import { requirePermissions } from "@carbon/auth/auth.server";
+
+const { client, companyId, userId } = await requirePermissions(request, {
+  view: "sales",          // permission_action, e.g. "sales_view" is checked internally
+});
+```
+
+- It checks the user's claims for the required `<module>_<action>` permission and **redirects on
+  denial**. It also handles the `carbon-key` API-key path (rate limiting, scope checks).
+- Pass `bypassRls: true` to get `getCarbonServiceRole()` instead (only honored for `employee` role).
+- `userId` is the effective user (respects console/impersonation); `sessionUserId` is the raw session user.
+
+## Service functions
+
+DB logic lives in service files, **not** in route handlers:
+
+- ERP: `apps/erp/app/modules/{module}/{module}.service.ts`
+- MES: `apps/mes/app/services/{name}.service.ts`
+
+Each function takes the **client as its first argument** and returns the raw supabase `{ data, error }`
+(it does **not** throw). The route handler inspects `error` and converts it with `flash(request, error(...))`.
+
+```typescript
+import type { Database } from "@carbon/database";
+import type { SupabaseClient } from "@supabase/supabase-js";
+
+export async function getCustomer(client: SupabaseClient<Database>, id: string) {
+  return client.from("customer").select("*").eq("id", id).single();
+}
+```
+
+Conventions (see also `conventions-services.md`):
+
+- Always scope list queries by `companyId` (`.eq("companyId", companyId)`) — defense in depth even though RLS also enforces it.
+- List endpoints take `GenericQueryFilters` and run through `setGenericQueryFilters(query, args, [...])` (`~/utils/query`) for search/sort/pagination.
+- Count/select for list endpoints: prefer `{ count: LIST_COUNT }` (`LIST_COUNT = "estimated"`, `~/utils/query`) over `count: "exact"`. `exact` is `COUNT(*) OVER ()`, which materializes the whole filtered set just to produce a total the UI shows approximately anyway — on 500k `trackedEntity` rows that is 652 ms vs 1.5 ms. `estimated` is a hybrid: PostgREST still returns an exact count below its threshold, so small tenants see no change. Currently used by the ten view-backed endpoints plus `getJobs` and `getTrackedEntities`.
+- The ten endpoints backed by the big multi-join **views** (`parts`, `materials`, `tools`, `consumables`, `services`, `purchaseOrders`, `quotes`, `salesOrders`, `purchaseInvoices`, `salesInvoices`) additionally select an explicit `*_LIST_COLUMNS` constant instead of `select("*")`, so Postgres can prune the views' unreferenced computed columns. Adding a column to one of those tables means adding it to the constant — `apps/erp/test/list-select-columns.test.ts` fails if an `accessorKey` is missing, because the CSV export reads accessors untyped. The rationale lives once on `LIST_COUNT` in `apps/erp/app/utils/query.ts`, not at each constant.
+- Use `sanitize(...)` (re-exported from `@carbon/utils`) to strip empty values before insert/update.
+- Upserts are done either with a manual `id ? update : insert` branch or supabase's native `.upsert(...)`; both are in use.
+- `fetchAllFromTable(client, table, columns, qb)` (from `@carbon/database`) pages through large result sets:
+  the first page alone, then the rest in concurrent waves, and deliberately WITHOUT a count — `count: "exact"`
+  there was a `COUNT(*) OVER ()` on every page (see `LIST_COUNT` above for the same trap on list endpoints).
+
+## N+1 reads
+
+**Never query inside a loop.** Fetching a list and then issuing one query per row turns a page
+into N+1 round trips; at 500 rows that is 500 sequential queries holding 500 connection
+checkouts, and it degrades as the customer's data grows — the tenant with the most data is the
+one it breaks for. `Promise.all` over the same loop is not a fix: it removes the waiting, not the
+queries, and replaces one slow page with a burst that exhausts the pool.
+
+Collect the ids first, then make **one** query:
+
+```typescript
+// No: one query per line.
+const suppliers = await Promise.all(
+  lines.map((line) => client.from("supplier").select("*").eq("id", line.supplierId).single())
+);
+
+// Yes: one query, indexed by id.
+const { data } = await client
+  .from("supplier")
+  .select("id, name")
+  .in("id", [...new Set(lines.map((line) => line.supplierId))])
+  .eq("companyId", companyId);
+const byId = new Map((data ?? []).map((row) => [row.id, row]));
+```
+
+Real precedents: `getWorkflowVersionNumbers` (flat `.in()` lookup instead of a nested embed),
+`getWorkflowRunRecordNames` (groups refs by table, one query per table, never per row).
+
+When the related rows belong to the parent, prefer a **PostgREST embed**
+(`.select("*, salesOrderLine(*)")`) — one request, and the join happens in Postgres. For reads
+that need real aggregation across tables, use a view or an RPC rather than assembling it in
+TypeScript. Over 1000 rows, page with `fetchAllFromTable` — do not loop.
+
+## RPC functions
+
+Heavy/aggregate logic lives in Postgres functions called via `client.rpc("fn_name", { ... }, { count })`.
+Examples: `get_sales_order_lines_by_customer_id`, `get_opportunity_with_related_records`,
+`get_quote_methods`, `get_part_details`. Use an RPC when the query is non-trivial or needs a transaction
+that supabase-js can't express; the function is defined in a migration.
+
+## Transactions
+
+**The Supabase client cannot open a transaction.** Every `client.from(...)` call is its own HTTP
+roundtrip to PostgREST, so a sequence of them — awaited in order or fanned out with `Promise.all` —
+has no atomicity and no rollback: some rows commit, the rest fail, and the data is left half
+applied. Never write multi-step writes that way and hope.
+
+Two real options, in order of preference:
+
+1. **A Kysely transaction** — one real PG transaction over a direct `pg` connection. The default:
+   logic stays in TypeScript, so it is typed, unit-testable, and reviewable in the diff.
+2. **A Postgres function called via `client.rpc(...)`** — when the same atomic write must also be
+   callable through PostgREST, where Kysely cannot go (the public API), or when the work is
+   genuinely set-based and belongs next to the data. The cost is real: SQL is harder to test and
+   review, and ships through a migration. Do not push app logic into SQL just to get atomicity.
+
+For **multi-row / multi-table writes** where partial failure is a bug, use Kysely. The route passes
+`getDatabaseClient()` (`apps/erp/app/services/database.server.ts` — a cached singleton over
+`getProcessPool()` in `packages/database/src/client.ts`, `@carbon/database/client`, Node-only). A Node process
+has ONE pool of 16 connections, shared by the app's client, the jobs (`getJobDatabaseClient()`)
+and scripts, and nothing but an exiting script ends it. `traceConnectionWaits` (`@carbon/logger/tracing.server`)
+records a `db pool wait` span when a caller queues for a connection and `db connect` when one is
+opened, since query spans time only the query. On Vercel both apps' `entry.server.tsx` call
+`attachDatabasePool(getProcessPool())` (`@vercel/functions`): a frozen instance cannot run pg's idle
+timer, so it is kept up until idle connections have closed. Sixteen is a per-instance cap, not
+a database budget: the pool connects through the Supabase pooler, so what bounds the total is the
+pooler's client limit across every running instance, and raising the per-process size multiplies by
+the instance count. Kysely opens one PG transaction, runs
+every write inside it, and rolls everything back on any error.
+
+**Use transactions when:**
+- Bulk reorder / sortOrder updates across N rows.
+- Writes that span multiple tables and need all-or-nothing semantics (e.g. parent + child rows, denormalized counters).
+- Anything where partial application would be a real bug, not a cosmetic glitch.
+
+**Don't use transactions when:**
+- A single write (already atomic).
+- Reads only — keep using the Supabase client (`client.from(...).select(...)`); Kysely has no auth/RLS context.
+- Throwaway/idempotent fan-out where partial failure is fine and retry is cheap.
+
+### Service function example
+
+`Kysely<KyselyDatabase>` is the first arg by convention. The route passes `getDatabaseClient()`.
+Real precedents: `items.service.ts → upsertPickMethodWithShelfLife`, and the drag-sort
+reorders (`update<Entity>LineOrder` in purchasing/sales/invoicing,
+`updateAssemblyInstructionStep{,Material}Order`, `updateChangeNoticeActionOrder`), which are
+thin wrappers over ONE shared helper, `updateSortOrder` in
+`apps/erp/app/modules/shared/sort-order.ts`. Reuse it for any new reorder — never write a
+per-row UPDATE loop.
+
+```typescript
+import type { Kysely, KyselyDatabase } from "@carbon/database/client";
+import { updateSortOrder } from "../shared/sort-order";
+
+export async function updatePurchaseOrderLineOrder(
+  db: Kysely<KyselyDatabase>,
+  companyId: string,
+  userId: string,
+  purchaseOrderId: string,
+  updates: { id: string; sortOrder: number }[]
+) {
+  return updateSortOrder(db, {
+    table: "purchaseOrderLine",
+    column: "sortOrder",
+    companyId,
+    userId,
+    parent: { column: "purchaseOrderId", id: purchaseOrderId },
+    updates
+  });
+}
+```
+
+`updateSortOrder` issues a single `UPDATE t … FROM (VALUES …) v(id, sortOrder) WHERE t.id = v.id
+AND t."companyId" = $ AND t.<parent> = $ RETURNING t.id` inside a transaction and throws (rolling
+back) when fewer rows come back than were sent — an id from another company, another document,
+or a missing row aborts the whole reorder. A row one hop from the document uses
+`parent: { column, via: { table, column, id } }` (assembly step materials → step → instruction).
+It is deliberately NOT in a `*.service.ts`, so the generic "reorder any table" function never
+becomes an API/MCP tool. Its compiled SQL is pinned by `shared/sort-order.test.ts`.
+
+Keep `companyId`/`userId` as positional params named exactly that: the API dispatcher
+(`api+/v1+/lib/dispatch.server.ts`) fills them from the authenticated context, never the body.
+The parent document id is an ordinary payload param.
+
+### Route handler example
+
+```typescript
+import { getDatabaseClient } from "~/services/database.server";
+import { updatePurchaseOrderLineOrder } from "~/modules/purchasing";
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  const { companyId, userId } = await requirePermissions(request, { update: "purchasing" });
+  if (!params.orderId) throw new Error("Could not find orderId");
+  // ... build `updates` from formData ...
+  try {
+    await updatePurchaseOrderLineOrder(
+      getDatabaseClient(),
+      companyId,
+      userId,
+      params.orderId, // the URL's document — every row must belong to it
+      updates
+    );
+  } catch (err) {
+    return data(
+      { success: false },
+      await flash(request, error(err, "Failed to update sort order"))
+    );
+  }
+  return { success: true };
+}
+```
+
+### Key notes
+
+- Kysely **throws** on rollback — use `try/catch`, not the `{ error }` return pattern.
+- Kysely **does not apply RLS**, so authorization is two layers and both are required:
+  `requirePermissions` at the route proves the caller may act in the company, and the service
+  **always** scopes every statement by `companyId` — plus the parent document id whenever the row
+  ids come from the request body. The route cannot enforce the second: it never sees which rows
+  the ids name, so an unscoped service lets any route reorder/edit any row in the company.
+  The `no-unscoped-kysely-write` check (`@carbon/checks`) fails any `updateTable`/`deleteFrom`
+  in ERP modules/routes, MES or `packages/jobs` whose statement has no `.where("companyId", …)`.
+  A link table with no `companyId` column (`jobMaterialStep`, `jobOperationToolStep`) is scoped
+  through its parent: `.where("jobOperationStepId", "in", (eb) => eb.selectFrom("jobOperationStep")
+  .select("id").where("id", "in", ids).where("companyId", "=", companyId))`.
+- Never query inside a loop — one set-based statement (`UPDATE … FROM (VALUES …)`, `.in()`, a
+  join) per logical write.
+- Single writes are already atomic — don't reach for a transaction.
+- Kysely auto-quotes reserved column names (e.g. `order`), so `.set({ order: sortOrder })` is
+  safe; in raw `sql`, use `sql.ref(column)`.
+
+## RLS / permission model
+
+- Multi-tenant: nearly every table has `companyId` (composite PK `("id", "companyId")`).
+- Standardized policy names `SELECT` / `INSERT` / `UPDATE` / `DELETE`, gated by SQL helpers
+  `get_companies_with_employee_role()` (read) and `get_companies_with_employee_permission('<module>_<action>')`
+  (write). Policies and those helpers are authored in `packages/database/src/authz/`, not in
+  migrations — see `authz-manifest.md`.
+- RLS is the real authorization boundary for supabase-js clients; `requirePermissions` is the app-layer gate
+  (and the only gate for service-role / Kysely paths). See `conventions-database.md` for the table+RLS template.
+
+## Generated types
+
+- `packages/database/src/types.ts` (`src/client.ts` consumes it as `SupabaseDatabase`) is
+  **generated — never hand-edit**.
+- `Database` is re-exported from `@carbon/database`; the Kysely shape is `KyselyDatabase`
+  (`KyselifyDatabase<SupabaseDatabase>`) from `@carbon/database/client`.
+- Row/Insert/Update types: `Database["public"]["Tables"]["customer"]["Row" | "Insert" | "Update"]`.
+- Regenerate with `pnpm run db:types` (`scripts/generate-db-types.ts`); requires the local Supabase DB
+  running with all migrations applied. After merging branches that add migrations, regenerate or
+  typecheck fails with `SelectQueryError` / "excessively deep" errors.
+
+## Migrations
+
+- Live in `packages/database/supabase/migrations/`, timestamp-prefixed and applied in order via the
+  Supabase CLI. Read the **newest** relevant migration for current schema/RLS truth — not the first.
+- New migration: `npm run db:migrate <name>` (avoid `000000` HHMMSS to prevent cross-branch collisions).
+- Follow `workflow-database-migration.md` and `conventions-database.md` when adding tables.
+
+Realtime is not a service-layer pattern and is not covered here: see `realtime-system.md` (broadcast topics, `handle.realtime`, live lists).

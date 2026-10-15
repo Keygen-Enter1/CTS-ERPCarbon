@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { requireFeature } from "@carbon/ee/plan.server";
+import { upsertWebhook } from "@carbon/ee/webhooks.server";
+import { validationError, validator } from "@carbon/form";
+import { useCloseRoute } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { webhookValidator } from "~/modules/settings";
+import { WebhookForm } from "~/modules/settings/ui/Webhooks";
+import { getParams, path } from "~/utils/path";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  await requirePermissions(request, {
+    view: "settings"
+  });
+
+  return null;
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    view: "settings"
+  });
+
+  await requireFeature({
+    request,
+    client,
+    companyId,
+    feature: "WEBHOOKS",
+    redirectTo: path.to.webhooks
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(webhookValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const createWebhook = await upsertWebhook(client, {
+    ...validation.data,
+    companyId,
+    createdBy: userId
+  });
+  if (createWebhook.error) {
+    return data(
+      {},
+      await flash(
+        request,
+        error(createWebhook.error, "Failed to create webhook")
+      )
+    );
+  }
+
+  throw redirect(
+    `${path.to.webhooks}?${getParams(request)}`,
+    await flash(request, success("Created webhook"))
+  );
+}
+
+export default function NewWebhookRoute() {
+  const closeRoute = useCloseRoute();
+  const initialValues = {
+    name: "",
+    url: "",
+    table: "",
+    onInsert: false,
+    onUpdate: false,
+    onDelete: false,
+    active: false
+  };
+
+  return (
+    <WebhookForm initialValues={initialValues} onClose={() => closeRoute()} />
+  );
+}

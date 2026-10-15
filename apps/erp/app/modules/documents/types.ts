@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+
+import type { getDocumentLabels, getDocuments } from "./documents.service";
+
+export type Document = NonNullable<
+  Awaited<ReturnType<typeof getDocuments>>["data"]
+>[number] & {
+  // Signed, server-minted token for the public `/download/:token` route. Present
+  // only for rows backed by a file; surfaced as a link in the CSV export.
+  downloadToken?: string;
+};
+
+export type DocumentLabel = NonNullable<
+  Awaited<ReturnType<typeof getDocumentLabels>>["data"]
+>[number];
+
+export type DocumentTransactionType =
+  Database["public"]["Enums"]["documentTransactionType"];

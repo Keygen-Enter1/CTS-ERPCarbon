@@ -1,0 +1,604 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Button,
+  Drawer,
+  DrawerBody,
+  DrawerContent,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+  Heading,
+  HStack,
+  NumberField,
+  NumberInput,
+  RadioGroup,
+  RadioGroupItem,
+  ScrollArea,
+  Table,
+  Tbody,
+  Td,
+  Th,
+  Thead,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  Tr,
+  TruncatedTooltipText,
+  VStack
+} from "@carbon/react";
+import {
+  deriveRate,
+  distinctItemText,
+  INPUT_FORMAT,
+  pluralize,
+  taxableBase
+} from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { Dispatch, SetStateAction } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { LuImage } from "react-icons/lu";
+import { Form, useNavigation, useParams } from "react-router";
+import type { z } from "zod";
+import { useAccounts } from "~/components/Form/Account";
+import { useCurrencyDecimals, useUser } from "~/hooks";
+import { useCurrencyFormatter } from "~/hooks/useCurrencyFormatter";
+import { getPrivateUrl, path } from "~/utils/path";
+import type { selectedLineSchema } from "../../purchasing.models";
+import type {
+  SupplierQuote,
+  SupplierQuoteLine,
+  SupplierQuoteLinePrice
+} from "../../types";
+
+type SupplierQuoteToOrderDrawerProps = {
+  isOpen: boolean;
+  quote: SupplierQuote;
+  lines: SupplierQuoteLine[];
+  pricing: SupplierQuoteLinePrice[];
+  onClose: () => void;
+};
+
+type SelectedLine = z.infer<typeof selectedLineSchema>;
+
+const SupplierQuoteToOrderDrawer = ({
+  isOpen,
+  quote,
+  lines,
+  pricing,
+  onClose
+}: SupplierQuoteToOrderDrawerProps) => {
+  const { t } = useLingui();
+  const [step] = useState(0);
+  const [selectedLines, setSelectedLines] = useState<
+    Record<string, SelectedLine>
+  >({});
+
+  const { id } = useParams();
+  if (!id) throw new Error("Could not find id");
+
+  const titles = [t`Select Quantities`];
+
+  const { company } = useUser();
+  const baseCurrency = company?.baseCurrencyCode ?? "USD";
+  const quoteCurrency = quote.currencyCode ?? baseCurrency;
+  const formatter = useCurrencyFormatter({ currency: baseCurrency });
+  const presentationCurrencyFormatter = useCurrencyFormatter({
+    currency: quoteCurrency
+  });
+
+  const renderStep = () => {
+    switch (step) {
+      case 0:
+        return (
+          <HStack className="h-full w-full">
+            <ScrollArea className="h-[calc(100dvh-145px)] flex-grow w-full">
+              <LinePricingForm
+                quote={quote}
+                lines={lines}
+                pricing={pricing}
+                formatter={formatter}
+                presentationCurrencyFormatter={presentationCurrencyFormatter}
+                setSelectedLines={setSelectedLines}
+              />
+            </ScrollArea>
+          </HStack>
+        );
+      default:
+        return null;
+    }
+  };
+
+  const navigation = useNavigation();
+  const isSubmitting = navigation.state !== "idle";
+  const hasSelectedLines = Object.keys(selectedLines).length > 0;
+
+  return (
+    <Drawer
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) {
+          onClose();
+        }
+      }}
+    >
+      <DrawerContent size="full">
+        <input type="hidden" name="id" value={quote.id!} />
+
+        <DrawerHeader>
+          <DrawerTitle>{titles[step]}</DrawerTitle>
+        </DrawerHeader>
+        <DrawerBody>{renderStep()}</DrawerBody>
+        <DrawerFooter>
+          <Form
+            action={path.to.convertSupplierQuoteToOrder(quote.id!)}
+            method="post"
+          >
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Button
+                    type="submit"
+                    isDisabled={isSubmitting || !hasSelectedLines}
+                    isLoading={isSubmitting}
+                  >
+                    {t`Convert`}
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              {!hasSelectedLines && (
+                <TooltipContent>
+                  {t`Select at least one line to convert`}
+                </TooltipContent>
+              )}
+            </Tooltip>
+            <input
+              type="hidden"
+              name="selectedLines"
+              value={JSON.stringify(selectedLines)}
+            />
+          </Form>
+        </DrawerFooter>
+      </DrawerContent>
+    </Drawer>
+  );
+};
+
+export default SupplierQuoteToOrderDrawer;
+
+type LinePricingFormProps = {
+  quote: SupplierQuote;
+  lines: SupplierQuoteLine[];
+  pricing: SupplierQuoteLinePrice[];
+  formatter: Intl.NumberFormat;
+  presentationCurrencyFormatter: Intl.NumberFormat;
+  setSelectedLines: Dispatch<SetStateAction<Record<string, SelectedLine>>>;
+};
+
+const LinePricingForm = ({
+  quote,
+  lines,
+  pricing,
+  formatter,
+  presentationCurrencyFormatter,
+  setSelectedLines
+}: LinePricingFormProps) => {
+  const accounts = useAccounts();
+  const pricingByLine = useMemo(
+    () =>
+      lines.reduce<Record<string, SupplierQuoteLinePrice[]>>((acc, line) => {
+        acc[line.id!] = pricing.filter(
+          (p) => p.supplierQuoteLineId === line.id
+        );
+        return acc;
+      }, {}),
+    [lines, pricing]
+  );
+
+  const { company } = useUser();
+  const baseCurrency = company?.baseCurrencyCode ?? "USD";
+  const quoteCurrency = quote.currencyCode ?? baseCurrency;
+  const shouldConvertCurrency = quoteCurrency !== baseCurrency;
+  const quoteExchangeRate = quote.exchangeRate ?? 1;
+
+  return (
+    <VStack spacing={8}>
+      {lines.map((line) => {
+        const isGlAccount = line.supplierQuoteLineType === "G/L Account";
+        const lineHeading = isGlAccount
+          ? line.description || "Indirect Expense"
+          : line.itemReadableId;
+        const lineDescription = isGlAccount
+          ? (accounts.find((a) => a.id === line.accountId)?.name ??
+            "G/L Account")
+          : distinctItemText(lineHeading, line.description);
+
+        return (
+          <VStack key={line.id}>
+            <HStack spacing={2} className="items-start">
+              {line.thumbnailPath ? (
+                <img
+                  alt={lineHeading!}
+                  className="w-24 h-24 shrink-0 bg-gradient-to-bl from-muted to-muted/40 rounded-lg"
+                  src={getPrivateUrl(line.thumbnailPath)}
+                />
+              ) : (
+                <div className="w-24 h-24 shrink-0 bg-gradient-to-bl from-muted to-muted/40 rounded-lg p-4">
+                  <LuImage className="w-16 h-16 text-muted-foreground" />
+                </div>
+              )}
+
+              {/* flex-1 + min-w-0, not VStack's default w-full: `width: 100%`
+                  on a flex item resolves against the row's full width and
+                  ignores the thumbnail beside it, pushing the description past
+                  the card edge. min-w-0 is what lets truncate bite. */}
+              <VStack spacing={0} className="flex-1 min-w-0">
+                <Heading className="min-w-0">{lineHeading}</Heading>
+                {lineDescription && (
+                  <TruncatedTooltipText
+                    className="text-muted-foreground text-base truncate"
+                    tooltip={lineDescription}
+                  >
+                    {lineDescription}
+                  </TruncatedTooltipText>
+                )}
+              </VStack>
+            </HStack>
+            <LinePricingOptions
+              line={line}
+              options={pricingByLine[line.id!]}
+              quoteCurrency={quoteCurrency}
+              shouldConvertCurrency={shouldConvertCurrency}
+              quoteExchangeRate={quoteExchangeRate}
+              formatter={formatter}
+              presentationCurrencyFormatter={presentationCurrencyFormatter}
+              setSelectedLines={setSelectedLines}
+            />
+          </VStack>
+        );
+      })}
+    </VStack>
+  );
+};
+
+type LinePricingOptionsProps = {
+  line: SupplierQuoteLine;
+  options: SupplierQuoteLinePrice[];
+  quoteCurrency: string;
+  shouldConvertCurrency: boolean;
+  quoteExchangeRate: number;
+  formatter: Intl.NumberFormat;
+  presentationCurrencyFormatter: Intl.NumberFormat;
+  setSelectedLines: Dispatch<SetStateAction<Record<string, SelectedLine>>>;
+};
+
+const LinePricingOptions = ({
+  line,
+  options,
+  quoteCurrency,
+  quoteExchangeRate,
+  presentationCurrencyFormatter,
+  setSelectedLines
+}: LinePricingOptionsProps) => {
+  const { t } = useLingui();
+  const currencyDecimals = useCurrencyDecimals(quoteCurrency);
+  const [selectedValue, setSelectedValue] = useState("");
+  const [showOverride, setShowOverride] = useState(false);
+  const [overridePricing, setOverridePricing] = useState<SelectedLine>({
+    quantity: 1,
+    leadTime: 0,
+    unitPrice: 0,
+    supplierUnitPrice: 0,
+    supplierShippingCost: 0,
+    shippingCost: 0,
+    supplierTaxAmount: 0,
+    taxAmount: 0,
+    taxPercent: 0
+  });
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  useEffect(() => {
+    if (selectedValue === "custom") {
+      setSelectedLines((prev) => ({
+        ...prev,
+        [line.id!]: {
+          quantity: overridePricing.quantity,
+          unitPrice: overridePricing.unitPrice,
+          supplierUnitPrice: overridePricing.supplierUnitPrice,
+          supplierShippingCost: overridePricing.supplierShippingCost,
+          shippingCost: overridePricing.shippingCost,
+          leadTime: overridePricing.leadTime,
+          supplierTaxAmount: overridePricing.supplierTaxAmount,
+          taxAmount: overridePricing.taxAmount,
+          // Override collects amounts only — seed the rate from the canonical
+          // denominator (unit price x quantity + shipping).
+          taxPercent: deriveRate(
+            overridePricing.supplierTaxAmount,
+            taxableBase(
+              overridePricing.supplierUnitPrice,
+              overridePricing.quantity,
+              overridePricing.supplierShippingCost
+            )
+          )
+        }
+      }));
+    }
+  }, [
+    line.id,
+    overridePricing,
+    selectedValue,
+    setSelectedLines,
+    quoteExchangeRate
+  ]);
+
+  return (
+    <VStack spacing={2}>
+      <RadioGroup
+        className="w-full"
+        value={selectedValue}
+        onValueChange={(value) => {
+          const selectedOption =
+            value === "custom"
+              ? overridePricing
+              : options.find((opt) => opt.quantity.toString() === value);
+
+          if (selectedOption) {
+            setSelectedLines((prev) => ({
+              ...prev,
+              [line.id!]: {
+                quantity: selectedOption.quantity,
+                unitPrice: selectedOption.unitPrice ?? 0,
+                supplierUnitPrice: selectedOption.supplierUnitPrice ?? 0,
+                supplierShippingCost: selectedOption.supplierShippingCost ?? 0,
+                shippingCost: selectedOption.shippingCost ?? 0,
+                leadTime: selectedOption.leadTime,
+                supplierTaxAmount: selectedOption.supplierTaxAmount ?? 0,
+                taxAmount: selectedOption.taxAmount ?? 0,
+                taxPercent: selectedOption.taxPercent ?? 0
+              }
+            }));
+            setSelectedValue(value);
+          }
+        }}
+      >
+        <Table>
+          <Thead>
+            <Tr>
+              <Th></Th>
+              <Th>
+                <Trans>Quantity</Trans>
+              </Th>
+              <Th>
+                <Trans>Unit Price</Trans>
+              </Th>
+              <Th>
+                <Trans>Shipping</Trans>
+              </Th>
+              <Th>
+                <Trans>Lead Time</Trans>
+              </Th>
+              <Th>
+                <Trans>Tax</Trans>
+              </Th>
+              <Th>
+                <Trans>Total Price</Trans>
+              </Th>
+            </Tr>
+          </Thead>
+          <Tbody>
+            {!Array.isArray(options) || options.length === 0 ? (
+              <Tr>
+                <Td colSpan={6} className="text-center py-8">
+                  <Trans>No pricing options found</Trans>
+                </Td>
+              </Tr>
+            ) : (
+              options.map(
+                (option, index) =>
+                  line?.quantity?.includes(option.quantity) && (
+                    <Tr key={index}>
+                      <Td>
+                        <RadioGroupItem
+                          value={option.quantity.toString()}
+                          id={`${line.id}:${option.quantity.toString()}`}
+                        />
+                        <label
+                          htmlFor={`${line.id}:${option.quantity.toString()}`}
+                          className="sr-only"
+                        >
+                          {option.quantity}
+                        </label>
+                      </Td>
+                      <Td>{option.quantity}</Td>
+                      <Td>
+                        {presentationCurrencyFormatter.format(
+                          option.supplierUnitPrice ?? 0
+                        )}
+                      </Td>
+                      <Td>
+                        {presentationCurrencyFormatter.format(
+                          option.supplierShippingCost ?? 0
+                        )}
+                      </Td>
+                      <Td>
+                        {option.leadTime} {pluralize(option.leadTime, "day")}
+                      </Td>
+                      <Td>
+                        {presentationCurrencyFormatter.format(
+                          option.supplierTaxAmount ?? 0
+                        )}
+                      </Td>
+                      <Td>
+                        {presentationCurrencyFormatter.format(
+                          (option.supplierUnitPrice ?? 0) * option.quantity +
+                            (option.supplierShippingCost ?? 0) +
+                            (option.supplierTaxAmount ?? 0)
+                        )}
+                      </Td>
+                    </Tr>
+                  )
+              )
+            )}
+            {showOverride && (
+              <Tr>
+                <Td>
+                  <RadioGroupItem value="custom" id={`${line.id}:custom`} />
+                  <label
+                    htmlFor={`${line.id}:custom`}
+                    className="sr-only"
+                  ></label>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    aria-label={t`Quantity`}
+                    minValue={0}
+                    value={overridePricing.quantity}
+                    onChange={(quantity) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        quantity
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    aria-label={t`Unit Price`}
+                    minValue={0}
+                    value={overridePricing.supplierUnitPrice}
+                    formatOptions={INPUT_FORMAT.rate(
+                      quoteCurrency,
+                      currencyDecimals
+                    )}
+                    onChange={(unitPrice) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        supplierUnitPrice: unitPrice,
+                        unitPrice: unitPrice * quoteExchangeRate
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    aria-label={t`Shipping`}
+                    minValue={0}
+                    value={overridePricing.supplierShippingCost}
+                    formatOptions={INPUT_FORMAT.money(
+                      quoteCurrency,
+                      currencyDecimals
+                    )}
+                    onChange={(shippingCost) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        shippingCost: shippingCost * quoteExchangeRate,
+                        supplierShippingCost: shippingCost
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    aria-label={t`Lead Time`}
+                    minValue={0}
+                    formatOptions={{
+                      style: "unit",
+                      unit: "day",
+                      unitDisplay: "long"
+                    }}
+                    value={overridePricing.leadTime}
+                    onChange={(leadTime) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        leadTime
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  <NumberField
+                    className="w-[120px]"
+                    aria-label={t`Tax`}
+                    minValue={0}
+                    value={overridePricing.supplierTaxAmount}
+                    formatOptions={INPUT_FORMAT.money(
+                      quoteCurrency,
+                      currencyDecimals
+                    )}
+                    onChange={(taxAmount) =>
+                      setOverridePricing((v) => ({
+                        ...v,
+                        supplierTaxAmount: taxAmount,
+                        // Same conversion the unit price and shipping overrides
+                        // above use, so the three stay consistent with each other.
+                        taxAmount: taxAmount * quoteExchangeRate
+                      }))
+                    }
+                  >
+                    <NumberInput
+                      size="md"
+                      className="border-0 -ml-3 shadow-none disabled:bg-transparent disabled:opacity-100"
+                    />
+                  </NumberField>
+                </Td>
+                <Td>
+                  {presentationCurrencyFormatter.format(
+                    overridePricing.supplierUnitPrice *
+                      overridePricing.quantity +
+                      overridePricing.supplierShippingCost +
+                      overridePricing.supplierTaxAmount
+                  )}
+                </Td>
+              </Tr>
+            )}
+          </Tbody>
+        </Table>
+      </RadioGroup>
+      {!showOverride && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setShowOverride(true);
+                setSelectedValue("custom");
+              }}
+            >
+              {t`Add Adjustment`}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            {t`Add a custom pricing row to override quantity, price, shipping, lead time, and tax`}
+          </TooltipContent>
+        </Tooltip>
+      )}
+    </VStack>
+  );
+};

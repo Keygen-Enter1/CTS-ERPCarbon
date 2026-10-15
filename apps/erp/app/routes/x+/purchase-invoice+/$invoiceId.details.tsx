@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import type { JSONContent } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import type { FileObject } from "@supabase/storage-js";
+import { useRef } from "react";
+import { Fragment } from "react/jsx-runtime";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useParams } from "react-router";
+import { DeferredFiles } from "~/components";
+import { useRouteData, useUser } from "~/hooks";
+import type {
+  PurchaseInvoice,
+  PurchaseInvoiceDelivery,
+  PurchaseInvoiceLine
+} from "~/modules/invoicing";
+import {
+  getInvoiceSettlementsForInvoice,
+  getPurchaseInvoice,
+  InvoicePaymentsPanel,
+  isPurchaseInvoiceLocked,
+  PurchaseInvoiceSummary,
+  purchaseInvoiceValidator,
+  updatePurchaseInvoice
+} from "~/modules/invoicing";
+import { PurchaseInvoiceDeliveryForm } from "~/modules/invoicing/ui/PurchaseInvoice";
+import type { PurchaseInvoiceDeliveryFormRef } from "~/modules/invoicing/ui/PurchaseInvoice/PurchaseInvoiceDeliveryForm";
+import type { SupplierInteraction } from "~/modules/purchasing";
+import {
+  SupplierInteractionDocuments,
+  SupplierInteractionNotes
+} from "~/modules/purchasing/ui/SupplierInteraction";
+import { getCustomFields, setCustomFields } from "~/utils/form";
+import { requireUnlocked } from "~/utils/lockedGuard.server";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "invoicing"
+  });
+
+  const { invoiceId } = params;
+  if (!invoiceId) throw new Error("Could not find invoiceId");
+
+  const [invoice, applications] = await Promise.all([
+    getPurchaseInvoice(client, invoiceId),
+    getInvoiceSettlementsForInvoice(client, companyId, "purchase", invoiceId)
+  ]);
+  if (invoice.error) {
+    throw redirect(
+      path.to.invoicingPurchasing,
+      await flash(
+        request,
+        error(invoice.error, "Failed to load purchase invoice")
+      )
+    );
+  }
+
+  return {
+    internalNotes: (invoice.data?.internalNotes ?? {}) as JSONContent,
+    paymentApplications: applications.data ?? []
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+
+  const { invoiceId: id } = params;
+  if (!id) throw new Error("Could not find invoiceId");
+
+  // Check if PI is locked
+  const { client: viewClient } = await requirePermissions(request, {
+    view: "invoicing"
+  });
+
+  const purchaseInvoice = await getPurchaseInvoice(viewClient, id);
+  if (purchaseInvoice.error) {
+    throw redirect(
+      path.to.purchaseInvoice(id),
+      await flash(
+        request,
+        error(purchaseInvoice.error, "Failed to load purchase invoice")
+      )
+    );
+  }
+
+  await requireUnlocked({
+    request,
+    isLocked: isPurchaseInvoiceLocked(purchaseInvoice.data?.status),
+    redirectTo: path.to.purchaseInvoice(id),
+    message: "Cannot modify a confirmed purchase invoice."
+  });
+
+  const { client, userId } = await requirePermissions(request, {
+    update: "invoicing"
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(purchaseInvoiceValidator).validate(
+    formData
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const { invoiceId, ...d } = validation.data;
+  if (!invoiceId) throw new Error("Could not find invoiceId");
+
+  const result = await updatePurchaseInvoice(client, {
+    id,
+    invoiceId,
+    supplierId: d.supplierId,
+    supplierReference: d.supplierReference || null,
+    paymentTermId: d.paymentTermId || null,
+    currencyCode: d.currencyCode,
+    locationId: d.locationId,
+    invoiceSupplierId: d.invoiceSupplierId || null,
+    invoiceSupplierContactId: d.invoiceSupplierContactId || null,
+    invoiceSupplierLocationId: d.invoiceSupplierLocationId || null,
+    dateIssued: d.dateIssued || null,
+    dateDue: d.dateDue || null,
+    exchangeRate: d.exchangeRate,
+    exchangeRateUpdatedAt: d.exchangeRateUpdatedAt,
+    customFields: setCustomFields(formData),
+    updatedBy: userId
+  });
+  if (result.error) {
+    throw redirect(
+      path.to.purchaseInvoice(id),
+      await flash(
+        request,
+        error(result.error, "Failed to update purchase invoice")
+      )
+    );
+  }
+
+  throw redirect(
+    path.to.purchaseInvoice(id),
+    await flash(request, success("Updated purchase invoice"))
+  );
+}
+
+export default function PurchaseInvoiceBasicRoute() {
+  const { t } = useLingui();
+  const { internalNotes, paymentApplications } = useLoaderData<typeof loader>();
+  const { invoiceId } = useParams();
+  if (!invoiceId) throw new Error("invoiceId not found");
+
+  const invoiceData = useRouteData<{
+    purchaseInvoice: PurchaseInvoice;
+    purchaseInvoiceLines: PurchaseInvoiceLine[];
+    purchaseInvoiceDelivery: PurchaseInvoiceDelivery;
+    interaction: SupplierInteraction;
+    files: Promise<FileObject[]>;
+  }>(path.to.purchaseInvoice(invoiceId));
+
+  if (!invoiceData?.purchaseInvoice)
+    throw new Error("purchaseInvoice not found");
+  const { purchaseInvoice, purchaseInvoiceDelivery } = invoiceData;
+
+  if (!invoiceData) throw new Error("Could not find invoice data");
+
+  const deliveryFormRef = useRef<PurchaseInvoiceDeliveryFormRef>(null);
+
+  const handleEditShippingCost = () => {
+    deliveryFormRef.current?.focusShippingCost();
+  };
+
+  const initialValues = {
+    id: purchaseInvoice.id ?? "",
+    invoiceId: purchaseInvoice.invoiceId ?? "",
+    supplierId: purchaseInvoice.supplierId ?? "",
+    supplierReference: purchaseInvoice.supplierReference ?? "",
+    invoiceSupplierId: purchaseInvoice.invoiceSupplierId ?? "",
+    paymentTermId: purchaseInvoice.paymentTermId ?? "",
+    currencyCode: purchaseInvoice.currencyCode ?? "",
+    dateIssued: purchaseInvoice.dateIssued ?? "",
+    dateDue: purchaseInvoice.dateDue ?? "",
+    status: purchaseInvoice.status ?? ("Draft" as "Draft"),
+    ...getCustomFields(purchaseInvoice.customFields)
+  };
+
+  const deliveryInitialValues = {
+    id: purchaseInvoiceDelivery.id,
+    locationId: purchaseInvoiceDelivery.locationId ?? "",
+    supplierShippingCost: purchaseInvoiceDelivery.supplierShippingCost ?? 0,
+    shippingMethodId: purchaseInvoiceDelivery.shippingMethodId ?? "",
+    shippingTermId: purchaseInvoiceDelivery.shippingTermId ?? "",
+    incoterm: purchaseInvoiceDelivery.incoterm ?? undefined,
+    incotermLocation: purchaseInvoiceDelivery.incotermLocation ?? "",
+    ...getCustomFields(purchaseInvoiceDelivery.customFields)
+  };
+
+  const { company } = useUser();
+
+  return (
+    <Fragment key={invoiceId}>
+      <PurchaseInvoiceSummary onEditShippingCost={handleEditShippingCost} />
+      <InvoicePaymentsPanel rows={paymentApplications} />
+      <SupplierInteractionNotes
+        key={`notes-${initialValues.id}`}
+        id={invoiceId}
+        title={t`Notes`}
+        table="purchaseInvoice"
+        internalNotes={internalNotes}
+      />
+      <DeferredFiles key={`documents-${invoiceId}`} resolve={invoiceData.files}>
+        {(resolvedFiles) => (
+          <SupplierInteractionDocuments
+            interactionId={invoiceData.interaction.id}
+            attachments={resolvedFiles}
+            id={invoiceId}
+            type="Purchase Invoice"
+          />
+        )}
+      </DeferredFiles>
+      <PurchaseInvoiceDeliveryForm
+        key={`delivery-${invoiceId}`}
+        ref={deliveryFormRef}
+        initialValues={deliveryInitialValues}
+        currencyCode={initialValues.currencyCode || company.baseCurrencyCode}
+        defaultCollapsed={false}
+      />
+    </Fragment>
+  );
+}

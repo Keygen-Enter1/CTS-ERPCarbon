@@ -1,0 +1,94 @@
+---
+title: Numbering sequences
+description: The per-company generator behind every readable document number — jobs, change notices, payments, and more.
+---
+
+Each Carbon document receives a <Term id="readable-id">human-readable number</Term>, such as `J000001`, `CN-000001`, or `PAY-2026-07-000001`. A company-scoped <Term id="numbering-sequence">sequence</Term> maintains the counter for each document type. Under **Settings → Sequences**, you can change a sequence's prefix, counter, and padding.
+
+Carbon formats and advances the counter atomically to prevent duplicate numbers:
+
+```
+{prefix}{next + step, zero-padded to size}{suffix}
+```
+
+<Callout type="note" title="The number is stored on the document, not recomputed">
+Once created, a document's number never changes. Retuning a sequence only affects documents created **after** the change; it never renumbers what exists.
+</Callout>
+
+## Fields
+
+<Screenshot label="Settings → Sequences: the sequence form with prefix, current, size, step, suffix, and the live preview of the next number" caption="The form previews the next number as you type." />
+
+<FieldTable>
+  <Field name="Prefix" type="text">Text prepended to the number. Optional; supports date tokens, so `PAY-%{yyyy}-%{mm}-` renders as `PAY-2026-07-`.</Field>
+  <Field name="Current" type="integer">The last value handed out; the next document gets `Current + Step`. Set it to restart or fast-forward numbering. Must be `≥ 0`. When a document is saved with a higher number in this sequence's format (typed as a custom ID, or sent through the API or an AI agent), Current moves up to it, so that number is never handed out again.</Field>
+  <Field name="Size" type="integer">Zero-padding width: size `6` gives `000001`. Accepted range `1`–`20`; most sequences ship at `6`. A counter that outgrows the size is issued in full, so size `6` at `1000000` gives `1000000`.</Field>
+  <Field name="Step" type="integer">How much the counter climbs each time. Almost always `1`; must be `≥ 1`.</Field>
+  <Field name="Suffix" type="text">Text appended after the number. Optional; same date tokens as the prefix.</Field>
+</FieldTable>
+
+### Date tokens
+
+Prefix and suffix can embed the current date — how payments and journal entries get their year/month partitioning. Tokens are interpolated when the number is generated, not when you save: `%{yyyy}` (2026), `%{yy}` (26), `%{mm}` (01–12), `%{ww}` (ISO week, 01–53), `%{dd}` (01–31), plus `%{hh}` and `%{ss}` for hour and second.
+
+## Seed defaults
+
+A new company is seeded with a sequence for every numbered document type:
+
+| Document type | `table` | Prefix | Example |
+|---|---|---|---|
+| Job | `job` | `J` | `J000001` |
+| Quote | `quote` | `Q` | `Q000001` |
+| Sales order | `salesOrder` | `SO` | `SO000001` |
+| Sales RFQ | `salesRfq` | `RFQ` | `RFQ000001` |
+| Sales invoice | `salesInvoice` | `AR` | `AR000001` |
+| Purchase order | `purchaseOrder` | `PO` | `PO000001` |
+| Purchase invoice | `purchaseInvoice` | `AP` | `AP000001` |
+| Purchasing RFQ | `purchasingRfq` | `PRFQ` | `PRFQ000001` |
+| Supplier quote | `supplierQuote` | `SQ` | `SQ000001` |
+| Receipt | `receipt` | `RE` | `RE000001` |
+| Shipment | `shipment` | `SHP` | `SHP000001` |
+| Warehouse transfer | `warehouseTransfer` | `WT` | `WT000001` |
+| Stock transfer | `stockTransfer` | `ST` | `ST000001` |
+| Picking list | `pickingList` | `PL` | `PL000001` |
+| Inventory count | `inventoryCount` | `IC` | `IC000001` |
+| Change notice | `changeOrder` | `CN-` | `CN-000001` |
+| Issue (NCR) | `nonConformance` | `NCR` | `NCR000001` |
+| Inbound inspection | `inboundInspection` | `II` | `II000001` |
+| Gauge | `gauge` | `G` | `G00001` |
+| Maintenance dispatch | `maintenanceDispatch` | `MAIN` | `MAIN000001` |
+| Customer | `customer` | `CUS` | `CUS000001` |
+| Supplier | `supplier` | `SUP` | `SUP000001` |
+| Fixed asset | `fixedAsset` | `FA` | `FA000001` |
+| Depreciation run | `depreciationRun` | `DR` | `DR000001` |
+| Journal entry | `journalEntry` | `JE-%{yyyy}-%{mm}-` | `JE-2026-07-000001` |
+| Payment | `payment` | `PAY-%{yyyy}-%{mm}-` | `PAY-2026-07-000001` |
+| Credit memo | `creditMemo` | `CR-%{yyyy}-%{mm}-` | `CR-2026-07-000001` |
+| Debit memo | `debitMemo` | `DR-%{yyyy}-%{mm}-` | `DR-2026-07-000001` |
+
+A prefix on an older company may differ: a few sequences added after launch were backfilled with different defaults (jobs as `WO`, change notices re-prefixed from `ECO-` without renumbering existing records). Either way, change it under **Settings → Sequences**.
+
+Accounting posts are the heaviest user of this machinery: every GL post pulls a fresh `journalEntry` number as it books, which is why that sequence carries a month token by default. Sequences are company-scoped, so two companies in the same [group](/docs/reference/intercompany) number independently even when they share a chart of accounts. Where the numbers land day to day: [jobs](/docs/reference/jobs), [change notices](/docs/reference/change-orders), and [payments](/docs/reference/payments).
+
+<AgentContext>
+## Internals and troubleshooting
+
+A sequence is a row in the `sequence` table keyed by `("table", "companyId")` (`20230525025310_sequences.sql`, PK moved in `20240704105128_rfq.sql:120`). The counter advances in the same operation that reads it (`packages/database/src/sequence.ts:76`). The form's live preview is `SequenceForm.tsx:38`; seed defaults are `packages/database/src/seed-data.ts:233`. Payments pick the right sequence by memo direction — credit memos draw `CR-`, debit memos `DR-` (`20260630093809_ar-ap-payments.sql:567`).
+
+A document saved with a number it was given moves its sequence past that number: the `sync_advance_document_sequence` interceptor (`packages/database/src/event-system/handlers/`) runs after every insert and number change on the numbered tables, reads the number with `util.document_sequence_pattern`, and raises `next` to it when it is higher. It never lowers `next`. The `document-sequence-synced` conformance check (`packages/checks`) fails CI when a new sequence is neither covered by it nor exempt.
+
+### A sequence field won't save (Current, Step, or Size)
+`sequenceValidator` bounds them (`settings.models.ts:285-292`): Current `≥ 0`, Step `≥ 1`, Size `1`–`20`. Values outside those ranges are rejected.
+
+### Current jumped ahead on its own
+A document was saved with a higher number in the sequence's format, by a custom ID, the API, or an AI agent through MCP. Current moved up to it so the next automatic number does not collide. If the jump came from a typo, set Current back under Settings → Sequences, but not below the highest number already used.
+
+### "Failed to insert …" because the number is already taken
+Before `20261012043717_advance-document-sequence.sql`, a number chosen by the caller never moved the counter, so the counter later issued a number that already existed. `20261012043741_backfill-document-sequences.sql` moved every counter that was behind past the highest existing number. On the sales order form, typing a number that already exists shows "Sales order … already exists" on the field.
+
+### Editing a sequence didn't renumber existing documents
+By design: numbers are written at creation and never recomputed.
+
+### A prefix on my company doesn't match the seed defaults
+Backfilled defaults for older companies differ in places — jobs were backfilled as `WO` (`20240909194622_jobs.sql:363`) though new companies seed `J`; change notices were re-prefixed `ECO-` → `CN-` for new records only, leaving minted `ECO-` ids untouched. Change it under Settings → Sequences.
+</AgentContext>

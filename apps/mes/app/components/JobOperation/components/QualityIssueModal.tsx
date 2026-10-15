@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Result } from "@carbon/auth";
+import { Hidden, Select, Submit, TextArea, ValidatedForm } from "@carbon/form";
+import { useAction, useLoaderQuery } from "@carbon/query";
+import {
+  Button,
+  HStack,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  ModalTitle,
+  toast,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { qualityIssuePriority, qualityIssueValidator } from "~/services/models";
+import { path } from "~/utils/path";
+
+export function QualityIssueModal({
+  operationId,
+  trackedEntityId,
+  isOpen,
+  onClose
+}: {
+  operationId: string;
+  trackedEntityId?: string;
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const { t } = useLingui();
+  const fetcher = useAction<Result>({
+    onSuccess: (data) => {
+      if (data?.success) {
+        toast.success(t`Quality issue created`);
+        onClose();
+      }
+    }
+  });
+  const issueTypeFetcher = useLoaderQuery<
+    PostgrestResponse<{ id: string; name: string }>
+  >(isOpen ? path.to.api.qualityIssueTypes : null);
+
+  const issueTypes = issueTypeFetcher.data?.data ?? [];
+
+  if (!isOpen) return null;
+
+  return (
+    <Modal
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <ModalContent>
+        <ValidatedForm
+          method="post"
+          action={path.to.qualityIssueNew}
+          validator={qualityIssueValidator}
+          defaultValues={{
+            jobOperationId: operationId,
+            description: "",
+            nonConformanceTypeId: issueTypes[0]?.id ?? "",
+            priority: "Medium" as const,
+            trackedEntityId: trackedEntityId ?? ""
+          }}
+          fetcher={fetcher}
+        >
+          <ModalHeader>
+            <ModalTitle>
+              <Trans>Create Quality Issue</Trans>
+            </ModalTitle>
+          </ModalHeader>
+          <ModalBody>
+            <Hidden name="jobOperationId" value={operationId} />
+            {trackedEntityId && (
+              <Hidden name="trackedEntityId" value={trackedEntityId} />
+            )}
+            <VStack spacing={4}>
+              <Select
+                name="nonConformanceTypeId"
+                label={t`Issue Type`}
+                size="lg"
+                options={issueTypes.map((type) => ({
+                  value: type.id,
+                  label: type.name
+                }))}
+              />
+              <Select
+                name="priority"
+                label={t`Priority`}
+                size="lg"
+                options={qualityIssuePriority.map((p) => ({
+                  value: p,
+                  label: p
+                }))}
+              />
+              <TextArea
+                name="description"
+                label={t`Description`}
+                placeholder={t`Describe the problem...`}
+                size="lg"
+              />
+            </VStack>
+          </ModalBody>
+          <ModalFooter>
+            <HStack>
+              <Button variant="secondary" size="lg" onClick={onClose}>
+                <Trans>Cancel</Trans>
+              </Button>
+              <Submit size="lg" isLoading={fetcher.state !== "idle"}>
+                <Trans>Create Issue</Trans>
+              </Submit>
+            </HStack>
+          </ModalFooter>
+        </ValidatedForm>
+      </ModalContent>
+    </Modal>
+  );
+}

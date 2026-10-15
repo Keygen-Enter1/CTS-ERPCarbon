@@ -1,0 +1,281 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  ActionMenu,
+  Button,
+  Drawer,
+  DrawerBody,
+  DrawerContent,
+  DrawerDescription,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+  HStack,
+  IconButton,
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem,
+  useDebounce,
+  useDisclosure
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Reorder } from "motion/react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { AiOutlineNumber } from "react-icons/ai";
+import { BiText } from "react-icons/bi";
+import { BsCalendarDate, BsToggleOn } from "react-icons/bs";
+import { CgProfile } from "react-icons/cg";
+import {
+  LuContainer,
+  LuGripVertical,
+  LuLink,
+  LuPencil,
+  LuSquareUser,
+  LuTrash
+} from "react-icons/lu";
+import { Link, useFetcher, useParams } from "react-router";
+import { New } from "~/components";
+import { ConfirmDelete } from "~/components/Modals";
+import { NewPlacementContext } from "~/components/New";
+import { useUrlParams } from "~/hooks";
+import type { AttributeDataType } from "~/modules/people";
+import type { CustomField, CustomFieldsTableType } from "~/modules/settings";
+import { path } from "~/utils/path";
+
+type CustomFieldCategoryDetailProps = {
+  customFieldTable: CustomFieldsTableType;
+  dataTypes: AttributeDataType[];
+  onClose: () => void;
+};
+
+type CustomFieldAndDataType = CustomField & {
+  dataType: AttributeDataType;
+};
+
+const CustomFieldCategoryDetail = ({
+  customFieldTable,
+  dataTypes,
+  onClose
+}: CustomFieldCategoryDetailProps) => {
+  const { t } = useLingui();
+  const sortOrderFetcher = useFetcher<{}>();
+  const { table } = useParams();
+  if (!table) throw new Error("table is not found");
+  const [params] = useUrlParams();
+
+  const getAttributeDataType = useCallback(
+    (id: number) => {
+      return dataTypes.find((dt) => dt.id === id);
+    },
+    [dataTypes]
+  );
+
+  const fieldMap = useMemo(
+    () =>
+      Array.isArray(customFieldTable.fields)
+        ? customFieldTable.fields.reduce<
+            Record<string, CustomFieldAndDataType>
+            // @ts-expect-error
+          >((acc, field) => {
+            if (!field) return acc;
+            const customField = field as CustomFieldAndDataType;
+            return {
+              ...acc,
+              [customField.id]: {
+                ...customField,
+                dataType: getAttributeDataType(customField.dataTypeId)
+              }
+            };
+          }, {})
+        : {},
+    [customFieldTable.fields, getAttributeDataType]
+  ) as Record<string, CustomFieldAndDataType>;
+
+  const [sortOrder, setSortOrder] = useState<string[]>(
+    Array.isArray(customFieldTable.fields)
+      ? customFieldTable.fields
+          .sort(
+            (a, b) =>
+              (a as CustomField).sortOrder - (b as CustomField).sortOrder
+          )
+          .map((field) => (field as CustomField).id)
+      : []
+  );
+
+  useEffect(() => {
+    if (Array.isArray(customFieldTable.fields)) {
+      const sorted = [...customFieldTable.fields]
+        .sort(
+          (a, b) => (a as CustomField).sortOrder - (b as CustomField).sortOrder
+        )
+        .map((field) => (field as CustomField).id);
+      setSortOrder(sorted);
+    }
+  }, [customFieldTable.fields]);
+
+  const onReorder = (newOrder: string[]) => {
+    const updates: Record<string, number> = {};
+
+    // Update all positions to ensure consistent ordering
+    newOrder.forEach((id, index) => {
+      updates[id] = index + 1;
+    });
+
+    setSortOrder(newOrder);
+    updateSortOrder(updates);
+  };
+
+  const updateSortOrder = useDebounce(
+    (updates: Record<string, number>) => {
+      let formData = new FormData();
+      formData.append("updates", JSON.stringify(updates));
+      sortOrderFetcher.submit(formData, { method: "post" });
+    },
+    2500,
+    true
+  );
+
+  const deleteModal = useDisclosure();
+  const [selectedCustomField, setSelectedCustomField] = useState<
+    CustomField | undefined
+  >();
+
+  const onDelete = (data?: CustomField) => {
+    setSelectedCustomField(data);
+    deleteModal.onOpen();
+  };
+
+  const onDeleteCancel = () => {
+    setSelectedCustomField(undefined);
+    deleteModal.onClose();
+  };
+
+  const renderContextMenu = (fieldId: string) => {
+    return (
+      <>
+        <MenuItem shortcut={MENU_ITEM_SHORTCUTS.edit} asChild>
+          <Link to={`${fieldId}?${params.toString()}`}>
+            <MenuIcon icon={<LuPencil />} />
+            <Trans>Edit Custom Field</Trans>
+          </Link>
+        </MenuItem>
+        <MenuItem
+          shortcut={MENU_ITEM_SHORTCUTS.delete}
+          destructive
+          onClick={() => onDelete(fieldMap[fieldId])}
+        >
+          <MenuIcon icon={<LuTrash />} />
+          <Trans>Delete Custom Field</Trans>
+        </MenuItem>
+      </>
+    );
+  };
+
+  return (
+    <>
+      <Drawer
+        open
+        onOpenChange={(open) => {
+          if (!open) onClose();
+        }}
+      >
+        <DrawerContent>
+          <DrawerHeader>
+            <DrawerTitle>{customFieldTable.name}</DrawerTitle>
+            <DrawerDescription>{customFieldTable.module}</DrawerDescription>
+          </DrawerHeader>
+          <DrawerBody>
+            {Array.isArray(customFieldTable?.fields) && (
+              <Reorder.Group
+                axis="y"
+                values={sortOrder}
+                onReorder={onReorder}
+                className="space-y-2 w-full"
+              >
+                {sortOrder.map((sortId) => {
+                  return (
+                    <Reorder.Item
+                      key={sortId}
+                      value={sortId}
+                      className="rounded-lg w-full"
+                    >
+                      <HStack>
+                        <IconButton
+                          aria-label={t`Drag handle`}
+                          icon={<LuGripVertical />}
+                          variant="ghost"
+                        />
+                        <p className="flex-grow text-foreground flex items-center justify-between">
+                          <span>{fieldMap[sortId]?.name}</span>
+                          {fieldMap[sortId]?.required && (
+                            <span className="text-muted-foreground text-xxs">
+                              <Trans>Required</Trans>
+                            </span>
+                          )}
+                        </p>
+                        <Button
+                          isDisabled
+                          leftIcon={
+                            getIcon(fieldMap[sortId]?.dataType) ?? undefined
+                          }
+                          variant="ghost"
+                        >
+                          {fieldMap[sortId]?.dataType?.label ?? "Unknown"}
+                        </Button>
+                        <ActionMenu>{renderContextMenu(sortId)}</ActionMenu>
+                      </HStack>
+                    </Reorder.Item>
+                  );
+                })}
+              </Reorder.Group>
+            )}
+          </DrawerBody>
+          <DrawerFooter>
+            {/* Inline on phones too: the app bar sits under this drawer. */}
+            <NewPlacementContext.Provider value="inline">
+              <Button asChild size="md">
+                <New label={t`Custom Field`} to={`new?${params?.toString()}`} />
+              </Button>
+            </NewPlacementContext.Provider>
+          </DrawerFooter>
+        </DrawerContent>
+      </Drawer>
+      {selectedCustomField && selectedCustomField.id && (
+        <ConfirmDelete
+          isOpen={deleteModal.isOpen}
+          action={path.to.deleteCustomField(table, selectedCustomField.id)}
+          name={selectedCustomField?.name ?? ""}
+          text={t`Are you sure you want to delete the ${selectedCustomField?.name} field?`}
+          onSubmit={onDeleteCancel}
+          onCancel={onDeleteCancel}
+        />
+      )}
+    </>
+  );
+};
+
+function getIcon(props: AttributeDataType) {
+  if (!props) return null;
+  const {
+    isBoolean,
+    isDate,
+    isNumeric,
+    isText,
+    isLink,
+    isUser,
+    isCustomer,
+    isSupplier
+  } = props;
+  if (isBoolean) return <BsToggleOn />;
+  if (isDate) return <BsCalendarDate />;
+  if (isNumeric) return <AiOutlineNumber />;
+  if (isText) return <BiText />;
+  if (isLink) return <LuLink />;
+  if (isUser) return <CgProfile />;
+  if (isCustomer) return <LuSquareUser />;
+  if (isSupplier) return <LuContainer />;
+}
+
+export default CustomFieldCategoryDetail;

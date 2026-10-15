@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { CONTROLLED_ENVIRONMENT, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { flash } from "@carbon/auth/session.server";
+import {
+  disableAuditLog,
+  enableAuditLog,
+  getArchiveDownloadUrl,
+  getAuditLogArchives,
+  isAuditLogEnabled,
+  syncAuditSubscriptions
+} from "@carbon/ee/audit.server";
+import { requireFeature } from "@carbon/ee/plan.server";
+import { getLogger } from "@carbon/logger";
+import { Button, RecordOutlet, ScrollArea } from "@carbon/react";
+import { redirect, redirectExternal } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import { Trans } from "@lingui/react/macro";
+import { LuHistory } from "react-icons/lu";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { Link, useLoaderData } from "react-router";
+import { SettingsPage, SettingsPageHeading } from "~/components/SettingsPage";
+import { usePlanGate } from "~/hooks/usePlanGate";
+import { AuditLogSettings, AuditLogUpgradeOverlay } from "~/modules/settings";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+const logger = getLogger("erp", "settings-audit-logs");
+
+export const handle: Handle = {
+  breadcrumb: msg`Audit Log`,
+  to: path.to.auditLog
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "settings"
+  });
+
+  // Check if audit log is enabled for this company
+  let enabled = false;
+  try {
+    enabled = await isAuditLogEnabled(client, companyId);
+  } catch {
+    // Table might not exist yet, that's ok
+  }
+
+  const serviceRole = getCarbonServiceRole();
+
+  // Controlled environments (ITAR/CUI, NIST 800-171 3.3.1): audit logging is on
+  // by default and cannot be turned off. Enable it on demand for any controlled
+  // company that isn't already capturing. This is mandatory, not the viewer's
+  // choice, so it runs as the service role: create_audit_log_table requires
+  // settings_update, and this loader only requires settings_view.
+  if (CONTROLLED_ENVIRONMENT && !enabled) {
+    try {
+      await enableAuditLog(serviceRole, companyId);
+      enabled = true;
+    } catch {
+      // Best-effort; the write path degrades gracefully if it can't enable here.
+    }
+  }
+
+  // Sync subscriptions to pick up any newly added auditable tables
+  if (enabled) {
+    try {
+      await syncAuditSubscriptions(client, companyId);
+    } catch {
+      // Subscription sync failure is non-critical
+    }
+  }
+
+  // Get archives (uses service role to bypass RLS on auditLogArchive table)
+  let archives: Awaited<ReturnType<typeof getAuditLogArchives>> = [];
+  if (enabled) {
+    try {
+      archives = await getAuditLogArchives(serviceRole, companyId);
+    } catch {
+      // Archives table might not exist
+    }
+  }
+
+  return {
+    enabled,
+    archives,
+    controlled: CONTROLLED_ENVIRONMENT
+  };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    update: "settings"
+  });
+
+  const formData = await request.formData();
+  const actionType = formData.get("action") as string;
+
+  switch (actionType) {
+    case "enable": {
+      await requireFeature({
+        request,
+        client,
+        companyId,
+        feature: "AUDIT_LOG",
+        redirectTo: path.to.auditLog,
+        message: "Upgrade to Business to enable audit logging"
+      });
+
+      try {
+        await enableAuditLog(client, companyId);
+        throw redirect(
+          path.to.auditLog,
+          await flash(request, success("Audit logging enabled"))
+        );
+      } catch (err) {
+        if (err instanceof Response) throw err;
+        throw redirect(
+          path.to.auditLog,
+          await flash(request, error(err, "Failed to enable audit logging"))
+        );
+      }
+    }
+
+    case "disable": {
+      // Controlled environments cannot turn audit logging off (3.3.1).
+      if (CONTROLLED_ENVIRONMENT) {
+        throw redirect(
+          path.to.auditLog,
+          await flash(
+            request,
+            error(
+              null,
+              "Audit logging cannot be disabled in a controlled environment"
+            )
+          )
+        );
+      }
+      try {
+        await disableAuditLog(client, companyId);
+        throw redirect(
+          path.to.auditLog,
+          await flash(request, success("Audit logging disabled"))
+        );
+      } catch (err) {
+        if (err instanceof Response) throw err;
+        throw redirect(
+          path.to.auditLog,
+          await flash(request, error(err, "Failed to disable audit logging"))
+        );
+      }
+    }
+
+    case "download": {
+      const archiveId = formData.get("archiveId") as string;
+      if (!archiveId) {
+        throw redirect(
+          path.to.auditLog,
+          await flash(request, error(null, "Archive ID is required"))
+        );
+      }
+
+      try {
+        const serviceRole = getCarbonServiceRole();
+        const downloadUrl = await getArchiveDownloadUrl(
+          serviceRole,
+          archiveId,
+          companyId
+        );
+        // Redirect to the signed URL for download
+        return redirectExternal(downloadUrl);
+      } catch (err) {
+        logger.error("Failed to generate audit archive download URL", {
+          companyId,
+          archiveId,
+          error: err
+        });
+        throw redirect(
+          path.to.auditLog,
+          await flash(request, error(err, "Failed to generate download URL"))
+        );
+      }
+    }
+
+    default:
+      throw redirect(
+        path.to.auditLog,
+        await flash(request, error(null, "Invalid action"))
+      );
+  }
+}
+
+export default function AuditLogRoute() {
+  const { enabled, archives, controlled } = useLoaderData<typeof loader>();
+  const { isGated } = usePlanGate({ feature: "AUDIT_LOG" });
+
+  if (isGated) {
+    return <AuditLogUpgradeOverlay />;
+  }
+
+  return (
+    <ScrollArea className="w-full h-[calc(100dvh-var(--topbar-height)-var(--content-inset))]">
+      <SettingsPage className="gap-4">
+        <div className="flex items-center justify-between w-full max-md:justify-end">
+          <SettingsPageHeading>
+            <Trans>Audit Logs</Trans>
+          </SettingsPageHeading>
+          {enabled && (
+            <Button variant="secondary" leftIcon={<LuHistory />} asChild>
+              <Link to={path.to.auditLogDetails}>
+                <Trans>View All</Trans>
+              </Link>
+            </Button>
+          )}
+        </div>
+        <AuditLogSettings
+          enabled={enabled}
+          archives={archives}
+          controlled={controlled}
+        />
+        {enabled && <RecordOutlet />}
+      </SettingsPage>
+    </ScrollArea>
+  );
+}

@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { TextArea, ValidatedForm } from "@carbon/form";
+import {
+  Button,
+  Drawer,
+  DrawerBody,
+  DrawerContent,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+  HStack,
+  useCloseRoute,
+  VStack
+} from "@carbon/react";
+import type { CalendarDateTime } from "@internationalized/date";
+import {
+  getLocalTimeZone,
+  parseAbsolute,
+  toCalendarDateTime
+} from "@internationalized/date";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useState } from "react";
+import type { z } from "zod";
+import {
+  DateTimePicker,
+  Employee,
+  Hidden,
+  Select,
+  Submit,
+  WorkCenter
+} from "~/components/Form";
+import { usePermissions } from "~/hooks";
+import { productionEventValidator } from "../../production.models";
+
+type ProductionEventFormProps = {
+  initialValues: z.infer<typeof productionEventValidator>;
+  operationOptions: {
+    label: string;
+    value: string;
+    helperText?: string;
+    processId?: string | null;
+  }[];
+};
+
+const ProductionEventForm = ({
+  initialValues,
+  operationOptions
+}: ProductionEventFormProps) => {
+  const permissions = usePermissions();
+  const { t } = useLingui();
+  const closeRoute = useCloseRoute();
+
+  const eventTypeOptions = [
+    { label: t`Labor`, value: "Labor" },
+    { label: t`Machine`, value: "Machine" },
+    { label: t`Setup`, value: "Setup" }
+  ];
+  const onClose = () => closeRoute();
+
+  const [jobOperationId, setJobOperationId] = useState(
+    initialValues.jobOperationId ?? ""
+  );
+  const processId =
+    operationOptions.find((option) => option.value === jobOperationId)
+      ?.processId ?? undefined;
+
+  const [startTime, setStartTime] = useState(
+    toCalendarDateTime(
+      parseAbsolute(initialValues.startTime, getLocalTimeZone())
+    )
+  );
+  const [endTime, setEndTime] = useState<CalendarDateTime | undefined>(
+    initialValues.endTime
+      ? toCalendarDateTime(
+          parseAbsolute(initialValues.endTime, getLocalTimeZone())
+        )
+      : undefined
+  );
+  const isEditing = initialValues.id !== undefined;
+  const isDisabled = isEditing
+    ? !permissions.can("update", "production")
+    : !permissions.can("create", "production");
+  return (
+    <Drawer
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DrawerContent>
+        <ValidatedForm
+          validator={productionEventValidator}
+          method="post"
+          defaultValues={initialValues}
+          className="flex flex-col h-full"
+        >
+          <DrawerHeader>
+            <DrawerTitle>
+              {isEditing ? (
+                <Trans>Edit Production Event</Trans>
+              ) : (
+                <Trans>Create Production Event</Trans>
+              )}
+            </DrawerTitle>
+          </DrawerHeader>
+          <DrawerBody>
+            <Hidden name="id" />
+
+            <VStack spacing={4}>
+              <Select
+                name="jobOperationId"
+                label={t`Operation`}
+                termId="operation"
+                options={operationOptions ?? []}
+                onChange={(value) => setJobOperationId(value?.value ?? "")}
+              />
+              <Employee name="employeeId" label={t`Employee`} />
+              <WorkCenter
+                name="workCenterId"
+                label={t`Work Center`}
+                termId="work-center"
+                processId={processId}
+              />
+              <Select
+                name="type"
+                label={t`Event Type`}
+                termId="production-event-type"
+                options={eventTypeOptions}
+              />
+              <DateTimePicker
+                name="startTime"
+                label={t`Start Time`}
+                maxValue={endTime}
+                onChange={setStartTime}
+              />
+              <DateTimePicker
+                name="endTime"
+                label={t`End Time`}
+                minValue={startTime}
+                onChange={setEndTime}
+              />
+              <TextArea name="notes" label={t`Notes`} />
+            </VStack>
+          </DrawerBody>
+          <DrawerFooter>
+            <HStack>
+              <Submit isDisabled={isDisabled}>
+                <Trans>Save</Trans>
+              </Submit>
+              <Button variant="solid" onClick={onClose}>
+                <Trans>Cancel</Trans>
+              </Button>
+            </HStack>
+          </DrawerFooter>
+        </ValidatedForm>
+      </DrawerContent>
+    </Drawer>
+  );
+};
+
+export default ProductionEventForm;

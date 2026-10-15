@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { requireFeature } from "@carbon/ee/plan.server";
+import { upsertEnforcementRule } from "@carbon/ee/rules.server";
+import { validationError, validator } from "@carbon/form";
+import type { TargetType } from "@carbon/utils";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { data, useLoaderData, useNavigate } from "react-router";
+import { storageRuleValidator } from "~/modules/inventory";
+import StorageRuleForm from "~/modules/inventory/ui/StorageRules/StorageRuleForm";
+import { getParams, path } from "~/utils/path";
+
+const isTargetType = (value: string | null): value is TargetType =>
+  value === "item" || value === "workCenter";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  await requirePermissions(request, { create: "inventory" });
+  const url = new URL(request.url);
+  const raw = url.searchParams.get("targetType");
+  return { targetType: isTargetType(raw) ? raw : ("item" as TargetType) };
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    create: "inventory"
+  });
+
+  await requireFeature({
+    request,
+    client,
+    companyId,
+    feature: "STORAGE_RULES",
+    redirectTo: path.to.storageRules
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(storageRuleValidator).validate(formData);
+  if (validation.error) return validationError(validation.error);
+
+  const insert = await upsertEnforcementRule(client, "storage", companyId, {
+    ...validation.data,
+    description: validation.data.description ?? null,
+    createdBy: userId
+  });
+
+  if (insert.error) {
+    return data(
+      {},
+      await flash(request, error(insert.error, "Failed to create rule"))
+    );
+  }
+
+  throw redirect(`${path.to.storageRules}?${getParams(request)}`);
+}
+
+export default function NewStorageRuleRoute() {
+  const { targetType } = useLoaderData<typeof loader>();
+  const navigate = useNavigate();
+  // navigate(-1) breaks when the page was opened directly (no history entry
+  // to pop). Always navigate forward to the parent list route — closes the
+  // drawer regardless of how the user got here.
+  return (
+    <StorageRuleForm
+      initialValues={{ targetType }}
+      onClose={() => navigate(path.to.storageRules)}
+    />
+  );
+}

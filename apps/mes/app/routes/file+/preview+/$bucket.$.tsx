@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import type { CompanyBucket } from "@carbon/files";
+import {
+  effectiveExtension,
+  fileResponseHeaders,
+  getCompanyPrivateBucket,
+  getContentType,
+  imageTransformErrorMessage,
+  isStorageNotFound,
+  isUnsafeStoragePath,
+  LEGACY_PRIVATE_BUCKET,
+  storage,
+  storageErrorStatus,
+  TEMP_STAGING_BUCKET
+} from "@carbon/files";
+import { getLogger } from "@carbon/logger";
+import type { LoaderFunctionArgs } from "react-router";
+
+const log = getLogger("mes");
+
+export let loader = async ({ request, params }: LoaderFunctionArgs) => {
+  // Employees only: the read below uses the service role, so this is the whole
+  // gate. A customer or supplier portal account is also a session in the company
+  // and would otherwise read every private file it has.
+  const { companyId } = await requirePermissions(request, { role: "employee" });
+  const { bucket } = params;
+  let path = params["*"];
+
+  if (!bucket) throw new Error("Bucket not found");
+  if (!path) throw new Error("Path not found");
+
+  // Don't decode the path here - let Supabase handle the URL encoding
+  // path = decodeURIComponent(path);
+
+  const fileType = path.split(".").pop()?.toLowerCase();
+
+  if (!fileType) {
+    return new Response(null, { status: 400 });
+  }
+  // Retained CAD raws are stored zstd-compressed (`raw.step.zst`, …) to keep
+  // them from lingering as the fat upload. Decompress on the way out so a
+  // download yields the original, openable file. The content-type + extension
+  // come from the underlying format, not the `.zst` wrapper.
+  const isZst = fileType === "zst";
+  const effectiveType = effectiveExtension(path);
+  // HEIC is converted at upload, so this only serves legacy files and paths
+  // that bypass the app (API uploads): browsers outside Safari can't render
+  // HEIC, so ask storage for the imgproxy JPEG rendition instead.
+  const isHeicFile = effectiveType === "heic" || effectiveType === "heif";
+  let contentType = getContentType(effectiveType);
+
+  // Authorize against the companyId as a full path segment (prefix or
+  // slash-bounded), not a loose substring — `.includes(companyId)` lets
+  // `<otherCo>/.../<yourCompanyId>.pdf` serve another company's private file.
+  if (isUnsafeStoragePath(path)) {
+    log.warn("Refused a storage path that escapes its prefix", {
+      companyId,
+      bucket,
+      path
+    });
+    return new Response(null, { status: 400 });
+  }
+  const decodedPath = decodeURIComponent(path);
+  const ownsPath =
+    decodedPath.startsWith(`${companyId}/`) ||
+    decodedPath.includes(`/${companyId}/`);
+  if (!ownsPath) {
+    log.warn("Refused file preview outside the caller's company", {
+      companyId,
+      bucket,
+      path
+    });
+    return new Response(null, { status: 403 });
+  }
+
+  // `public` and `temp-staging` are shared buckets legitimately served through
+  // this route (file previews, staged CAD raw downloads); any other bucket id
+  // that isn't the caller's own company bucket (or legacy `private`) would be
+  // another tenant's private bucket — refuse it. The ownsPath check alone is
+  // not enough: a slash-bounded match allows `<otherCo>/x/<yourCo>/file`.
+  const isPrivateBucket =
+    bucket === getCompanyPrivateBucket(companyId) ||
+    bucket === LEGACY_PRIVATE_BUCKET;
+  if (
+    !isPrivateBucket &&
+    bucket !== "public" &&
+    bucket !== TEMP_STAGING_BUCKET
+  ) {
+    log.warn("Refused file preview from another bucket", {
+      companyId,
+      bucket
+    });
+    return new Response(null, { status: 403 });
+  }
+
+  const serviceRole = await getCarbonServiceRole();
+  // A company-private request reads the company bucket with legacy fallback;
+  // any other bucket is read as-is.
+  const source: Pick<CompanyBucket, "download"> = isPrivateBucket
+    ? storage(serviceRole).company(companyId)
+    : storage(serviceRole).from(bucket);
+
+  async function downloadFile() {
+    if (!path) throw new Error("Path not found");
+    if (isHeicFile) {
+      const transformed = await source.download(path, {
+        transform: { quality: 85 }
+      });
+      if (!transformed.error) {
+        // imgproxy may negotiate webp via Accept — trust the blob, not the path
+        contentType = transformed.data.type || "image/jpeg";
+        return transformed;
+      }
+      // No imgproxy (off by default locally, or a stale self-host stack) —
+      // fall through to the raw bytes; Safari can still render them.
+      log.error(
+        imageTransformErrorMessage(
+          transformed.error,
+          "Failed to transform HEIC file"
+        ),
+        { path, error: transformed.error }
+      );
+    }
+    // Use the original encoded path for the storage API call
+    return source.download(path);
+  }
+
+  const result = await downloadFile();
+  if (result.error) {
+    log.error("Failed to download file", {
+      path,
+      status: storageErrorStatus(result.error),
+      error: result.error
+    });
+    // A missing object is a clean 404, not a 500 — consumers (e.g. the model
+    // download flow) branch on the status; an opaque error page body must
+    // never be saved to disk as if it were the file.
+    // Anything else is a real failure and must not pass for a miss.
+    return new Response(null, {
+      status: (await isStorageNotFound(result.error)) ? 404 : 500
+    });
+  }
+  const fileData = result.data;
+
+  const headers = fileResponseHeaders(
+    contentType,
+    "private, max-age=31536000, immutable"
+  );
+
+  if (isZst) {
+    // Stream the storage object through a zstd decompress transform (Node
+    // >=22.15/24) rather than buffering the whole file — the decompressed source
+    // can be large, and this keeps memory flat.
+    const { createZstdDecompress } = await import("node:zlib");
+    const { Readable } = await import("node:stream");
+    const source = Readable.fromWeb(
+      fileData.stream() as import("node:stream/web").ReadableStream
+    );
+    const decompressed = source.pipe(createZstdDecompress());
+    return new Response(
+      Readable.toWeb(decompressed) as unknown as ReadableStream,
+      { status: 200, headers }
+    );
+  }
+
+  return new Response(fileData, { status: 200, headers });
+};

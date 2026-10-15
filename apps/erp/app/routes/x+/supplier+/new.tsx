@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { ActionFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { NewRecordPage } from "~/components/NewRecordPage";
+import { useSupplierApprovalRequired, useUser } from "~/hooks";
+import { supplierValidator, upsertSupplier } from "~/modules/purchasing";
+import SupplierForm from "~/modules/purchasing/ui/Supplier/SupplierForm";
+import { setCustomFields } from "~/utils/form";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: msg`Suppliers`,
+  to: path.to.suppliers,
+  module: "purchasing"
+};
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    create: "purchasing"
+  });
+
+  const formData = await request.formData();
+  const modal = formData.get("type") === "modal";
+
+  const validation = await validator(supplierValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  // biome-ignore lint/correctness/noUnusedVariables: suppressed due to migration
+  const { id, ...d } = validation.data;
+
+  const createSupplier = await upsertSupplier(client, {
+    ...d,
+    companyId,
+    createdBy: userId,
+    customFields: setCustomFields(formData)
+  });
+  if (createSupplier.error) {
+    return modal
+      ? data(
+          createSupplier,
+          await flash(
+            request,
+            error(createSupplier.error, createSupplier.error.message)
+          )
+        )
+      : redirect(
+          path.to.suppliers,
+          await flash(
+            request,
+            error(createSupplier.error, createSupplier.error.message)
+          )
+        );
+  }
+
+  const supplierId = createSupplier.data?.id;
+
+  return modal ? createSupplier : redirect(path.to.supplier(supplierId));
+}
+
+export default function SuppliersNewRoute() {
+  const { company } = useUser();
+  const supplierApprovalRequired = useSupplierApprovalRequired();
+
+  const initialValues = {
+    name: "",
+    supplierStatus: (supplierApprovalRequired ? "Pending" : undefined) as
+      | "Pending"
+      | undefined,
+    currencyCode: company?.baseCurrencyCode ?? undefined,
+    phone: "",
+    fax: "",
+    website: ""
+  };
+  return (
+    <NewRecordPage className="max-md:p-0">
+      <SupplierForm initialValues={initialValues} />
+    </NewRecordPage>
+  );
+}

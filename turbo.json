@@ -1,0 +1,99 @@
+{
+  "$schema": "https://turborepo.org/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build", "//#lingui:compile"],
+      "inputs": ["$TURBO_DEFAULT$", "!**/AGENTS.md", "!**/CLAUDE.md"],
+      "env": ["ASSETS_URL", "VERCEL"],
+      "outputs": [
+        "dist/**",
+        "build/**",
+        "api/**",
+        ".vercel/**",
+        "public/build/**",
+        ".next/**",
+        "!.next/cache/**"
+      ]
+    },
+    "@carbon/documents#build": {
+      "inputs": ["scripts/generate-fonts.mjs", "package.json"],
+      "outputs": ["src/pdf/fonts.data.ts"]
+    },
+    "//#lingui:compile": {
+      "inputs": ["lingui.config.js", "packages/locale/locales/**/*.po"],
+      "outputs": ["packages/locale/locales/**/*.mjs"]
+    },
+    "transit": {
+      "dependsOn": ["^transit"],
+      "inputs": ["$TURBO_DEFAULT$", "!**/AGENTS.md", "!**/CLAUDE.md"]
+    },
+    "test": {
+      "dependsOn": ["^build", "transit"],
+      "inputs": ["$TURBO_DEFAULT$", "!**/AGENTS.md", "!**/CLAUDE.md"],
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["transit"],
+      "inputs": ["$TURBO_DEFAULT$", "!**/AGENTS.md", "!**/CLAUDE.md"],
+      "outputs": [".react-router/types/**", ".source/**", "lib/*.generated.ts"]
+    },
+    "lint": {
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "!**/AGENTS.md",
+        "!**/CLAUDE.md",
+        "$TURBO_ROOT$/biome.jsonc"
+      ],
+      "outputs": []
+    },
+    "dev": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    },
+    "clean": {
+      "cache": false
+    },
+    "deploy": {
+      "dependsOn": ["^build"],
+      "cache": false
+    },
+    "db:types": {
+      "outputs": [],
+      "cache": true
+    },
+    "db:init": {
+      "outputs": []
+    },
+    "db:migrate": {
+      "outputs": [],
+      "cache": false
+    },
+    "db:seed": {
+      "outputs": [],
+      "cache": false
+    },
+    "typegen": {
+      "cache": false,
+      "outputs": []
+    },
+    "//#generate:mcp": {
+      "inputs": [
+        "apps/erp/app/modules/**/*.ts",
+        "apps/erp/app/types/**",
+        "apps/erp/app/utils/**",
+        "apps/erp/app/routes/api+/mcp+/lib/mcp-blocked-tools.ts",
+        "apps/erp/app/routes/api+/mcp+/lib/mcp-exposure.ts",
+        "apps/erp/tsconfig.json",
+        "packages/{account,api,database,documents,files,locale,logger,notifications,printing,server-functions,utils}/src/**",
+        "packages/database/supabase/migrations/**",
+        "scripts/generate-mcp.ts",
+        "scripts/lib/**"
+      ],
+      "outputs": [
+        "apps/erp/app/routes/api+/mcp+/lib/tool-metadata.json",
+        "apps/erp/app/routes/api+/mcp+/lib/tool-manifest.digest.json"
+      ]
+    }
+  }
+}

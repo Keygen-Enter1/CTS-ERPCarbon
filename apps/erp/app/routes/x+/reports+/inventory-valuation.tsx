@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { datetime } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import { hasAccountingCutover } from "~/modules/accounting/accounting.utils";
+import {
+  getInventoryValuation,
+  getInventoryValuationTieOut,
+  InventoryValuationWorkbench
+} from "~/modules/inventory";
+import { getCompanySettings } from "~/modules/settings";
+import { getCompanyTimeZone } from "~/modules/shared/timezone.server";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: msg`Inventory Valuation`,
+  to: path.to.inventoryValuation,
+  module: "accounting"
+};
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "accounting"
+  });
+
+  const url = new URL(request.url);
+  const asOfDate =
+    url.searchParams.get("asOfDate") ??
+    datetime.today(await getCompanyTimeZone(client, companyId)).toString();
+  const groupBy: "location" | "item" =
+    url.searchParams.get("groupBy") === "item" ? "item" : "location";
+  const locationId = url.searchParams.get("locationId") || null;
+
+  // The tie-out only means something once journals count — skip it entirely
+  // before the accounting cutover (tieOut: null hides the panel).
+  const companySettings = await getCompanySettings(client, companyId);
+  const accountingSetUp = hasAccountingCutover(companySettings.data);
+
+  const [valuation, tieOut, locations] = await Promise.all([
+    getInventoryValuation(client, companyId, { asOfDate, locationId }),
+    accountingSetUp
+      ? getInventoryValuationTieOut(client, companyId, asOfDate)
+      : Promise.resolve({ data: null, error: null }),
+    client
+      .from("location")
+      .select("id, name")
+      .eq("companyId", companyId)
+      .order("name")
+  ]);
+
+  // A failed valuation query must surface, not render as an empty report.
+  if (valuation.error) {
+    throw new Error(valuation.error.message);
+  }
+
+  return {
+    asOfDate,
+    groupBy,
+    locationId,
+    rows: valuation.data ?? [],
+    tieOut: tieOut.data ?? null,
+    // A failed tie-out must read as "unavailable", not "nothing to tie out" —
+    // this is a financial control surface.
+    tieOutError: Boolean(tieOut.error),
+    locations: locations.data ?? []
+  };
+}
+
+export default function InventoryValuationRoute() {
+  const {
+    asOfDate,
+    groupBy,
+    locationId,
+    rows,
+    tieOut,
+    tieOutError,
+    locations
+  } = useLoaderData<typeof loader>();
+  return (
+    <InventoryValuationWorkbench
+      rows={rows}
+      tieOut={tieOut}
+      tieOutError={tieOutError}
+      asOfDate={asOfDate}
+      groupBy={groupBy}
+      locationId={locationId}
+      locations={locations}
+    />
+  );
+}

@@ -1,0 +1,644 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Button,
+  Count,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  Input,
+  InputGroup,
+  InputLeftElement,
+  MENU_ITEM_SHORTCUTS,
+  useDisclosure,
+  useMount,
+  VStack
+} from "@carbon/react";
+import { distinctItemText, getItemReadableId } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Suspense, useState } from "react";
+import {
+  LuChevronDown,
+  LuChevronRight,
+  LuCirclePlus,
+  LuEllipsisVertical,
+  LuSearch,
+  LuSettings2,
+  LuTrash,
+  LuTruck
+} from "react-icons/lu";
+import { Await, Link, useNavigate, useParams } from "react-router";
+import {
+  Empty,
+  Hyperlink,
+  ItemThumbnail,
+  MethodIcon,
+  MethodItemTypeIcon
+} from "~/components";
+import type { DragHandleBindings } from "~/components/LineReorder";
+import {
+  ReorderableLineList,
+  ReorderableRow,
+  ReorderEditBar,
+  useLineOrderEditMode
+} from "~/components/LineReorder";
+import { LevelLine } from "~/components/TreeView";
+import {
+  useOptimisticLocation,
+  usePermissions,
+  useRealtime,
+  useRouteData,
+  useUser
+} from "~/hooks";
+import { getLinkToItemDetails } from "~/modules/items/ui/Item/ItemForm";
+import type { ItemType } from "~/modules/shared";
+import { itemType } from "~/modules/shared";
+import { EXPLORER_SHORTCUTS } from "~/shortcuts";
+import { useItems } from "~/stores/items";
+import { path } from "~/utils/path";
+import { isSalesOrderLocked } from "../../sales.models";
+import type {
+  Customer,
+  SalesOrder,
+  SalesOrderLine,
+  SalesOrderRelatedItems
+} from "../../types";
+import DeleteSalesOrderLine from "./DeleteSalesOrderLine";
+import SalesOrderLineForm from "./SalesOrderLineForm";
+
+// Define types for the related items
+type RelatedItem = {
+  id: string;
+  documentReadableId: string;
+  documentId?: string;
+};
+
+type RelatedItemNode = {
+  key: "jobs" | "shipments";
+  name: string;
+  module: string;
+  children: RelatedItem[];
+};
+
+function getRelatedItems(
+  items: SalesOrderRelatedItems,
+  lineId: string
+): RelatedItemNode[] {
+  return [
+    {
+      key: "jobs",
+      name: "Jobs",
+      module: "production",
+      children:
+        items.jobs
+          ?.filter((job) => job.salesOrderLineId === lineId)
+          .map((job) => ({
+            id: job.id ?? "",
+            documentReadableId: job.jobId ?? "",
+            documentId: job.id ?? ""
+          })) ?? []
+    },
+    {
+      key: "shipments",
+      name: "Shipments",
+      module: "inventory",
+      children: items.shipments
+        .filter((shipment) =>
+          shipment.shipmentLine.some(
+            (line) => line.lineId === lineId && line.shippedQuantity > 0
+          )
+        )
+        .map((shipment) => ({
+          id: shipment.id ?? "",
+          documentReadableId: shipment.shipmentId ?? "",
+          documentId: shipment.id ?? ""
+        }))
+    }
+  ];
+}
+
+export default function SalesOrderExplorer() {
+  const { defaults } = useUser();
+  const { orderId } = useParams();
+  if (!orderId) throw new Error("Could not find orderId");
+  const salesOrderData = useRouteData<{
+    salesOrder: SalesOrder;
+    lines: SalesOrderLine[];
+    customer: Customer;
+  }>(path.to.salesOrder(orderId));
+  const permissions = usePermissions();
+
+  const salesOrderLineInitialValues = {
+    salesOrderId: orderId,
+    salesOrderLineType: "Part" as const,
+    saleQuantity: 1,
+    unitPrice: 0,
+    addOnCost: 0,
+    nonTaxableAddOnCost: 0,
+    locationId:
+      salesOrderData?.salesOrder?.locationId ?? defaults.locationId ?? "",
+    taxPercent: salesOrderData?.customer?.taxPercent ?? 0,
+    promisedDate:
+      salesOrderData?.salesOrder?.receiptPromisedDate ??
+      salesOrderData?.salesOrder?.receiptRequestedDate ??
+      "",
+    shippingCost: 0
+  };
+
+  const newSalesOrderLineDisclosure = useDisclosure();
+  const deleteLineDisclosure = useDisclosure();
+  const [deleteLine, setDeleteLine] = useState<SalesOrderLine | null>(null);
+  const isLocked = isSalesOrderLocked(salesOrderData?.salesOrder?.status);
+  const isDisabled = isLocked
+    ? true
+    : salesOrderData?.salesOrder?.status !== "Draft";
+
+  const modelPaths = (salesOrderData?.lines ?? [])
+    .map((d) => d.modelPath)
+    .filter(Boolean);
+  useRealtime(
+    "modelUpload",
+    modelPaths.length ? `modelPath=in.(${modelPaths.join(",")})` : undefined
+  );
+
+  const onDeleteLine = (line: SalesOrderLine) => {
+    setDeleteLine(line);
+    deleteLineDisclosure.onOpen();
+  };
+
+  const onDeleteCancel = () => {
+    setDeleteLine(null);
+    deleteLineDisclosure.onClose();
+  };
+
+  const lines = salesOrderData?.lines ?? [];
+  const canReorder =
+    !isDisabled && permissions.can("update", "sales") && lines.length > 1;
+
+  const editMode = useLineOrderEditMode<SalesOrderLine>({
+    actionPath: path.to.salesOrderLineOrder(orderId),
+    lines
+  });
+
+  return (
+    <>
+      <VStack className="w-full h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] justify-between">
+        <VStack
+          className="flex-1 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent"
+          spacing={0}
+        >
+          {lines.length > 0 ? (
+            editMode.isEditing ? (
+              <ReorderableLineList<SalesOrderLine>
+                lines={editMode.draft}
+                activeLine={editMode.activeLine}
+                onDragStart={editMode.handleDragStart}
+                onDragEnd={editMode.handleDragEnd}
+                renderRow={(line, dragHandle) => (
+                  <SalesOrderLineBody line={line} dragHandle={dragHandle} />
+                )}
+                renderOverlay={(line) => (
+                  <SalesOrderLineBody line={line} isOverlay />
+                )}
+              />
+            ) : (
+              lines.map((line) => (
+                <SalesOrderLineItem
+                  key={line.id}
+                  isDisabled={isDisabled}
+                  line={line}
+                  onDelete={onDeleteLine}
+                />
+              ))
+            )
+          ) : (
+            <Empty>
+              {permissions.can("update", "sales") && (
+                <Button
+                  isDisabled={isDisabled}
+                  leftIcon={<LuCirclePlus />}
+                  variant="secondary"
+                  onClick={newSalesOrderLineDisclosure.onOpen}
+                >
+                  <Trans>Add Line Item</Trans>
+                </Button>
+              )}
+            </Empty>
+          )}
+        </VStack>
+        <div className="w-full flex border-t border-border p-4 gap-2">
+          {editMode.isEditing ? (
+            <ReorderEditBar
+              isSaving={editMode.isSaving}
+              isDirty={editMode.isDirty}
+              onSave={editMode.save}
+              onCancel={editMode.cancelEditMode}
+            />
+          ) : (
+            <>
+              <Button
+                className="flex-1"
+                shortcut={EXPLORER_SHORTCUTS.addLine}
+                isDisabled={isDisabled || !permissions.can("update", "sales")}
+                leftIcon={<LuCirclePlus />}
+                variant="secondary"
+                onClick={newSalesOrderLineDisclosure.onOpen}
+              >
+                <Trans>Add Line Item</Trans>
+              </Button>
+              {canReorder && lines.length > 0 && (
+                <IconButton
+                  aria-label="Reorder lines"
+                  icon={<LuSettings2 />}
+                  variant="ghost"
+                  className="text-muted-foreground"
+                  onClick={editMode.enterEditMode}
+                />
+              )}
+            </>
+          )}
+        </div>
+      </VStack>
+      {newSalesOrderLineDisclosure.isOpen && (
+        <SalesOrderLineForm
+          initialValues={salesOrderLineInitialValues}
+          type="modal"
+          onClose={newSalesOrderLineDisclosure.onClose}
+        />
+      )}
+      {deleteLineDisclosure.isOpen && (
+        <DeleteSalesOrderLine line={deleteLine!} onCancel={onDeleteCancel} />
+      )}
+    </>
+  );
+}
+
+function SalesOrderLineBody({
+  line,
+  dragHandle,
+  isOverlay
+}: {
+  line: SalesOrderLine;
+  dragHandle?: DragHandleBindings;
+  isOverlay?: boolean;
+}) {
+  const [items] = useItems();
+  const readableId = getItemReadableId(items, line.itemId);
+  const description = distinctItemText(readableId, line.description);
+  return (
+    <ReorderableRow dragHandle={dragHandle} isOverlay={isOverlay}>
+      <HStack spacing={2} className="flex-grow min-w-0 p-2 pr-10">
+        <ItemThumbnail thumbnailPath={line.thumbnailPath} type="Part" />
+        <VStack spacing={0} className="min-w-0">
+          <span className="font-semibold line-clamp-1">{readableId}</span>
+          {description && (
+            <span className="text-muted-foreground text-xs truncate line-clamp-1">
+              {description}
+            </span>
+          )}
+        </VStack>
+      </HStack>
+    </ReorderableRow>
+  );
+}
+
+type SalesOrderLineItemProps = {
+  line: SalesOrderLine;
+  isDisabled: boolean;
+  onDelete: (line: SalesOrderLine) => void;
+};
+
+function SalesOrderLineItem({
+  line,
+  isDisabled,
+  onDelete
+}: SalesOrderLineItemProps) {
+  const { orderId, lineId } = useParams();
+  if (!orderId) throw new Error("Could not find orderId");
+
+  const [items] = useItems();
+  const permissions = usePermissions();
+  const disclosure = useDisclosure();
+  const location = useOptimisticLocation();
+  const navigate = useNavigate();
+  const searchDisclosure = useDisclosure();
+
+  useMount(() => {
+    if (lineId === line.id) {
+      disclosure.onOpen();
+    }
+  });
+
+  const isSelected =
+    location.pathname === path.to.salesOrderLine(orderId, line.id!);
+
+  const secondaryText =
+    line.salesOrderLineType === "Fixed Asset"
+      ? (line as any).assetName || line.description
+      : distinctItemText(
+          getItemReadableId(items, line.itemId),
+          line.description
+        );
+
+  const onLineClick = () => {
+    if (location.pathname !== path.to.salesOrderLine(orderId, line.id!)) {
+      navigate(path.to.salesOrderLine(orderId, line.id!));
+    }
+  };
+
+  return (
+    <VStack spacing={0} className="border-b">
+      <HStack
+        className={cn(
+          "group w-full p-2 items-center hover:bg-accent/30 cursor-pointer relative",
+          isSelected && "bg-accent/60 hover:bg-accent/50"
+        )}
+        onClick={onLineClick}
+      >
+        <HStack spacing={2} className="flex-grow min-w-0 pr-10">
+          <ItemThumbnail
+            thumbnailPath={line.thumbnailPath}
+            type="Part" // TODO
+          />
+
+          <VStack spacing={0} className="min-w-0">
+            <span className="font-semibold line-clamp-1">
+              {line.salesOrderLineType === "Fixed Asset"
+                ? (line as any).assetReadableId || "Fixed Asset"
+                : getItemReadableId(items, line.itemId)}
+            </span>
+            {secondaryText && (
+              <span className="text-muted-foreground text-xs truncate line-clamp-1">
+                {secondaryText}
+              </span>
+            )}
+          </VStack>
+        </HStack>
+        <div className="absolute right-2">
+          <HStack spacing={1}>
+            <IconButton
+              aria-label={disclosure.isOpen ? "Hide" : "Show"}
+              className={cn(
+                "animate md:opacity-0 group-hover:opacity-100 group-active:opacity-100 data-[state=open]:opacity-100",
+                disclosure.isOpen && "-rotate-180"
+              )}
+              icon={<LuChevronDown />}
+              size="md"
+              variant="solid"
+              onClick={(e) => {
+                e.stopPropagation();
+                disclosure.onToggle();
+              }}
+            />
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  aria-label="More"
+                  className="md:opacity-0 group-hover:opacity-100 group-active:opacity-100 data-[state=open]:opacity-100"
+                  icon={<LuEllipsisVertical />}
+                  size="md"
+                  variant="solid"
+                  onClick={(e) => e.stopPropagation()}
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.delete}
+                  destructive
+                  disabled={isDisabled || !permissions.can("update", "sales")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(line);
+                  }}
+                >
+                  <DropdownMenuIcon icon={<LuTrash />} />
+                  <Trans>Delete Line</Trans>
+                </DropdownMenuItem>
+                {/* @ts-expect-error */}
+                {itemType.includes(line?.salesOrderLineType ?? "") && (
+                  <DropdownMenuItem
+                    shortcut={MENU_ITEM_SHORTCUTS.view}
+                    asChild
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Link
+                      to={getLinkToItemDetails(
+                        line.salesOrderLineType as ItemType,
+                        line.itemId!
+                      )}
+                    >
+                      <DropdownMenuIcon
+                        icon={<MethodItemTypeIcon type={"Part"} />}
+                      />
+                      <Trans>View Item Master</Trans>
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem onClick={searchDisclosure.onOpen}>
+                  <DropdownMenuIcon icon={<LuSearch />} />
+                  <Trans>Search</Trans>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </HStack>
+        </div>
+      </HStack>
+      {disclosure.isOpen && (
+        <VStack className="border-b border-border p-1">
+          <RelatedItems
+            lineId={line.id!}
+            isSearchExpanded={searchDisclosure.isOpen}
+          />
+        </VStack>
+      )}
+    </VStack>
+  );
+}
+
+function RelatedItems({
+  lineId,
+  isSearchExpanded
+}: {
+  lineId: string;
+  isSearchExpanded: boolean;
+}) {
+  const { orderId } = useParams();
+  if (!orderId) throw new Error("Could not find orderId");
+
+  const salesOrderData = useRouteData<{
+    relatedItems: Promise<SalesOrderRelatedItems>;
+  }>(path.to.salesOrder(orderId));
+
+  return (
+    <Suspense
+      fallback={
+        <div className="p-2 text-sm text-muted-foreground">
+          Loading related items...
+        </div>
+      }
+    >
+      <Await resolve={salesOrderData?.relatedItems}>
+        {(relatedItemsData) => {
+          // Process the related items for this specific line
+          // @ts-expect-error
+          const relatedItems = getRelatedItems(relatedItemsData, lineId);
+
+          return (
+            <SalesOrderLineRelatedItems
+              relatedItems={relatedItems}
+              isSearchExpanded={isSearchExpanded}
+            />
+          );
+        }}
+      </Await>
+    </Suspense>
+  );
+}
+
+type SalesOrderLineRelatedItemsProps = {
+  relatedItems: RelatedItemNode[];
+  isSearchExpanded: boolean;
+};
+
+// Component to display related items tree for a sales order line
+function SalesOrderLineRelatedItems({
+  relatedItems,
+  isSearchExpanded
+}: SalesOrderLineRelatedItemsProps) {
+  const { t } = useLingui();
+  const [filterText, setFilterText] = useState("");
+
+  return (
+    <VStack className="w-full p-2">
+      {isSearchExpanded && (
+        <HStack className="w-full pb-2">
+          <InputGroup size="sm" className="flex flex-grow">
+            <InputLeftElement>
+              <LuSearch className="h-4 w-4" />
+            </InputLeftElement>
+            <Input
+              placeholder={t`Search related items...`}
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+            />
+          </InputGroup>
+        </HStack>
+      )}
+      <VStack spacing={0} className="w-full">
+        {relatedItems.map((node) => (
+          <RelatedItemTreeNode
+            key={node.key}
+            node={node}
+            filterText={filterText}
+          />
+        ))}
+      </VStack>
+    </VStack>
+  );
+}
+
+// Component to display a node in the related items tree
+function RelatedItemTreeNode({
+  node,
+  filterText
+}: {
+  node: RelatedItemNode;
+  filterText: string;
+}) {
+  const [isExpanded, setIsExpanded] = useState(true);
+
+  const filteredChildren = node.children.filter((child) =>
+    child.documentReadableId.toLowerCase().includes(filterText.toLowerCase())
+  );
+
+  return (
+    <>
+      <button
+        className="flex h-8 cursor-pointer items-center overflow-hidden rounded-sm px-2 gap-2 text-sm hover:bg-accent w-full font-medium"
+        onClick={(e) => {
+          e.stopPropagation();
+          setIsExpanded(!isExpanded);
+        }}
+      >
+        <div className="h-8 w-4 flex items-center justify-center">
+          <LuChevronRight className={cn("size-4", isExpanded && "rotate-90")} />
+        </div>
+        <div className="flex flex-grow items-center justify-between gap-2">
+          <span>{node.name}</span>
+          {filteredChildren.length > 0 && (
+            <Count count={filteredChildren.length} />
+          )}
+        </div>
+      </button>
+      {isExpanded && (
+        <div className="flex flex-col w-full">
+          {filteredChildren.length === 0 ? (
+            <div className="flex h-8 items-center overflow-hidden rounded-sm px-2 gap-4">
+              <LevelLine isSelected={false} />
+              <div className="text-xs text-muted-foreground">
+                No {node.name.toLowerCase()} found
+              </div>
+            </div>
+          ) : (
+            filteredChildren.map((child) => (
+              <RelatedItemLink
+                key={child.id}
+                item={child}
+                nodeType={node.key}
+              />
+            ))
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+// Component to display a link to a related item
+function RelatedItemLink({
+  item,
+  nodeType
+}: {
+  item: RelatedItem;
+  nodeType: "jobs" | "shipments";
+}) {
+  const getLinkForItem = (): string => {
+    switch (nodeType) {
+      case "jobs":
+        return item.documentId ? path.to.job(item.documentId) : "#";
+      case "shipments":
+        return item.documentId ? path.to.shipment(item.documentId) : "#";
+      default:
+        return "#";
+    }
+  };
+
+  const getIcon = () => {
+    switch (nodeType) {
+      case "jobs":
+        return <MethodIcon type="Make to Order" />;
+      case "shipments":
+        return <LuTruck className="text-indigo-600" />;
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <Hyperlink
+      to={getLinkForItem()}
+      className="flex h-8 cursor-pointer items-center overflow-hidden rounded-sm px-1 gap-4 text-sm hover:bg-accent w-full font-medium whitespace-nowrap"
+    >
+      <LevelLine isSelected={false} className="mr-2" />
+      <div className="mr-2">{getIcon()}</div>
+      <span className="truncate">{item.documentReadableId}</span>
+    </Hyperlink>
+  );
+}

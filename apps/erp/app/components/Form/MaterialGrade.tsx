@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { CreatableCombobox } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import { useDisclosure } from "@carbon/react";
+import { useLingui } from "@lingui/react/macro";
+import { useMemo, useRef, useState } from "react";
+import type {
+  getMaterialGradeList,
+  MaterialGrade as MaterialGradeType
+} from "~/modules/items";
+import MaterialGradeForm from "~/modules/items/ui/MaterialGrades/MaterialGradeForm";
+import { path } from "~/utils/path";
+import { useEmptyState } from "./emptyStates";
+
+type MaterialGradeSelectProps = Omit<
+  ComboboxProps,
+  "options" | "onChange" | "inline"
+> & {
+  substanceId?: string;
+  inline?: boolean;
+  onChange?: (grade: MaterialGradeType | null) => void;
+};
+
+const MaterialGradePreview = (
+  value: string,
+  options: { value: string; label: string | JSX.Element }[]
+) => {
+  const grade = options.find((o) => o.value === value);
+  if (!grade) return null;
+  return <span>{grade.label}</span>;
+};
+
+const MaterialGrade = (props: MaterialGradeSelectProps) => {
+  const { t } = useLingui();
+  const materialGradesLoader = useLoaderQuery<
+    Awaited<ReturnType<typeof getMaterialGradeList>>
+  >(props.substanceId ? path.to.api.materialGrades(props.substanceId) : null);
+
+  const newGradeModal = useDisclosure();
+  const [created, setCreated] = useState<string>("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const options = useMemo(() => {
+    return (materialGradesLoader.data?.data ?? []).map((c) => ({
+      value: c.id,
+      label: c.name,
+      helper: c.companyId === null ? "Standard" : "Custom"
+    }));
+  }, [materialGradesLoader.data?.data]);
+
+  const onChange = (
+    newValue: { label: string | JSX.Element; value: string } | null
+  ) => {
+    const grade =
+      materialGradesLoader.data?.data?.find(
+        (grade) => grade.id === newValue?.value
+      ) ?? null;
+
+    props.onChange?.(grade as MaterialGradeType | null);
+  };
+
+  const emptyMessage = useEmptyState(
+    "materialGrade",
+    props.substanceId ? { onCreate: () => newGradeModal.onOpen() } : undefined
+  );
+
+  return (
+    <>
+      <CreatableCombobox
+        ref={triggerRef}
+        options={options}
+        {...props}
+        disabled={props.disabled || !props.substanceId}
+        helperText={
+          props.helperText ??
+          (!props.inline && !props.substanceId
+            ? t`Select a substance first to see available options`
+            : undefined)
+        }
+        inline={props?.inline ? MaterialGradePreview : undefined}
+        isOptional={props?.isOptional ?? true}
+        label={props?.label ?? "Grade"}
+        emptyMessage={emptyMessage}
+        onChange={onChange}
+        onCreateOption={(option) => {
+          newGradeModal.onOpen();
+          setCreated(option);
+        }}
+      />
+      {newGradeModal.isOpen && (
+        <MaterialGradeForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newGradeModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            name: created,
+            materialSubstanceId: props.substanceId!
+          }}
+        />
+      )}
+    </>
+  );
+};
+
+export default MaterialGrade;

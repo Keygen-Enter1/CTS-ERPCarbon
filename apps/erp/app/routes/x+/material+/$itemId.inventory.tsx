@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { getStorageRulesDataForTarget } from "@carbon/ee/rules.server";
+import { validationError, validator } from "@carbon/form";
+import { VStack } from "@carbon/react";
+import { pluckUnique, redirect } from "@carbon/utils";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import { useStorageUnits } from "~/components/Form/StorageUnit";
+import { useRouteData } from "~/hooks";
+import {
+  getTrackedEntityExpirations,
+  InventoryDetails
+} from "~/modules/inventory";
+import RuleAssignmentsList from "~/modules/inventory/ui/StorageRules/RuleAssignmentsList";
+import type { Material, UnitOfMeasureListItem } from "~/modules/items";
+import {
+  getBomHasShelfLifeManagedInput,
+  getItemQuantities,
+  getItemShelfLife,
+  getItemStorageUnitQuantities,
+  getPickMethod,
+  pickMethodWithShelfLifeValidator,
+  type shelfLifeModes,
+  upsertPickMethod,
+  upsertPickMethodWithShelfLife
+} from "~/modules/items";
+import { PickMethodForm } from "~/modules/items/ui/Item";
+import { getLocationsList } from "~/modules/resources";
+import { getUserDefaults } from "~/modules/users/users.server";
+import { getDatabaseClient } from "~/services/database.server";
+import { useItems } from "~/stores";
+import type { ListItem } from "~/types";
+import { getCustomFields, setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId, userId } = await requirePermissions(request, {
+    view: "parts"
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const url = new URL(request.url);
+  const searchParams = new URLSearchParams(url.search);
+  let locationId = searchParams.get("location");
+
+  // Three waits at most: what needs no location is read while the
+  // default location is, and everything that needs it is read together.
+  const [userDefaults, shelfLife, bomHasShelfLifeManagedInput, rulesData] =
+    await Promise.all([
+      locationId ? null : getUserDefaults(client, userId, companyId),
+      getItemShelfLife(client, itemId),
+      getBomHasShelfLifeManagedInput(client, itemId, companyId),
+      getStorageRulesDataForTarget(client, {
+        targetType: "item",
+        targetId: itemId,
+        companyId
+      })
+    ]);
+
+  if (userDefaults) {
+    if (userDefaults.error) {
+      throw redirect(
+        path.to.material(itemId),
+        await flash(
+          request,
+          error(userDefaults.error, "Failed to load default location")
+        )
+      );
+    }
+
+    locationId = userDefaults.data?.locationId ?? null;
+  }
+
+  if (!locationId) {
+    const locations = await getLocationsList(client, companyId);
+    if (locations.error || !locations.data?.length) {
+      throw redirect(
+        path.to.material(itemId),
+        await flash(
+          request,
+          error(locations.error, "Failed to load any locations")
+        )
+      );
+    }
+    locationId = locations.data?.[0].id as string;
+  }
+
+  let [materialInventory, quantities, itemStorageUnitQuantities] =
+    await Promise.all([
+      getPickMethod(client, itemId, companyId, locationId),
+      getItemQuantities(client, itemId, companyId, locationId),
+      getItemStorageUnitQuantities(client, itemId, companyId, locationId)
+    ]);
+
+  if (materialInventory.error || !materialInventory.data) {
+    const insertPickMethod = await upsertPickMethod(client, {
+      itemId,
+      companyId,
+      locationId,
+      customFields: {},
+      createdBy: userId
+    });
+
+    if (insertPickMethod.error) {
+      throw redirect(
+        path.to.material(itemId),
+        await flash(
+          request,
+          error(insertPickMethod.error, "Failed to insert material inventory")
+        )
+      );
+    }
+
+    materialInventory = await getPickMethod(
+      client,
+      itemId,
+      companyId,
+      locationId
+    );
+    if (materialInventory.error || !materialInventory.data) {
+      throw redirect(
+        path.to.material(itemId),
+        await flash(
+          request,
+          error(materialInventory.error, "Failed to load material inventory")
+        )
+      );
+    }
+  }
+
+  if (quantities.error) {
+    throw redirect(
+      path.to.items,
+      await flash(
+        request,
+        error(quantities, "Failed to load material quantities")
+      )
+    );
+  }
+
+  if (itemStorageUnitQuantities.error || !itemStorageUnitQuantities.data) {
+    throw redirect(
+      path.to.items,
+      await flash(
+        request,
+        error(itemStorageUnitQuantities, "Failed to load material quantities")
+      )
+    );
+  }
+
+  const trackedEntityIds = pluckUnique(
+    itemStorageUnitQuantities.data,
+    (row) => row.trackedEntityId
+  );
+
+  const trackedEntityExpirations = await getTrackedEntityExpirations(
+    client,
+    trackedEntityIds
+  );
+
+  return {
+    materialInventory: materialInventory.data,
+    itemStorageUnitQuantities: itemStorageUnitQuantities.data,
+    quantities: quantities.data,
+    shelfLife: shelfLife.data,
+    bomHasShelfLifeManagedInput,
+    trackedEntityExpirations,
+    itemId,
+    locationId,
+    ruleAssignments: rulesData.assignments,
+    ruleLibrary: rulesData.library
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { companyId, userId } = await requirePermissions(request, {
+    update: "parts"
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const formData = await request.formData();
+  const validation = await validator(pickMethodWithShelfLifeValidator).validate(
+    formData
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const {
+    shelfLifeMode,
+    shelfLifeDays,
+    shelfLifeTriggerProcessId,
+    shelfLifeTriggerTiming,
+    shelfLifeCalculateFromBom,
+    ...pickMethodFields
+  } = validation.data;
+
+  try {
+    await upsertPickMethodWithShelfLife(getDatabaseClient(), {
+      itemId,
+      locationId: pickMethodFields.locationId,
+      defaultStorageUnitId: pickMethodFields.defaultStorageUnitId,
+      sortMethod: pickMethodFields.sortMethod,
+      customFields: setCustomFields(formData),
+      companyId,
+      userId,
+      shelfLife: {
+        mode: shelfLifeMode,
+        days: shelfLifeDays,
+        triggerProcessId: shelfLifeTriggerProcessId,
+        triggerTiming: shelfLifeTriggerTiming,
+        calculateFromBom: shelfLifeCalculateFromBom
+      }
+    });
+  } catch (err) {
+    throw redirect(
+      path.to.material(itemId),
+      await flash(request, error(err, "Failed to update material inventory"))
+    );
+  }
+
+  throw redirect(
+    path.to.materialInventoryLocation(itemId, pickMethodFields.locationId),
+    await flash(request, success("Updated material inventory"))
+  );
+}
+
+export default function MaterialInventoryRoute() {
+  const sharedMaterialsData = useRouteData<{
+    locations: ListItem[];
+    unitOfMeasures: UnitOfMeasureListItem[];
+  }>(path.to.materialRoot);
+
+  const {
+    materialInventory,
+    itemStorageUnitQuantities,
+    quantities,
+    shelfLife,
+    bomHasShelfLifeManagedInput,
+    trackedEntityExpirations,
+    itemId,
+    ruleAssignments,
+    ruleLibrary
+  } = useLoaderData<typeof loader>();
+
+  const materialData = useRouteData<{
+    materialSummary: Material;
+  }>(path.to.material(itemId));
+  if (!materialData) throw new Error("Could not find material data");
+  const itemUnitOfMeasureCode =
+    materialData?.materialSummary?.unitOfMeasureCode;
+
+  const initialValues = {
+    ...materialInventory,
+    defaultStorageUnitId: materialInventory.defaultStorageUnitId ?? undefined,
+    shelfLifeMode: shelfLife?.mode as
+      | (typeof shelfLifeModes)[number]
+      | undefined,
+    shelfLifeDays: shelfLife?.days ?? undefined,
+    shelfLifeTriggerProcessId: shelfLife?.triggerProcessId ?? undefined,
+    shelfLifeTriggerTiming: shelfLife?.triggerTiming ?? undefined,
+    shelfLifeCalculateFromBom: shelfLife?.calculateFromBom ?? false,
+    ...getCustomFields(materialInventory.customFields ?? {})
+  };
+
+  const [items] = useItems();
+  const item = items.find((i) => i.id === itemId);
+  const itemTrackingType = item?.itemTrackingType;
+  const replenishmentSystem = item?.replenishmentSystem ?? null;
+
+  const storageUnits = useStorageUnits(materialInventory?.locationId);
+
+  return (
+    <VStack spacing={4} className="p-4">
+      <PickMethodForm
+        key={`${initialValues.itemId}-${itemTrackingType ?? "Inventory"}`}
+        initialValues={initialValues}
+        locations={sharedMaterialsData?.locations ?? []}
+        storageUnits={storageUnits.options}
+        type="Material"
+        itemTrackingType={itemTrackingType ?? "Inventory"}
+        replenishmentSystem={replenishmentSystem}
+        bomHasShelfLifeManagedInput={bomHasShelfLifeManagedInput}
+      />
+      <InventoryDetails
+        itemStorageUnitQuantities={itemStorageUnitQuantities}
+        itemUnitOfMeasureCode={itemUnitOfMeasureCode ?? "EA"}
+        itemTrackingType={itemTrackingType ?? "Inventory"}
+        itemShelfLife={shelfLife ?? null}
+        trackedEntityExpirations={trackedEntityExpirations}
+        pickMethod={initialValues}
+        quantities={quantities}
+        storageUnits={storageUnits.options}
+      />
+      <RuleAssignmentsList
+        targetType="item"
+        targetId={itemId}
+        assignments={ruleAssignments as never}
+        library={ruleLibrary as never}
+      />
+    </VStack>
+  );
+}

@@ -1,0 +1,742 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useCarbon } from "@carbon/auth";
+import { convertKbToString, downloadUrl, storage } from "@carbon/files";
+import { getLogger } from "@carbon/logger";
+import { useRevalidator } from "@carbon/query";
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+  File,
+  HStack,
+  IconButton,
+  MENU_ITEM_SHORTCUTS,
+  Table,
+  Tbody,
+  Td,
+  Th,
+  Thead,
+  Tr,
+  toast,
+  VStack
+} from "@carbon/react";
+import { MODEL_RAW_KEEP_MAX_BYTES } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { FileObject } from "@supabase/storage-js";
+import type { ChangeEvent } from "react";
+import { useCallback } from "react";
+import { LuEllipsisVertical, LuUpload } from "react-icons/lu";
+import { Link, useFetchers, useSubmit } from "react-router";
+import {
+  DateTime,
+  DocumentPreview,
+  FileDropzone,
+  Hyperlink,
+  ModelOptimizedIndicator
+} from "~/components";
+import DocumentIcon from "~/components/DocumentIcon";
+import { Enumerable } from "~/components/Enumerable";
+import { useFileUpload, usePermissions, useUser } from "~/hooks";
+import type { OptimisticFileObject } from "~/modules/shared";
+import { getDocumentType } from "~/modules/shared";
+import type { ModelUpload } from "~/types";
+import { downloadModelFile } from "~/utils/download";
+import { path } from "~/utils/path";
+import { stripSpecialCharacters } from "~/utils/string";
+
+const logger = getLogger("erp", "sales", "opportunity-documents");
+
+const useOpportunityLineDocuments = ({
+  id,
+  lineId,
+  itemId,
+  type
+}: {
+  id: string;
+  lineId: string;
+  itemId?: string | null;
+  type: "Request for Quote" | "Sales Order" | "Quote" | "Sales Invoice";
+}) => {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  const revalidator = useRevalidator();
+  const { carbon } = useCarbon();
+  const { company } = useUser();
+  const submit = useSubmit();
+
+  const canDelete = permissions.can("delete", "sales");
+  const canUpdate = permissions.can("update", "sales");
+
+  const getPath = useCallback(
+    (
+      file: { name: string },
+      bucket: "opportunity-line" | "parts" = "opportunity-line"
+    ) => {
+      if (bucket === "parts" && itemId) {
+        return `${company.id}/parts/${itemId}/${stripSpecialCharacters(
+          file.name
+        )}`;
+      }
+      return `${company.id}/opportunity-line/${lineId}/${stripSpecialCharacters(
+        file.name
+      )}`;
+    },
+    [company.id, lineId, itemId]
+  );
+
+  const deleteFile = useCallback(
+    async (file: FileObject & { bucket?: string }) => {
+      const bucket = file.bucket === "parts" ? "parts" : "opportunity-line";
+      if (!carbon) {
+        toast.error("Error deleting file");
+        return;
+      }
+      const { error } = await storage(carbon)
+        .company(company.id)
+        .remove([getPath(file, bucket as "opportunity-line" | "parts")]);
+
+      if (error) {
+        toast.error(error.message || "Error deleting file");
+        return;
+      }
+
+      toast.success(t`${file.name} deleted successfully`);
+      revalidator.revalidate();
+    },
+    [getPath, carbon, revalidator, t, company.id]
+  );
+
+  const deleteModel = useCallback(
+    async (lineId: string) => {
+      if (!lineId || !carbon) return;
+
+      const [
+        salesRfqLineResult,
+        quoteLineResult,
+        salesOrderLineResult,
+        salesInvoiceLineResult
+      ] = await Promise.all([
+        carbon
+          .from("salesRfqLine")
+          .update({ modelUploadId: null })
+          .eq("id", lineId),
+        carbon
+          .from("quoteLine")
+          .update({ modelUploadId: null })
+          .eq("id", lineId),
+        carbon
+          .from("salesOrderLine")
+          .update({ modelUploadId: null })
+          .eq("id", lineId),
+        carbon
+          .from("salesInvoiceLine")
+          .update({ modelUploadId: null })
+          .eq("id", lineId)
+      ]);
+
+      if (salesRfqLineResult.error) {
+        toast.error(t`Error removing model from RFQ line`);
+        return;
+      }
+
+      if (quoteLineResult.error) {
+        toast.error(t`Error removing model from quote line`);
+        return;
+      }
+
+      if (salesOrderLineResult.error) {
+        toast.error(t`Error removing model from sales order line`);
+        return;
+      }
+
+      if (salesInvoiceLineResult.error) {
+        toast.error(t`Error removing model from sales invoice line`);
+        return;
+      }
+
+      toast.success(t`Model removed from line`);
+      revalidator.revalidate();
+    },
+    [carbon, revalidator, t]
+  );
+
+  const downloadModel = useCallback(
+    async (model: ModelUpload) => {
+      const result = await downloadModelFile(model);
+      if (result === "unavailable") {
+        toast.error(t`The original model file is no longer available`);
+      } else if (result === "error") {
+        toast.error(t`Error downloading file`);
+      }
+    },
+
+    [t]
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+  const download = useCallback(
+    async (file: FileObject & { bucket?: string }) => {
+      const bucket = file.bucket === "parts" ? "parts" : "opportunity-line";
+      const url = path.to.file.previewFile(
+        `private/${getPath(file, bucket as "opportunity-line" | "parts")}`
+      );
+      try {
+        await downloadUrl(url, file.name);
+      } catch (error) {
+        toast.error(t`Error downloading file`);
+        logger.error("Failed to process file operation", { error });
+      }
+    },
+
+    []
+  );
+
+  const getModelPath = useCallback((model: ModelUpload) => {
+    if (!model?.modelId) {
+      return "";
+    }
+    return path.to.file.cadModel(model.modelId);
+  }, []);
+
+  const createDocumentRecord = useCallback(
+    ({
+      path: filePath,
+      name,
+      size,
+      bucket = "opportunity-line"
+    }: {
+      path: string;
+      name: string;
+      size: number;
+      bucket?: "opportunity-line" | "parts";
+    }) => {
+      const formData = new FormData();
+      formData.append("path", filePath);
+      formData.append("name", name);
+      formData.append("size", Math.round(size / 1024).toString());
+      formData.append("sourceDocument", type);
+      formData.append("sourceDocumentId", id);
+
+      submit(formData, {
+        method: "post",
+        action: path.to.newDocument,
+        navigate: false,
+        fetcherKey: `opportunity-line:${name}`
+      });
+    },
+    [id, submit, type]
+  );
+
+  const { upload: uploadFiles } = useFileUpload();
+  const upload = useCallback(
+    async (
+      files: File[],
+      bucket: "opportunity-line" | "parts" = "opportunity-line"
+    ) => {
+      if (bucket === "parts" && !itemId) {
+        toast.error(t`Cannot upload to parts bucket without item ID`);
+        return;
+      }
+
+      await uploadFiles(files, {
+        getPath: (file) => getPath(file, bucket),
+        onSuccess: (file, uploadedPath) =>
+          createDocumentRecord({
+            path: uploadedPath,
+            name: file.name,
+            size: file.size,
+            bucket
+          })
+      });
+      revalidator.revalidate();
+    },
+    [uploadFiles, getPath, createDocumentRecord, revalidator, itemId, t]
+  );
+
+  const moveFile = useCallback(
+    async (
+      file: FileObject & { bucket?: string },
+      targetBucket: "opportunity-line" | "parts"
+    ) => {
+      if (!carbon) {
+        toast.error(t`Carbon client not available`);
+        return;
+      }
+
+      if (targetBucket === "parts" && !itemId) {
+        toast.error(t`Cannot move to parts bucket without item ID`);
+        return;
+      }
+
+      const currentBucket =
+        file.bucket === "parts" ? "parts" : "opportunity-line";
+
+      if (currentBucket === targetBucket) {
+        toast.error(t`File is already in the selected bucket`);
+        return;
+      }
+
+      try {
+        // Download the file first
+        const sourcePath = getPath(file, currentBucket);
+        const { data: downloadData } = await storage(carbon)
+          .company(company.id)
+          .download(sourcePath);
+
+        if (!downloadData) {
+          toast.error(t`Failed to download file for moving`);
+          return;
+        }
+
+        // Upload to new location
+        const targetPath = getPath(file, targetBucket);
+        const { error: uploadError } = await storage(carbon)
+          .company(company.id)
+          .upload(targetPath, downloadData, {
+            cacheControl: `${12 * 60 * 60}`,
+            upsert: true
+          });
+
+        if (uploadError) {
+          toast.error(t`Failed to upload file to new location`);
+          return;
+        }
+
+        // Delete from old location
+        const { error: deleteError } = await storage(carbon)
+          .company(company.id)
+          .remove([sourcePath]);
+
+        if (deleteError) {
+          toast.error(t`Failed to delete file from old location`);
+          return;
+        }
+
+        toast.success(
+          t`Moved ${file.name} to ${
+            targetBucket === "parts" ? "Parts" : "Opportunity"
+          } bucket`
+        );
+        revalidator.revalidate();
+      } catch (error) {
+        toast.error(t`Error moving file`);
+        logger.error("Failed to process file operation", { error });
+      }
+    },
+    [carbon, itemId, getPath, revalidator, t, company.id]
+  );
+
+  return {
+    canDelete,
+    canUpdate,
+    deleteFile,
+    deleteModel,
+    download,
+    downloadModel,
+    getPath,
+    getModelPath,
+    moveFile,
+    upload
+  };
+};
+
+type OpportunityLineDocumentsProps = {
+  files: FileObject[];
+  id: string;
+  lineId: string;
+  itemId?: string | null;
+  type: "Request for Quote" | "Sales Order" | "Quote" | "Sales Invoice";
+  modelUpload?: ModelUpload;
+  isReadOnly?: boolean;
+};
+
+const OpportunityLineDocuments = ({
+  files,
+  id,
+  lineId,
+  itemId,
+  modelUpload,
+  type,
+  isReadOnly: isReadOnlyProp
+}: OpportunityLineDocumentsProps) => {
+  const {
+    canDelete: canDeleteBase,
+    canUpdate: canUpdateBase,
+    download,
+    downloadModel,
+    deleteFile,
+    deleteModel,
+    getPath,
+    getModelPath,
+    moveFile,
+    upload
+  } = useOpportunityLineDocuments({
+    id,
+    lineId,
+    itemId,
+    type
+  });
+  const canDelete = isReadOnlyProp ? false : canDeleteBase;
+  const canUpdate = isReadOnlyProp ? false : canUpdateBase;
+
+  const onDrop = useCallback(
+    (acceptedFiles: File[]) => {
+      upload(acceptedFiles);
+    },
+    [upload]
+  );
+
+  const attachmentsByName = new Map<string, FileObject | OptimisticFileObject>(
+    files.map((file) => [file.name, file])
+  );
+  const pendingItems = usePendingItems();
+  for (let pendingItem of pendingItems) {
+    let item = attachmentsByName.get(pendingItem.name);
+    let merged = item ? { ...item, ...pendingItem } : pendingItem;
+    attachmentsByName.set(pendingItem.name, merged);
+  }
+
+  const allFiles = Array.from(attachmentsByName.values()).sort((a, b) =>
+    a.name.localeCompare(b.name)
+  ) as FileObject[];
+
+  return (
+    <>
+      <Card className="flex-grow">
+        <HStack className="justify-between items-start">
+          <CardHeader>
+            <CardTitle>
+              <Trans>Files</Trans>
+            </CardTitle>
+          </CardHeader>
+          <CardAction>
+            {!isReadOnlyProp && (
+              <OpportunityLineDocumentForm
+                id={id}
+                type={type}
+                lineId={lineId}
+                itemId={itemId}
+              />
+            )}
+          </CardAction>
+        </HStack>
+        <CardContent>
+          <Table>
+            <Thead>
+              <Tr>
+                <Th>
+                  <Trans>Name</Trans>
+                </Th>
+                <Th>
+                  <Trans>Size</Trans>
+                </Th>
+                <Th>
+                  <Trans>Bucket</Trans>
+                </Th>
+                <Th>
+                  <Trans>Created</Trans>
+                </Th>
+                <Th />
+              </Tr>
+            </Thead>
+            <Tbody>
+              {modelUpload?.modelName &&
+                (modelUpload.modelSize ?? 0) <= MODEL_RAW_KEEP_MAX_BYTES && (
+                  <Tr>
+                    <Td>
+                      <HStack>
+                        <DocumentIcon type="Model" />
+                        <VStack>
+                          <Hyperlink
+                            target="_blank"
+                            to={getModelPath(modelUpload)}
+                          >
+                            {modelUpload.modelName}
+                          </Hyperlink>
+                        </VStack>
+                        <ModelOptimizedIndicator
+                          modelPath={modelUpload.modelPath}
+                        />
+                      </HStack>
+                    </Td>
+                    <Td>
+                      {modelUpload.modelSize
+                        ? convertKbToString(
+                            Math.floor((modelUpload.modelSize ?? 0) / 1024)
+                          )
+                        : "--"}
+                    </Td>
+                    <Td>
+                      <Enumerable value="Model" />
+                    </Td>
+                    <Td className="text-xs font-mono">--</Td>
+                    <Td>
+                      <div className="flex justify-end w-full">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <IconButton
+                              aria-label="More"
+                              icon={<LuEllipsisVertical />}
+                              variant="secondary"
+                            />
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent>
+                            <DropdownMenuItem
+                              shortcut={MENU_ITEM_SHORTCUTS.view}
+                              asChild
+                            >
+                              <Link to={getModelPath(modelUpload)}>
+                                <Trans>View</Trans>
+                              </Link>
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              shortcut={MENU_ITEM_SHORTCUTS.download}
+                              onClick={() => downloadModel(modelUpload)}
+                            >
+                              <Trans>Download</Trans>
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              destructive
+                              disabled={!canDelete}
+                              onClick={() => deleteModel(lineId)}
+                            >
+                              <Trans>Delete</Trans>
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    </Td>
+                  </Tr>
+                )}
+              {allFiles.map((file) => {
+                const type = getDocumentType(file.name);
+                return (
+                  <Tr key={file.id}>
+                    <Td>
+                      <HStack>
+                        <DocumentIcon type={type} />
+                        <span
+                          className="font-medium cursor-pointer"
+                          onClick={() => {
+                            if (["PDF", "Image"].includes(type)) {
+                              const bucket =
+                                (file as any).bucket === "parts"
+                                  ? "parts"
+                                  : "opportunity-line";
+                              window.open(
+                                path.to.file.previewFile(
+                                  `${"private"}/${getPath(
+                                    file,
+                                    bucket as "opportunity-line" | "parts"
+                                  )}`
+                                ),
+                                "_blank"
+                              );
+                            } else {
+                              download(file);
+                            }
+                          }}
+                        >
+                          {["PDF", "Image"].includes(type) ? (
+                            <DocumentPreview
+                              bucket="private"
+                              pathToFile={getPath(
+                                file,
+                                (file as any).bucket === "parts"
+                                  ? "parts"
+                                  : "opportunity-line"
+                              )}
+                              // @ts-expect-error
+                              type={type}
+                            >
+                              {file.name}
+                            </DocumentPreview>
+                          ) : (
+                            file.name
+                          )}
+                        </span>
+                      </HStack>
+                    </Td>
+                    <Td>
+                      {convertKbToString(
+                        Math.floor((file.metadata?.size ?? 0) / 1024)
+                      )}
+                    </Td>
+                    <Td>
+                      <Enumerable
+                        value={
+                          (file as any).bucket === "parts"
+                            ? "Item"
+                            : "Opportunity"
+                        }
+                      />
+                    </Td>
+                    <Td className="text-xs font-mono">
+                      {file.created_at ? (
+                        <DateTime value={file.created_at} variant="date" />
+                      ) : (
+                        "--"
+                      )}
+                    </Td>
+                    <Td>
+                      <div className="flex justify-end w-full">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <IconButton
+                              aria-label="More"
+                              icon={<LuEllipsisVertical />}
+                              variant="secondary"
+                            />
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent>
+                            <DropdownMenuItem
+                              shortcut={MENU_ITEM_SHORTCUTS.download}
+                              onClick={() => download(file)}
+                            >
+                              <Trans>Download</Trans>
+                            </DropdownMenuItem>
+                            {itemId && (
+                              <DropdownMenuSub>
+                                <DropdownMenuSubTrigger disabled={!canUpdate}>
+                                  <Trans>Move to</Trans>
+                                </DropdownMenuSubTrigger>
+                                <DropdownMenuSubContent>
+                                  <DropdownMenuRadioGroup
+                                    value={
+                                      (file as any).bucket === "parts"
+                                        ? "parts"
+                                        : "opportunity-line"
+                                    }
+                                    onValueChange={(value) =>
+                                      moveFile(
+                                        file,
+                                        value as "opportunity-line" | "parts"
+                                      )
+                                    }
+                                  >
+                                    <DropdownMenuRadioItem value="opportunity-line">
+                                      <Trans>Opportunity</Trans>
+                                    </DropdownMenuRadioItem>
+                                    <DropdownMenuRadioItem value="parts">
+                                      <Trans>Item</Trans>
+                                    </DropdownMenuRadioItem>
+                                  </DropdownMenuRadioGroup>
+                                </DropdownMenuSubContent>
+                              </DropdownMenuSub>
+                            )}
+                            <DropdownMenuItem
+                              destructive
+                              disabled={!canDelete}
+                              onClick={() => deleteFile(file)}
+                            >
+                              <Trans>Delete</Trans>
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    </Td>
+                  </Tr>
+                );
+              })}
+              {allFiles.length === 0 && !modelUpload && (
+                <Tr>
+                  <Td
+                    colSpan={5}
+                    className="py-8 text-muted-foreground text-center"
+                  >
+                    <Trans>No files</Trans>
+                  </Td>
+                </Tr>
+              )}
+            </Tbody>
+          </Table>
+          {!isReadOnlyProp && <FileDropzone onDrop={onDrop} />}
+        </CardContent>
+      </Card>
+    </>
+  );
+};
+
+export default OpportunityLineDocuments;
+
+type OpportunityLineDocumentFormProps = {
+  id: string;
+  lineId: string;
+  itemId?: string | null;
+  type: "Request for Quote" | "Sales Order" | "Quote" | "Sales Invoice";
+};
+
+const OpportunityLineDocumentForm = ({
+  id,
+  lineId,
+  itemId,
+  type
+}: OpportunityLineDocumentFormProps) => {
+  const permissions = usePermissions();
+  const { upload } = useOpportunityLineDocuments({ id, lineId, itemId, type });
+
+  const uploadFiles = async (
+    e: ChangeEvent<HTMLInputElement>,
+    bucket: "opportunity-line" | "parts" = "opportunity-line"
+  ) => {
+    if (e.target.files) {
+      upload(Array.from(e.target.files), bucket);
+    }
+  };
+
+  return (
+    <File
+      isDisabled={!permissions.can("update", "sales")}
+      leftIcon={<LuUpload />}
+      onChange={(e) => uploadFiles(e, "opportunity-line")}
+      multiple
+    >
+      <Trans>New</Trans>
+    </File>
+  );
+};
+
+const usePendingItems = () => {
+  type PendingItem = ReturnType<typeof useFetchers>[number] & {
+    formData: FormData;
+  };
+
+  return useFetchers()
+    .filter((fetcher): fetcher is PendingItem => {
+      return fetcher.formAction === path.to.newDocument;
+    })
+    .reduce<OptimisticFileObject[]>((acc, fetcher) => {
+      const path = fetcher.formData.get("path") as string;
+      const name = fetcher.formData.get("name") as string;
+      const size = parseInt(fetcher.formData.get("size") as string, 10) * 1024;
+
+      if (path && name && size) {
+        const newItem: OptimisticFileObject = {
+          id: path,
+          name: name,
+          bucket_id: "private",
+          bucket: "private",
+          metadata: {
+            size,
+            mimetype: getDocumentType(name)
+          }
+        };
+        return [...acc, newItem];
+      }
+      return acc;
+    }, []);
+};

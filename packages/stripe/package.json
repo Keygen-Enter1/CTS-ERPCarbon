@@ -1,0 +1,46 @@
+{
+  "name": "@carbon/stripe",
+  "dependencies": {
+    "@carbon/auth": "workspace:*",
+    "@carbon/database": "workspace:*",
+    "@carbon/env": "workspace:*",
+    "@carbon/files": "workspace:*",
+    "@carbon/kv": "workspace:*",
+    "@carbon/lib": "workspace:*",
+    "@carbon/logger": "workspace:*",
+    "@carbon/utils": "workspace:*",
+    "@internationalized/date": "catalog:",
+    "@supabase/supabase-js": "catalog:",
+    "stripe": "22.4.0"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@carbon/config": "workspace:*",
+    "@types/node": "20.19.39",
+    "dotenv": "16.3.1",
+    "rimraf": "catalog:",
+    "sst": "catalog:",
+    "tsup": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "zod": "catalog:"
+  },
+  "exports": {
+    "./stripe.server": "./src/stripe.server.ts",
+    "./connect.server": "./src/connect.server.ts",
+    "./connect.constants": "./src/connect.constants.ts",
+    "./connect-invoice": "./src/connect-invoice.ts",
+    "./send-sales-invoice.server": "./src/send-sales-invoice.server.ts"
+  },
+  "private": true,
+  "scripts": {
+    "clean": "rimraf .turbo node_modules dist",
+    "dev": "tsup --watch",
+    "lint": "biome lint --write ",
+    "dev:stripe": "tsx ./stripe.dev.ts",
+    "register:stripe": "tsx ./stripe.register.ts",
+    "typecheck": "tsgo --noEmit"
+  },
+  "sideEffects": false,
+  "version": "0.0.0"
+}

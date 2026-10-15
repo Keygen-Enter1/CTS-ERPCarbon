@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+"use client";
+
+import { Skeleton } from "@carbon/react";
+import { useEffect } from "react";
+import { useInView } from "react-intersection-observer";
+import Empty from "./Empty";
+
+interface InfiniteScrollProps<T extends { id: string }> {
+  component: React.FC<{ item: T; highlightId?: string }>;
+  items: T[];
+  loadMore: () => Promise<void>;
+  hasMore: boolean;
+  highlightId?: string;
+}
+
+export function LoadingSkeleton({
+  ref
+}: {
+  ref?: React.RefObject<HTMLDivElement>;
+}) {
+  return (
+    <>
+      {[0, 1, 2].map((i) => (
+        <div
+          key={i}
+          ref={i === 0 ? ref : undefined}
+          className="flex items-center space-x-4 p-4"
+        >
+          <Skeleton className="h-8 w-8 rounded-full" />
+          <div className="space-y-2">
+            <Skeleton className="h-4 w-[250px]" />
+            <Skeleton className="h-4 w-[200px]" />
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+export default function InfiniteScroll<T extends { id: string }>({
+  component: Component,
+  items,
+  loadMore,
+  hasMore,
+  highlightId
+}: InfiniteScrollProps<T>) {
+  const { ref, inView } = useInView({
+    threshold: 0
+  });
+
+  useEffect(() => {
+    if (inView) {
+      loadMore();
+    }
+  }, [inView, loadMore]);
+
+  return (
+    <div className="w-full">
+      <ul className="relative h-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent flex flex-col gap-2">
+        {items.length === 0 ? (
+          <div className="flex pt-16 justify-center">
+            <Empty />
+          </div>
+        ) : (
+          items.map((item) => (
+            <Component key={item.id} item={item} highlightId={highlightId} />
+          ))
+        )}
+        <div ref={ref}>{hasMore && <LoadingSkeleton />}</div>
+      </ul>
+    </div>
+  );
+}

@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { Combobox } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import { HStack } from "@carbon/react";
+import { useMemo } from "react";
+import type { getProceduresList } from "~/modules/production/production.service";
+import ProcedureStatus from "~/modules/production/ui/Procedures/ProcedureStatus";
+import { path } from "~/utils/path";
+import { useEmptyState } from "./emptyStates";
+
+type ProcedureSelectProps = Omit<ComboboxProps, "options"> & {
+  processId?: string;
+  isConfigured?: boolean;
+  onConfigure?: () => void;
+};
+
+const Procedure = (props: ProcedureSelectProps) => {
+  const { options, loading } = useProcedures({
+    processId: props?.processId
+  });
+
+  const emptyMessage = useEmptyState("procedure");
+
+  return (
+    <>
+      <Combobox
+        options={options}
+        isOptional={props?.isOptional ?? true}
+        isLoading={loading}
+        emptyMessage={emptyMessage}
+        {...props}
+        label={props?.label ?? "Procedure"}
+      />
+    </>
+  );
+};
+
+Procedure.displayName = "Procedure";
+
+export default Procedure;
+
+export const useProcedures = (args: { processId?: string }) => {
+  const { processId } = args;
+  const procedureFetcher = useLoaderQuery<
+    Awaited<ReturnType<typeof getProceduresList>>
+  >(path.to.api.procedures);
+
+  const loading = procedureFetcher.isFetching;
+
+  const options = useMemo(
+    () =>
+      procedureFetcher.data?.data
+        ? procedureFetcher.data?.data
+            .filter((f) => {
+              if (processId) {
+                return f.processId === processId;
+              }
+
+              return true;
+            })
+            .map((c) => ({
+              value: c.id!,
+              label: (
+                <div className="flex justify-between items-center gap-1 w-full">
+                  <HStack className="items-end">
+                    <span className="text-sm truncate">{c.name} </span>
+                    <span className="text-xs text-muted-foreground">
+                      v{c.version}
+                    </span>
+                  </HStack>
+                  <ProcedureStatus
+                    status={c.status as "Active" | "Draft" | "Archived"}
+                  />
+                </div>
+              )
+            }))
+        : [],
+    [procedureFetcher.data, processId]
+  );
+
+  return { options, loading };
+};

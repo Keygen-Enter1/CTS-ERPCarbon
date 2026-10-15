@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import type { ActionFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { recalculateQuoteLinePrices } from "~/modules/sales";
+
+export async function action({ request }: ActionFunctionArgs) {
+  const { client, companyId, userId } = await requirePermissions(request, {
+    delete: "sales"
+  });
+
+  const formData = await request.formData();
+  const id = formData.get("id") as string;
+
+  if (!id) {
+    return data(
+      { error: "Operation ID is required" },
+      {
+        status: 400
+      }
+    );
+  }
+
+  // Fetch the operation's quoteId/quoteLineId before deleting
+  const op = await client
+    .from("quoteOperation")
+    .select("quoteId, quoteLineId")
+    .eq("id", id)
+    .eq("companyId", companyId)
+    .single();
+
+  const { error } = await client
+    .from("quoteOperation")
+    .delete()
+    .eq("id", id)
+    .eq("companyId", companyId);
+
+  if (error) {
+    return data(
+      { success: false, error: error.message },
+      {
+        status: 400
+      }
+    );
+  }
+
+  if (op.data) {
+    const serviceRole = getCarbonServiceRole();
+    await recalculateQuoteLinePrices(
+      serviceRole,
+      companyId,
+      op.data.quoteId,
+      op.data.quoteLineId,
+      userId
+    );
+  }
+
+  return { success: true };
+}

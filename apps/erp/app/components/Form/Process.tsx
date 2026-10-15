@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { CreatableCombobox } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import { useDisclosure } from "@carbon/react";
+import { useMemo, useRef, useState } from "react";
+import {
+  batchRuleInitialValues,
+  type getProcessesList
+} from "~/modules/resources";
+import ProcessForm from "~/modules/resources/ui/Processes/ProcessForm";
+import { path } from "~/utils/path";
+import { Enumerable } from "../Enumerable";
+import { useEmptyState } from "./emptyStates";
+
+type ProcessSelectProps = Omit<ComboboxProps, "options" | "inline"> & {
+  isConfigured?: boolean;
+  onConfigure?: () => void;
+  inline?: boolean;
+  /**
+   * Optional override for the option list. When omitted the picker shows
+   * every process in the company. Pass a scoped subset (e.g. processes used
+   * by an item's recipe) to constrain selection. `undefined` means "still
+   * loading" — picker stays empty until data arrives.
+   */
+  options?: { value: string; label: string }[];
+};
+
+const ProcessPreview = (
+  value: string,
+  options: { value: string; label: string | JSX.Element }[]
+) => {
+  const process = options.find((o) => o.value === value);
+  return process?.label ?? null;
+};
+
+const Process = ({
+  options: optionsOverride,
+  ...props
+}: ProcessSelectProps) => {
+  const newProcessModal = useDisclosure();
+  const [created, setCreated] = useState<string>("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const fetched = useProcesses();
+  const sourceOptions = optionsOverride ?? fetched;
+
+  const emptyMessage = useEmptyState("process", {
+    onCreate: () => newProcessModal.onOpen()
+  });
+
+  return (
+    <>
+      <CreatableCombobox
+        ref={triggerRef}
+        options={sourceOptions.map((o) => ({
+          value: o.value,
+          label: <Enumerable value={o.label} />
+        }))}
+        emptyMessage={emptyMessage}
+        {...props}
+        inline={props.inline ? ProcessPreview : undefined}
+        label={props?.label ?? "Work Center"}
+        onCreateOption={(option) => {
+          newProcessModal.onOpen();
+          setCreated(option);
+        }}
+      />
+      {newProcessModal.isOpen && (
+        <ProcessForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newProcessModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            name: created,
+            processType: "Process",
+            defaultStandardFactor: "Minutes/Piece",
+            completeAllOnScan: false,
+            batchable: false,
+            batchType: "Sequential" as const,
+            requiresAbility: false,
+            workCenters: [],
+            ...batchRuleInitialValues(null)
+          }}
+        />
+      )}
+    </>
+  );
+};
+
+Process.displayName = "Process";
+
+export default Process;
+
+export const useProcesses = () => {
+  const fetcher = useLoaderQuery<Awaited<ReturnType<typeof getProcessesList>>>(
+    path.to.api.processes
+  );
+
+  const options = useMemo(
+    () =>
+      fetcher.data?.data
+        ? fetcher.data?.data.map((c) => ({
+            value: c.id,
+            label: c.name
+          }))
+        : [],
+    [fetcher.data]
+  );
+
+  return options;
+};

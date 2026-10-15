@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { Combobox } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import { HStack } from "@carbon/react";
+import { useMemo } from "react";
+import type { getInspectionDocumentsForItem } from "~/modules/quality/quality.service";
+import { path } from "~/utils/path";
+
+type InspectionDocumentSelectProps = Omit<ComboboxProps, "options"> & {
+  itemId?: string;
+};
+
+const InspectionDocument = ({
+  itemId,
+  ...props
+}: InspectionDocumentSelectProps) => {
+  const { options, loading } = useInspectionDocuments({ itemId });
+
+  return (
+    <Combobox
+      options={options}
+      isOptional={props?.isOptional ?? true}
+      isLoading={loading}
+      {...props}
+      label={props?.label ?? "Inspection Plan"}
+    />
+  );
+};
+
+InspectionDocument.displayName = "InspectionDocument";
+
+export default InspectionDocument;
+
+export const useInspectionDocuments = (args: { itemId?: string }) => {
+  const { itemId } = args;
+  const inspectionDocumentFetcher = useLoaderQuery<
+    Awaited<ReturnType<typeof getInspectionDocumentsForItem>>
+  >(itemId ? path.to.api.inspectionDocuments(itemId) : null);
+
+  const loading = inspectionDocumentFetcher.isFetching;
+
+  const options = useMemo(
+    () =>
+      itemId && inspectionDocumentFetcher.data?.data
+        ? inspectionDocumentFetcher.data.data.map((c) => ({
+            value: c.id,
+            label: (
+              <div className="flex justify-between items-center gap-1 w-full">
+                <HStack className="items-end">
+                  <span className="text-sm truncate">
+                    {c.drawingNumber ?? c.fileName ?? c.id}{" "}
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    v{c.version}
+                  </span>
+                </HStack>
+              </div>
+            )
+          }))
+        : [],
+    [inspectionDocumentFetcher.data, itemId]
+  );
+
+  return { options, loading };
+};

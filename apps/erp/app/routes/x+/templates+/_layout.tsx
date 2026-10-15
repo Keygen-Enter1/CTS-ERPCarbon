@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { RecordOutlet } from "@carbon/react";
+import { msg } from "@lingui/core/macro";
+import type { MetaFunction } from "react-router";
+
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export { RouteErrorBoundary as ErrorBoundary } from "@carbon/react/ErrorBoundary";
+
+export const meta: MetaFunction = () => {
+  return [{ title: "Carbon | Document Templates" }];
+};
+
+export const handle: Handle = {
+  breadcrumb: msg`Templates`,
+  to: path.to.documentTemplates,
+  module: "settings"
+};
+
+export default function TemplatesRoute() {
+  return (
+    <div className="h-full w-full bg-card">
+      <RecordOutlet />
+    </div>
+  );
+}

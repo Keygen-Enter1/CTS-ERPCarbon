@@ -1,0 +1,1937 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+import { parseDate } from "@internationalized/date";
+import { z } from "zod";
+import { zfd } from "zod-form-data";
+import { plannedOrderValidator } from "../purchasing/purchasing.models";
+import {
+  methodItemType,
+  methodOperationOrders,
+  methodType,
+  operationTypes,
+  procedureStepType,
+  standardFactorType,
+  toTiptapDoc
+} from "../shared";
+import type {
+  ItemOrderStatus,
+  JobOrderStatusCategory,
+  JobStatus,
+  PurchaseOrderStatus
+} from "./types";
+
+export const KPIs = [
+  {
+    key: "utilization",
+    label: "Work Center Utilization",
+    emptyMessage: "No work center utilization data within range"
+  },
+  {
+    key: "estimatesVsActuals",
+    label: "Estimates vs Actuals",
+    emptyMessage: "No completed jobs within range"
+  },
+  {
+    key: "completionTime",
+    label: "Completion Time",
+    emptyMessage: "No completed jobs within range"
+  }
+] as const;
+
+export const deadlineTypes = [
+  "ASAP",
+  "Hard Deadline",
+  "Soft Deadline",
+  "No Deadline"
+] as const;
+
+// A due date only applies to the two dated deadline types; ASAP / No Deadline
+// ignore it. Single source for both the validators below and the job form UI.
+export function deadlineRequiresDueDate(
+  deadlineType: string | null | undefined
+): boolean {
+  return deadlineType === "Hard Deadline" || deadlineType === "Soft Deadline";
+}
+
+export const jobStatus = [
+  "Draft",
+  "Planned",
+  "Ready",
+  "In Progress",
+  "Paused",
+  "Completed",
+  "Closed",
+  "Cancelled",
+  "Overdue", // deprecated
+  "Due Today" // deprecated
+] as const;
+
+export const planningActionType = [
+  "Order",
+  "Make",
+  "Expedite",
+  "Defer",
+  "Cancel",
+  "Increase",
+  "Decrease",
+  "Release"
+] as const;
+
+export const planningActionStatus = ["Open", "Dismissed", "Actioned"] as const;
+
+// Pure (no lingui / JSX) so the ERP vitest suite can import it directly — the
+// models barrel drags the glossary's lingui macros, which vitest does not
+// transform (see apps/erp/test/job-complete-logic.test.ts).
+export {
+  actionsOfTypes,
+  PLANNING_ACTIONS_COLUMN,
+  PLANNING_ASSIGNEE_COLUMN,
+  PLANNING_DRAWER_PARAM,
+  resolvePlanningActionScope
+} from "./ui/Planning/planning-action-scope";
+
+/**
+ * The job statuses planning may change: Apply on a planning action and the
+ * order drawer's inline edits. An allowlist on purpose — a job past Planned is
+ * on the floor, finished, closed or cancelled, and is reviewed on the job.
+ */
+export const PLANNING_EDITABLE_JOB_STATUSES = ["Draft", "Planned"] as const;
+
+export function isJobEditableFromPlanning(
+  status: Database["public"]["Enums"]["jobStatus"] | null | undefined
+): boolean {
+  return PLANNING_EDITABLE_JOB_STATUSES.some((editable) => editable === status);
+}
+
+// The one definition lives in @carbon/utils, shared with the OEE sync.
+export { isJobLocked, JOB_LOCKED_STATUSES } from "@carbon/utils";
+
+export const DATE_COLUMN_SENTINELS = [
+  "unscheduled",
+  "next-week",
+  "next-month"
+] as const;
+
+export type DateColumnSentinel = (typeof DATE_COLUMN_SENTINELS)[number];
+
+const DATE_COLUMN_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+export function isDateColumnId(value: string): boolean {
+  if (!DATE_COLUMN_PATTERN.test(value)) return false;
+
+  try {
+    parseDate(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isDateColumnSentinel(
+  value: string
+): value is DateColumnSentinel {
+  return DATE_COLUMN_SENTINELS.includes(value as DateColumnSentinel);
+}
+
+export function isScheduleDateColumnId(value: string): boolean {
+  return isDateColumnSentinel(value) || isDateColumnId(value);
+}
+
+/**
+ * Convert a validated Dates board column to the persisted due date. The
+ * sentinel columns intentionally all persist as null; a value outside the
+ * canonical board vocabulary returns undefined for callers that need to
+ * distinguish invalid input from a valid null due date.
+ */
+export function getDueDateForColumn(
+  columnId: string
+): string | null | undefined {
+  if (isDateColumnId(columnId)) return columnId;
+  if (isDateColumnSentinel(columnId)) return null;
+  return undefined;
+}
+
+export const schedulePriorityValidator = z.preprocess(
+  (value) =>
+    typeof value === "string" && value.trim().length === 0 ? undefined : value,
+  zfd.numeric(z.number().refine(Number.isFinite, "Priority must be finite"))
+);
+
+/**
+ * A Queued assemblyPlanJob older than this never got picked up by the worker
+ * (pickup normally takes seconds) — treat it as dead rather than blocking the
+ * UI and re-runs forever. Processing rows are alive regardless of age: large
+ * models legitimately plan for many minutes, and the worker's onFailure flips
+ * them to Failed.
+ */
+const ASSEMBLY_PLAN_QUEUED_STALE_MS = 2 * 60 * 1000;
+// A Processing row with no live worker behind it (worker crash, or the dev
+// Inngest server — which keeps runs in memory — restarting mid-run) would
+// otherwise read as "running" forever: the UI spins and the re-run guard
+// blocks recovery. The worker's own budget is ~30 min of waiting plus
+// retries, so anything past this is an orphan.
+const ASSEMBLY_PLAN_PROCESSING_STALE_MS = 45 * 60 * 1000;
+
+/** Whether a motion-planning run is live (drives badges, polling, re-run guards). */
+export function isAssemblyPlanRunning(
+  job: { status: string; createdAt: string } | null | undefined
+): boolean {
+  if (!job) return false;
+  const age = Date.now() - new Date(job.createdAt).getTime();
+  if (job.status === "Processing") {
+    return age < ASSEMBLY_PLAN_PROCESSING_STALE_MS;
+  }
+  return job.status === "Queued" && age < ASSEMBLY_PLAN_QUEUED_STALE_MS;
+}
+
+export const jobOperationStatus = [
+  "Todo",
+  "Ready",
+  "Waiting",
+  "In Progress",
+  "Paused",
+  "Done",
+  "Canceled"
+] as const;
+
+export const maintenanceDispatchPriority = [
+  "Low",
+  "Medium",
+  "High",
+  "Critical"
+] as const;
+
+export const maintenanceDispatchStatus = [
+  "Open",
+  "Assigned",
+  "In Progress",
+  "Completed",
+  "Cancelled"
+] as const;
+
+export const maintenanceFrequency = [
+  "Daily",
+  "Weekly",
+  "Monthly",
+  "Quarterly",
+  "Annual"
+] as const;
+
+export const maintenanceSeverity = [
+  "Preventive",
+  "Operator Performed",
+  "Support Required",
+  "OEM Required"
+] as const;
+
+export const maintenanceSource = [
+  "Scheduled",
+  "Reactive",
+  "Non-Conformance"
+] as const;
+
+export const oeeImpact = ["Down", "Planned", "Impact", "No Impact"] as const;
+
+export const procedureStatus = ["Draft", "Active", "Archived"] as const;
+
+const baseJobValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  jobId: zfd.text(z.string().optional()),
+  itemId: z.string().min(1, { message: "Item is required" }),
+  customerId: zfd.text(z.string().optional()),
+  dueDate: zfd.text(z.string().optional()),
+  deadlineType: z.enum(deadlineTypes, {
+    error: "Deadline type is required"
+  }),
+  locationId: z.string().min(1, { message: "Location is required" }),
+  quantity: zfd.numeric(
+    z.number().positive({ message: "Quantity must be greater than zero" })
+  ),
+  scrapQuantity: zfd.numeric(z.number().min(0)),
+  startDate: zfd.text(z.string().optional()),
+  unitOfMeasureCode: z
+    .string()
+    .min(1, { message: "Unit of measure is required" }),
+  modelUploadId: zfd.text(z.string().optional()),
+  configuration: z.any().optional(),
+  // Make to Asset: the job completes to a fixed asset instead of inventory —
+  // either capitalised into a class, or its cost swept onto one asset that is
+  // already under construction. At most one is set (DB CHECK, refined below).
+  fixedAssetClassId: zfd.text(z.string().optional()),
+  fixedAssetId: zfd.text(z.string().optional())
+});
+
+export const bulkJobValidator = z
+  .object({
+    itemId: z.string().min(1, { message: "Item is required" }),
+    totalQuantity: zfd.numeric(
+      z
+        .number()
+        .positive({ message: "Total quantity must be greater than zero" })
+    ),
+    quantityPerJob: zfd.numeric(
+      z
+        .number()
+        .positive({ message: "Quantity per job must be greater than zero" })
+    ),
+    scrapQuantityPerJob: zfd.numeric(z.number().min(0)),
+    unitOfMeasureCode: z
+      .string()
+      .min(1, { message: "Unit of measure is required" }),
+    deadlineType: z.enum(deadlineTypes, {
+      error: "Deadline type is required"
+    }),
+    dueDateOfFirstJob: zfd.text(z.string().optional()),
+    dueDateOfLastJob: zfd.text(z.string().optional()),
+    locationId: z.string().min(1, { message: "Location is required" }),
+    customerId: zfd.text(z.string().optional()),
+    modelUploadId: zfd.text(z.string().optional()),
+    configuration: z.any().optional()
+  })
+  .refine(
+    (data) => {
+      if (data.dueDateOfFirstJob && data.dueDateOfLastJob) {
+        return data.dueDateOfFirstJob <= data.dueDateOfLastJob;
+      }
+      return true;
+    },
+    {
+      message: "Due date of first job must be before due date of last job",
+      path: ["dueDateOfLastJob"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (deadlineRequiresDueDate(data.deadlineType)) {
+        return !!data.dueDateOfFirstJob;
+      }
+      return true;
+    },
+    {
+      message: "Due date of first job is required for hard and soft deadlines",
+      path: ["dueDateOfFirstJob"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (deadlineRequiresDueDate(data.deadlineType)) {
+        return !!data.dueDateOfLastJob;
+      }
+      return true;
+    },
+    {
+      message: "Due date of last job is required for hard and soft deadlines",
+      path: ["dueDateOfLastJob"]
+    }
+  );
+
+export const jobValidator = baseJobValidator
+  .refine(
+    (data) => {
+      if (deadlineRequiresDueDate(data.deadlineType) && !data.dueDate) {
+        return false;
+      }
+      return true;
+    },
+    {
+      message: "Due date is required",
+      path: ["dueDate"]
+    }
+  )
+  .refine((data) => !(data.fixedAssetClassId && data.fixedAssetId), {
+    message:
+      "A job completes to a fixed-asset class or to one asset under construction, not both",
+    path: ["fixedAssetId"]
+  });
+
+/**
+ * The Make to Asset item rule, the same one `complete_job_to_inventory`
+ * enforces at completion. A job that targets a class makes new assets, each a
+ * fleet unit that rental, return to inventory and capitalization follow by its
+ * serial, so the item must be serialized. A job attached to an asset under
+ * construction makes no new unit, so an unserialized item is fine there as a
+ * single unit. Returns the refusal, or null when the job may go ahead.
+ */
+export function makeToAssetItemError(job: {
+  fixedAssetClassId?: string | null;
+  fixedAssetId?: string | null;
+  itemTrackingType?: string | null;
+  quantity?: number | null;
+}): string | null {
+  if (job.itemTrackingType === "Serial") return null;
+  if (job.fixedAssetClassId) {
+    return "A job that completes to a fixed asset class needs a serialized item";
+  }
+  if (job.fixedAssetId && Number(job.quantity ?? 0) > 1) {
+    return "Make to Asset needs a serialized item or a quantity of one";
+  }
+  return null;
+}
+
+export const leftoverAction = ["ship", "receive", "split", "discard"] as const;
+export type LeftoverAction = (typeof leftoverAction)[number];
+
+export const jobCompleteValidator = z.object({
+  quantityComplete: zfd.numeric(z.number().min(0)),
+  salesOrderId: zfd.text(z.string().optional()),
+  salesOrderLineId: zfd.text(z.string().optional()),
+  locationId: zfd.text(z.string().optional()),
+  storageUnitId: zfd.text(z.string().optional()),
+  // Leftover handling fields - for when quantityComplete > job.quantity
+  leftoverAction: zfd.text(z.enum(leftoverAction).optional()),
+  leftoverShipQuantity: zfd.numeric(z.number().min(0).optional()),
+  leftoverReceiveQuantity: zfd.numeric(z.number().min(0).optional())
+});
+
+export const salesOrderToJobValidator = baseJobValidator
+  .extend({
+    quoteId: zfd.text(z.string().optional()),
+    quoteLineId: zfd.text(z.string().optional()),
+    salesOrderId: zfd.text(z.string()),
+    salesOrderLineId: zfd.text(z.string())
+  })
+  .refine(
+    (data) => {
+      if (deadlineRequiresDueDate(data.deadlineType) && !data.dueDate) {
+        return false;
+      }
+      return true;
+    },
+    {
+      message: "Due date is required",
+      path: ["dueDate"]
+    }
+  );
+
+export const baseJobOperationValidator = z.object({
+  id: z.string().min(1, { message: "Operation ID is required" }),
+  jobMakeMethodId: z
+    .string()
+    .min(1, { message: "Quote Make Method is required" }),
+  order: zfd.numeric(z.number().min(0)),
+  operationOrder: z.enum(methodOperationOrders, {
+    error: "Operation order is required"
+  }),
+  operationType: z.enum(operationTypes, {
+    error: "Operation type is required"
+  }),
+  processId: z.string().min(1, { message: "Process is required" }),
+  procedureId: zfd.text(z.string().optional()),
+  assemblyInstructionId: zfd.text(z.string().optional()),
+  inspectionDocumentId: zfd.text(z.string().optional()),
+  description: zfd.text(
+    z.string().min(0, { message: "Description is required" })
+  ),
+  setupUnit: z
+    .enum(standardFactorType, {
+      error: "Setup unit is required"
+    })
+    .optional(),
+  setupTime: zfd.numeric(z.number().min(0).optional()),
+  laborUnit: z
+    .enum(standardFactorType, {
+      error: "Labor unit is required"
+    })
+    .optional(),
+  laborTime: zfd.numeric(z.number().min(0).optional()),
+  machineUnit: z
+    .enum(standardFactorType, {
+      error: "Machine unit is required"
+    })
+    .optional(),
+  machineTime: zfd.numeric(z.number().min(0).optional()),
+  machineRate: zfd.numeric(z.number().min(0).optional()),
+  overheadRate: zfd.numeric(z.number().min(0).optional()),
+  laborRate: zfd.numeric(z.number().min(0).optional()),
+  operationSupplierProcessId: zfd.text(z.string().optional()),
+  operationMinimumCost: zfd.numeric(z.number().min(0).optional()),
+  operationUnitCost: zfd.numeric(z.number().min(0).optional()),
+  operationLeadTime: zfd.numeric(z.number().min(0).optional())
+});
+
+export const jobOperationValidator = baseJobOperationValidator
+  .merge(
+    z.object({
+      workCenterId: zfd.text(z.string().optional())
+    })
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Outside Processing") {
+        return Number.isFinite(data.operationMinimumCost);
+      }
+      return true;
+    },
+    {
+      message: "Minimum is required",
+      path: ["operationMinimumCost"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Outside Processing") {
+        return Number.isFinite(data.operationUnitCost);
+      }
+      return true;
+    },
+    {
+      message: "Unit cost is required",
+      path: ["operationUnitCost"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Outside Processing") {
+        return Number.isFinite(data.operationLeadTime);
+      }
+      return true;
+    },
+    {
+      message: "Lead time is required",
+      path: ["operationLeadTime"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return !!data.setupUnit;
+      }
+      return true;
+    },
+    {
+      message: "Setup unit is required",
+      path: ["setupUnit"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return !!data.laborUnit;
+      }
+      return true;
+    },
+    {
+      message: "Labor unit is required",
+      path: ["laborUnit"]
+    }
+  )
+  .refine(
+    (data) => {
+      // Machine only applies to Process operations — Assembly and Inspection
+      // are setup + labor work.
+      if (data.operationType === "Process") {
+        return !!data.machineUnit;
+      }
+      return true;
+    },
+    {
+      message: "Machine unit is required",
+      path: ["machineUnit"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return Number.isFinite(data.setupTime);
+      }
+      return true;
+    },
+    {
+      message: "Setup time is required",
+      path: ["setupTime"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return Number.isFinite(data.laborTime);
+      }
+      return true;
+    },
+    {
+      message: "Labor time is required",
+      path: ["laborTime"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Process") {
+        return Number.isFinite(data.machineTime);
+      }
+      return true;
+    },
+    {
+      message: "Machine time is required",
+      path: ["machineTime"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Process") {
+        return Number.isFinite(data.machineRate);
+      }
+      return true;
+    },
+    {
+      message: "Machine rate is required",
+      path: ["machineRate"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return Number.isFinite(data.overheadRate);
+      }
+      return true;
+    },
+    {
+      message: "Overhead rate is required",
+      path: ["overheadRate"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return Number.isFinite(data.laborRate);
+      }
+      return true;
+    },
+    {
+      message: "Labor rate is required",
+      path: ["laborRate"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Inspection") {
+        return !!data.inspectionDocumentId;
+      }
+      return true;
+    },
+    {
+      message: "Inspection Plan is required",
+      path: ["inspectionDocumentId"]
+    }
+  );
+
+export const jobOperationValidatorForReleasedJob = baseJobOperationValidator
+  .merge(
+    z.object({
+      workCenterId: zfd.text(z.string().optional())
+    })
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return !!data.workCenterId;
+      }
+      return true;
+    },
+    {
+      message: "Work center is required",
+      path: ["workCenterId"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Outside Processing") {
+        return Number.isFinite(data.operationMinimumCost);
+      }
+      return true;
+    },
+    {
+      message: "Minimum is required",
+      path: ["operationMinimumCost"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Outside Processing") {
+        return Number.isFinite(data.operationUnitCost);
+      }
+      return true;
+    },
+    {
+      message: "Unit cost is required",
+      path: ["operationUnitCost"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Outside Processing") {
+        return Number.isFinite(data.operationLeadTime);
+      }
+      return true;
+    },
+    {
+      message: "Lead time is required",
+      path: ["operationLeadTime"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Outside Processing") {
+        return !!data.operationSupplierProcessId;
+      }
+      return true;
+    },
+    {
+      message: "Supplier is required",
+      path: ["operationSupplierProcessId"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return !!data.setupUnit;
+      }
+      return true;
+    },
+    {
+      message: "Setup unit is required",
+      path: ["setupUnit"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return !!data.laborUnit;
+      }
+      return true;
+    },
+    {
+      message: "Labor unit is required",
+      path: ["laborUnit"]
+    }
+  )
+  .refine(
+    (data) => {
+      // Machine only applies to Process operations — Assembly and Inspection
+      // are setup + labor work.
+      if (data.operationType === "Process") {
+        return !!data.machineUnit;
+      }
+      return true;
+    },
+    {
+      message: "Machine unit is required",
+      path: ["machineUnit"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return Number.isFinite(data.setupTime);
+      }
+      return true;
+    },
+    {
+      message: "Setup time is required",
+      path: ["setupTime"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return Number.isFinite(data.laborTime);
+      }
+      return true;
+    },
+    {
+      message: "Labor time is required",
+      path: ["laborTime"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Process") {
+        return Number.isFinite(data.machineTime);
+      }
+      return true;
+    },
+    {
+      message: "Machine time is required",
+      path: ["machineTime"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Process") {
+        return Number.isFinite(data.machineRate);
+      }
+      return true;
+    },
+    {
+      message: "Machine rate is required",
+      path: ["machineRate"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return Number.isFinite(data.overheadRate);
+      }
+      return true;
+    },
+    {
+      message: "Overhead rate is required",
+      path: ["overheadRate"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType !== "Outside Processing") {
+        return Number.isFinite(data.laborRate);
+      }
+      return true;
+    },
+    {
+      message: "Labor rate is required",
+      path: ["laborRate"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.operationType === "Inspection") {
+        return !!data.inspectionDocumentId;
+      }
+      return true;
+    },
+    {
+      message: "Inspection Plan is required",
+      path: ["inspectionDocumentId"]
+    }
+  );
+
+const baseMaterialValidator = z.object({
+  id: z.string().min(1, { message: "Material ID is required" }),
+  description: z.string().min(1, { message: "Description is required" }),
+  jobMakeMethodId: z.string().min(1, { message: "Make method is required" }),
+  itemType: z.enum(methodItemType, {
+    error: "Item type is required"
+  }),
+  methodType: z.enum(methodType, {
+    error: "Method type is required"
+  }),
+  itemId: z.string().min(1, { message: "Item is required" }),
+  kit: zfd.text(z.string().optional()).transform((value) => value === "true"),
+  order: zfd.numeric(z.number().min(0)),
+  quantity: zfd.numeric(z.number().min(0)),
+  requiresBatchTracking: zfd.text(
+    z.string().transform((val) => val === "true")
+  ),
+  requiresSerialTracking: zfd.text(
+    z.string().transform((val) => val === "true")
+  ),
+  unitCost: zfd.numeric(z.number().min(0)),
+  unitOfMeasureCode: z
+    .string()
+    .min(1, { message: "Unit of Measure is required" }),
+  storageUnitId: zfd.text(z.string().optional())
+});
+
+export const jobMaterialValidator = baseMaterialValidator
+  .extend({
+    jobOperationId: zfd.text(z.string().optional())
+    // Per-step assignment (part ↔ step) is many-to-many: the route reads
+    // formData.getAll("jobOperationStepIds") and writes jobMaterialStep rows.
+  })
+  .refine(
+    (data) => {
+      if (data.itemType === "Part") {
+        return !!data.itemId;
+      }
+      return true;
+    },
+    {
+      message: "Part ID is required",
+      path: ["itemId"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.itemType === "Material") {
+        return !!data.itemId;
+      }
+      return true;
+    },
+    {
+      message: "Material ID is required",
+      path: ["itemId"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.itemType === "Consumable") {
+        return !!data.itemId;
+      }
+      return true;
+    },
+    {
+      message: "Consumable ID is required",
+      path: ["itemId"]
+    }
+  );
+
+export const jobMaterialValidatorForReleasedJob = baseMaterialValidator
+  .extend({
+    jobOperationId: z.string().min(1, { message: "Operation is required" })
+    // Per-step assignment (part ↔ step) is many-to-many: the route reads
+    // formData.getAll("jobOperationStepIds") and writes jobMaterialStep rows.
+  })
+  .refine(
+    (data) => {
+      if (data.itemType === "Part") {
+        return !!data.itemId;
+      }
+      return true;
+    },
+    {
+      message: "Part ID is required",
+      path: ["itemId"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.itemType === "Material") {
+        return !!data.itemId;
+      }
+      return true;
+    },
+    {
+      message: "Material ID is required",
+      path: ["itemId"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.itemType === "Consumable") {
+        return !!data.itemId;
+      }
+      return true;
+    },
+    {
+      message: "Consumable ID is required",
+      path: ["itemId"]
+    }
+  );
+
+export const getJobMethodValidator = z.object({
+  sourceId: z.string().min(1, { message: "Source ID is required" }),
+  targetId: z.string().min(1, { message: "Please select a source method" }),
+  versionId: zfd.text(z.string().optional()),
+  billOfMaterial: zfd.checkbox(),
+  billOfProcess: zfd.checkbox(),
+  parameters: zfd.checkbox(),
+  tools: zfd.checkbox(),
+  steps: zfd.checkbox(),
+  workInstructions: zfd.checkbox()
+});
+
+// export const getJobMaterialMethodValidator = z.object({
+//   jobMaterialId: z.string().min(1, { message: "Quote Material is required" }),
+//   itemId: z.string().min(1, { message: "Please select a source method" }),
+// });
+
+export const procedureValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  version: zfd.numeric(z.number().min(0)),
+  processId: zfd.text(z.string().optional()),
+  content: zfd.text(z.string().optional()),
+  copyFromId: zfd.text(z.string().optional())
+});
+
+export const procedureStepValidator = z
+  .object({
+    id: zfd.text(z.string().optional()),
+    procedureId: z.string().min(1, { message: "Procedure is required" }),
+    name: z.string().trim().min(1, { message: "Name is required" }),
+    description: zfd.text(z.string().optional()),
+    type: z.enum(procedureStepType, {
+      error: "Type is required"
+    }),
+    unitOfMeasureCode: zfd.text(z.string().optional()),
+    minValue: zfd.numeric(z.number().min(0).optional()),
+    maxValue: zfd.numeric(z.number().min(0).optional()),
+    listValues: z.array(z.string()).optional(),
+    sortOrder: zfd.numeric(z.number().min(0).optional())
+  })
+  .refine(
+    (data) => {
+      if (data.type === "Measurement") {
+        return !!data.unitOfMeasureCode;
+      }
+      return true;
+    },
+    {
+      message: "Unit of measure is required",
+      path: ["unitOfMeasureCode"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.type === "List") {
+        return (
+          !!data.listValues &&
+          data.listValues.length > 0 &&
+          data.listValues.every((option) => option.trim() !== "")
+        );
+      }
+      return true;
+    },
+    {
+      message: "List options are required",
+      path: ["listOptions"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.minValue != null && data.maxValue != null) {
+        return data.maxValue >= data.minValue;
+      }
+      return true;
+    },
+    {
+      message: "Maximum value must be greater than or equal to minimum value",
+      path: ["maxValue"]
+    }
+  );
+
+export const procedureParameterValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  procedureId: z.string().min(1, { message: "Procedure is required" }),
+  key: z.string().min(1, { message: "Key is required" }),
+  value: z.string().min(1, { message: "Value is required" })
+});
+
+export const procedureSyncValidator = z.object({
+  operationId: z.string().min(1, { message: "Operation is required" }),
+  procedureId: z.string().min(1, { message: "Procedure is required" })
+});
+
+export const productionEventValidator = z
+  .object({
+    id: zfd.text(z.string().optional()),
+    jobOperationId: z.string().min(1, { message: "Operation is required" }),
+    type: z.enum(["Labor", "Machine", "Setup"], {
+      error: "Event type is required"
+    }),
+    employeeId: zfd.text(z.string().optional()),
+    workCenterId: zfd.text(z.string().optional()),
+    startTime: z.string().min(1, { message: "Start time is required" }),
+    endTime: zfd.text(z.string().optional()),
+    notes: zfd.text(z.string().optional())
+  })
+  .refine(
+    (data) => {
+      if (data.endTime) {
+        return new Date(data.startTime) < new Date(data.endTime);
+      }
+      return true;
+    },
+    {
+      message: "Start time must be before end time",
+      path: ["endTime"]
+    }
+  );
+
+export const assignMachineTimeValidator = z.object({
+  intent: z.literal("assign"),
+  jobOperationId: z.string().min(1, { message: "Operation is required" })
+});
+
+export const dismissMachineTimeValidator = z.object({
+  intent: z.literal("dismiss")
+});
+
+export const productionOrderValidator = z.object({
+  startDate: zfd.text(z.string().nullable()),
+  dueDate: zfd.text(z.string().nullable()),
+  periodId: z.string().min(1, { message: "Period is required" }),
+  quantity: zfd.numeric(
+    z.number().positive({ message: "Quantity must be greater than zero" })
+  ),
+  existingId: zfd.text(z.string().optional()),
+  existingQuantity: zfd.numeric(z.number().optional()),
+  existingReadableId: zfd.text(z.string().optional()),
+  existingStatus: zfd.text(z.enum(jobStatus).optional()),
+  isASAP: z.boolean().optional(),
+  // Reorder-policy attribution, copied from the Make action (absent on a job
+  // the planner added): the chart's order popover explains the suggestion
+  // from it, as it does for a purchase order.
+  policyName: plannedOrderValidator.shape.policyName,
+  reason: plannedOrderValidator.shape.reason,
+  triggerValues: plannedOrderValidator.shape.triggerValues
+});
+
+export type ProductionOrder = z.infer<typeof productionOrderValidator>;
+
+export const productionQuantityValidator = z
+  .object({
+    id: zfd.text(z.string().optional()),
+    jobOperationId: z.string().min(1, { message: "Operation is required" }),
+    type: z.enum(["Rework", "Scrap", "Production"], {
+      error: "Quantity type is required"
+    }),
+    scrapReasonId: zfd.text(z.string().optional()),
+    notes: zfd.text(z.string().optional()),
+    createdBy: zfd.text(z.string().optional()),
+    quantity: zfd.numeric(z.number().min(0))
+  })
+  .refine((data) => data.type !== "Scrap" || !!data.scrapReasonId, {
+    message: "Scrap reason is required",
+    path: ["scrapReasonId"]
+  });
+
+export const scheduleOperationUpdateValidator = z.object({
+  id: z.string().min(1, { message: "ID is required" }),
+  columnId: z.string().min(1, { message: "Column is required" }),
+  priority: schedulePriorityValidator
+});
+
+// A drop that renumbers several cards of one column, sent as one request.
+export const scheduleOperationReorderValidator = z.object({
+  columnId: z.string().min(1, { message: "Column is required" }),
+  updates: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        priority: z.number().refine(Number.isFinite, "Priority must be finite")
+      })
+    )
+    .min(1)
+    .max(1000)
+    .refine((rows) => new Set(rows.map((r) => r.id)).size === rows.length, {
+      message: "Each operation may appear once"
+    })
+});
+
+export const scheduleJobUpdateValidator = z.object({
+  id: z.string().min(1, { message: "ID is required" }),
+  locationId: z.string().trim().min(1, { message: "Location is required" }),
+  columnId: z
+    .string()
+    .min(1, { message: "Column is required" })
+    .refine(isScheduleDateColumnId, { message: "Invalid date column" }),
+  priority: schedulePriorityValidator
+});
+
+// Job operation batching — group N job operations on one batchable process into
+// one run. No maximum batch size (product decision). See
+// .ai/specs/2026-08-21-job-operation-batching.md.
+export const jobOperationBatchStatus = [
+  "Planned",
+  "Active",
+  "Completing",
+  "Completed"
+] as const;
+
+export const createJobOperationBatchValidator = z.object({
+  locationId: z.string().min(1, { message: "Location is required" }),
+  workCenterId: zfd.text(z.string().optional()),
+  notes: zfd.text(z.string().optional()),
+  // Create & Release: insert the batch already on the floor ('Active', shown
+  // as "Released"); unchecked creates it 'Planned' — planner-only, not
+  // dispatched to MES until released.
+  release: zfd.checkbox(),
+  // repeatable so a single submitted id still coerces to an array (RVF/zfd)
+  jobOperationIds: zfd.repeatable(
+    z
+      .array(z.string().min(1))
+      .min(1, { message: "Select at least one operation" })
+  ),
+  // Output lot identity is planned here, never typed on the floor. The
+  // batch-operations server fn enforces the rules (one item to merge, unique
+  // numbers when split); these only carry the planner's choice through.
+  mergeOutput: zfd.checkbox(),
+  outputLotNumber: zfd.text(z.string().trim().optional()),
+  // JSON-encoded [{ jobOperationId, lotNumber }] — FormData has no nesting.
+  lotNumbers: z.preprocess(
+    (value) => {
+      if (typeof value !== "string" || value === "") return undefined;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    },
+    z
+      .array(
+        z.object({
+          jobOperationId: z.string().min(1),
+          lotNumber: z.string().trim().min(1)
+        })
+      )
+      .optional()
+  )
+});
+
+export const updateJobOperationBatchValidator = z.object({
+  batchId: z.string().min(1, { message: "Batch is required" }),
+  intent: z.enum([
+    "add",
+    "remove",
+    "update",
+    "dissolve",
+    "release",
+    "unrelease"
+  ]),
+  // repeatable so a single submitted id still coerces to an array (RVF/zfd)
+  jobOperationIds: zfd.repeatableOfType(z.string().min(1)).optional(),
+  workCenterId: zfd.text(z.string().optional())
+});
+
+export const scrapReasonValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" })
+});
+
+export const failureModeValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" })
+});
+
+export const maintenanceDispatchValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  status: z.enum(maintenanceDispatchStatus),
+  priority: z.enum(maintenanceDispatchPriority),
+  severity: z.enum(maintenanceSeverity).optional(),
+  source: z.enum(maintenanceSource).optional(),
+  oeeImpact: z.enum(oeeImpact).optional(),
+  workCenterId: zfd.text(z.string().optional()),
+  suspectedFailureModeId: zfd.text(z.string().optional()),
+  plannedStartTime: zfd.text(z.string().optional()),
+  plannedEndTime: zfd.text(z.string().optional()),
+  assignee: zfd.text(z.string().optional()),
+  content: zfd.text(z.string().optional())
+});
+
+export const maintenanceDispatchCommentValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  maintenanceDispatchId: z.string().min(1, { message: "Dispatch is required" }),
+  comment: z.string().min(1, { message: "Comment is required" })
+});
+
+export const maintenanceDispatchEventValidator = z
+  .object({
+    id: zfd.text(z.string().optional()),
+    maintenanceDispatchId: z
+      .string()
+      .min(1, { message: "Dispatch is required" }),
+    employeeId: z.string().min(1, { message: "Employee is required" }),
+    workCenterId: z.string().min(1, { message: "Work center is required" }),
+    startTime: z.string().min(1, { message: "Start time is required" }),
+    endTime: zfd.text(z.string().optional()),
+    notes: zfd.text(z.string().optional())
+  })
+  .refine(
+    (data) => {
+      if (data.endTime) {
+        return new Date(data.startTime) < new Date(data.endTime);
+      }
+      return true;
+    },
+    {
+      message: "Start time must be before end time",
+      path: ["endTime"]
+    }
+  );
+
+export const maintenanceDispatchItemValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  maintenanceDispatchId: z.string().min(1, { message: "Dispatch is required" }),
+  itemId: z.string().min(1, { message: "Item is required" }),
+  quantity: zfd.numeric(z.number().min(1)),
+  unitOfMeasureCode: z
+    .string()
+    .min(1, { message: "Unit of measure is required" }),
+  unitCost: zfd.numeric(z.number().min(0).optional())
+});
+
+export const maintenanceDispatchWorkCenterValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  maintenanceDispatchId: z.string().min(1, { message: "Dispatch is required" }),
+  workCenterId: z.string().min(1, { message: "Work center is required" })
+});
+
+export const maintenanceScheduleValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  description: zfd.text(z.string().optional()),
+  workCenterId: z.string().min(1, { message: "Work center is required" }),
+  frequency: z.enum(maintenanceFrequency),
+  priority: z.enum(maintenanceDispatchPriority),
+  estimatedDuration: zfd.numeric(z.number().optional()),
+  active: zfd.checkbox()
+});
+
+export const maintenanceScheduleItemValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  maintenanceScheduleId: z.string().min(1, { message: "Schedule is required" }),
+  itemId: z.string().min(1, { message: "Item is required" }),
+  quantity: zfd.numeric(z.number().min(1)),
+  unitOfMeasureCode: z
+    .string()
+    .min(1, { message: "Unit of measure is required" })
+});
+
+export const demandProjectionValidator = z.object({
+  itemId: z.string().min(1, { message: "Item is required" }),
+  locationId: z.string().min(1, { message: "Location is required" }),
+  periods: z.array(z.string()).optional(),
+  ...Object.fromEntries(
+    Array.from({ length: 52 }, (_, i) => [
+      `week${i}`,
+      zfd.numeric(z.number().min(0).optional())
+    ])
+  )
+});
+
+// --- Assembly Instructions ---------------------------------------------
+
+export const assemblyInstructionStatuses = [
+  "Draft",
+  "Published",
+  "Archived"
+] as const;
+
+export const planConfidences = ["high", "low", "manual"] as const;
+
+export const assemblyStepStatuses = ["Todo", "Review", "Done"] as const;
+
+const vector3 = z.tuple([z.number(), z.number(), z.number()]);
+const quaternion = z.tuple([z.number(), z.number(), z.number(), z.number()]);
+const unitQuaternion = quaternion.refine(
+  ([x, y, z, w]) => Math.abs(Math.hypot(x, y, z, w) - 1) < 1e-3,
+  { message: "Rotation must be a unit quaternion" }
+);
+
+function isSeatWaypoint(
+  waypoint: { offset: number[]; rotation: number[] } | undefined
+): boolean {
+  if (!waypoint) return false;
+  const [ox = 0, oy = 0, oz = 0] = waypoint.offset;
+  const w = waypoint.rotation[3] ?? 0;
+  return Math.hypot(ox, oy, oz) < 1e-3 && Math.abs(Math.abs(w) - 1) < 1e-6;
+}
+
+/** Mirrors `Motion` in `packages/viewer/src/types.ts` — keep them in sync. */
+export const motionSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("linear"),
+    direction: vector3,
+    distance: z.number().positive()
+  }),
+  z.object({
+    type: z.literal("L"),
+    // 2+ segments: the tier-3 escape planner emits up to 3 (e.g. slide out
+    // of a blind slot, lift, exit); the viewer interpolates any count
+    segments: z
+      .array(
+        z.object({
+          direction: vector3,
+          distance: z.number().positive()
+        })
+      )
+      .min(2)
+  }),
+  z.object({
+    type: z.literal("helix"),
+    axis: vector3,
+    origin: vector3,
+    pitch: z.number().positive(),
+    turns: z.number().positive(),
+    approach: z.number().nonnegative()
+  }),
+  z.object({
+    type: z.literal("path"),
+    keyframes: z
+      .array(
+        z.object({
+          t: z.number().min(0).max(1),
+          position: vector3,
+          quaternion
+        })
+      )
+      .min(2)
+  }),
+  // Editor-drawn path; poses are relative to the seated pose.
+  z.object({
+    type: z.literal("waypoints"),
+    waypoints: z
+      .array(z.object({ offset: vector3, rotation: unitQuaternion }))
+      .min(2)
+      .refine((waypoints) => isSeatWaypoint(waypoints[waypoints.length - 1]), {
+        message: "The last waypoint must be the seated pose"
+      })
+  }),
+  z.object({ type: z.literal("none") })
+]);
+
+// A step camera is either a manual "Set view" pose (applied verbatim) or a
+// planner-baked view-direction hint (mesh-precise sight lines; the viewer
+// derives target/distance/frustum fit live at the real viewport aspect).
+export const cameraSchema = z.union([
+  z.object({
+    position: vector3,
+    target: vector3,
+    fov: z.number().positive()
+  }),
+  z.object({
+    source: z.literal("plan"),
+    direction: vector3
+  })
+]);
+
+/**
+ * A step's build orientation: a unit quaternion turning the model frame into
+ * the bench frame. Mirrors `AssemblyStep.orientation` in `@carbon/viewer`.
+ */
+export const orientationSchema = unitQuaternion;
+
+export const fastenerSchema = z.object({
+  spec: z.string().optional(),
+  count: z.number().int().positive().optional(),
+  torqueNm: z.number().positive().optional(),
+  tool: z.string().optional()
+});
+
+/**
+ * Planner flags persisted on assemblyInstructionStep.warnings (jsonb).
+ * `flagged` marks steps whose parts have no proven collision-free path —
+ * the viewer fades them in at the seated pose instead of animating a
+ * fabricated motion. `blockedBy` records the obstructing nodeIds from
+ * plan.json so the editor can name the blockers.
+ */
+export const stepPlanWarningsSchema = z.object({
+  flagged: z.boolean().optional(),
+  blockedBy: z.array(z.string()).optional(),
+  /**
+   * A part in this step will tip once placed (its center of mass falls outside
+   * the support polygon of the parts below it) — likely needs a fixture or a
+   * second hand. Diagnostic only; never blocks generation or playback.
+   */
+  needsSupport: z.boolean().optional(),
+  /**
+   * The motion the step had before the author first drew a path (the
+   * planner's, or `none`). Present = the path is hand-drawn, which also
+   * overrides `flagged` (`hasCustomMotion` / `isPlanFlagged` in
+   * `@carbon/viewer/steps`); Reset puts it back. A re-plan rewrites `warnings`,
+   * so it clears this together with the drawn path it replaces.
+   */
+  plannedMotion: z.unknown().optional()
+});
+
+const jsonField = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess((raw) => {
+    if (typeof raw !== "string") return raw;
+    if (raw.trim() === "") return undefined;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }, schema);
+
+export const assemblyInstructionValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  modelUploadId: z.string().min(1, { message: "Model is required" }),
+  itemId: zfd.text(z.string().optional())
+});
+
+// Assembly → BOP sync: which operation receives the instruction's steps. "method"
+// targets the item's (Draft) make-method operation; "job" targets a live job's
+// operation directly.
+export const syncAssemblyToBopValidator = z.object({
+  operationId: z.string().min(1, { message: "Operation is required" })
+});
+
+export type AssemblyModelState =
+  | "converted" // GLB + graph artifacts exist — ready for the viewer
+  | "processing" // conversion job is queued or running
+  | "failed" // last conversion failed — retriable
+  | "convertible" // STEP file present but never converted (lazy conversion)
+  | "none"; // no model, or a format the geometry service can't convert
+
+export function getAssemblyModelState(
+  model: {
+    modelPath: string | null;
+    processingStatus: Database["public"]["Enums"]["modelProcessingStatus"];
+    glbPath: string | null;
+    graphPath: string | null;
+  } | null
+): AssemblyModelState {
+  if (!model) return "none";
+  if (
+    model.processingStatus === "Success" &&
+    model.glbPath &&
+    model.graphPath
+  ) {
+    return "converted";
+  }
+  // The retained raw is compacted in place after upload (`x.step` ->
+  // `x.xbf.zst`, legacy `x.step.zst`), so peel the `.zst` wrapper before the
+  // extension check. Both STEP and its BinXCAF (`.xbf`) compacted form are
+  // convertible — the assembler content-sniffs and loads either through the
+  // same OCCT walk, yielding identical nodeIds.
+  const base = (model.modelPath ?? "").toLowerCase().replace(/\.zst$/, "");
+  const isStep = [".step", ".stp", ".xbf"].some((ext) => base.endsWith(ext));
+  if (!isStep) return "none";
+  if (
+    model.processingStatus === "Queued" ||
+    model.processingStatus === "Processing"
+  ) {
+    return "processing";
+  }
+  if (model.processingStatus === "Failed") return "failed";
+  return "convertible";
+}
+
+/**
+ * Creating an instruction starts from a made item; the instruction name and
+ * model are derived server-side (the name from the item, the model from the
+ * item's CAD files, converted lazily if needed). An explicit modelUploadId
+ * (e.g. from the part details page) takes precedence.
+ */
+export const assemblyInstructionFromItemValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  itemId: z.string().min(1, { message: "Item is required" }),
+  modelUploadId: zfd.text(z.string().optional())
+});
+
+export const assemblyInstructionStatusValidator = z.object({
+  status: z.enum(assemblyInstructionStatuses)
+});
+
+// Spin a new editable Draft version as a perfect copy of an existing instruction.
+export const assemblyInstructionVersionValidator = z.object({
+  copyFromId: z.string().min(1, { message: "Source instruction is required" })
+});
+
+/**
+ * Optional tiptap-doc transform: same coercion as the shared
+ * operationStepValidator description, but optional because "Add Step" posts
+ * only assemblyInstructionId + motion. Returns `any` for the same reason —
+ * the doc is consumed both as a DB Json value and as editor JSONContent.
+ */
+const optionalTiptapDescription = zfd
+  .text(z.string().optional())
+  .transform((val): any =>
+    val === undefined || val === "" ? undefined : toTiptapDoc(val)
+  );
+
+const assemblyInstructionStepFields = z.object({
+  id: zfd.text(z.string().optional()),
+  assemblyInstructionId: z.string().min(1),
+  title: zfd.text(z.string().optional()),
+  // Typed-step fields mirror jobOperationStep so steps can eventually be
+  // copied into job operations
+  type: zfd.text(z.enum(procedureStepType).optional()),
+  description: optionalTiptapDescription,
+  required: zfd.checkbox(),
+  unitOfMeasureCode: zfd.text(z.string().optional()),
+  minValue: zfd.numeric(z.number().min(0).optional()),
+  maxValue: zfd.numeric(z.number().min(0).optional()),
+  listValues: z.array(z.string()).optional(),
+  componentNodeIds: jsonField(z.array(z.string()).optional()),
+  motion: jsonField(motionSchema.optional()),
+  camera: jsonField(cameraSchema.nullable().optional()),
+  fastener: jsonField(fastenerSchema.nullable().optional()),
+  durationSeconds: zfd.numeric(z.number().positive().optional())
+});
+
+function refineAssemblyInstructionStep(
+  data: z.infer<typeof assemblyInstructionStepFields>,
+  ctx: z.RefinementCtx
+) {
+  if (data.type === "Measurement" && !data.unitOfMeasureCode) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["unitOfMeasureCode"],
+      message: "Unit of measure is required"
+    });
+  }
+  if (
+    data.type === "List" &&
+    !(
+      Array.isArray(data.listValues) &&
+      data.listValues.length > 0 &&
+      data.listValues.every((option) => option.trim() !== "")
+    )
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["listValues"],
+      message: "List options are required"
+    });
+  }
+  if (
+    data.minValue != null &&
+    data.maxValue != null &&
+    data.maxValue < data.minValue
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["maxValue"],
+      message: "Maximum value must be greater than or equal to minimum value"
+    });
+  }
+}
+
+export const assemblyInstructionStepValidator =
+  assemblyInstructionStepFields.superRefine(refineAssemblyInstructionStep);
+
+/** A new step; `parentStepId` adds it at the end of that sub-assembly. */
+export const assemblyInstructionStepNewValidator = assemblyInstructionStepFields
+  .extend({ parentStepId: zfd.text(z.string().optional()) })
+  .superRefine(refineAssemblyInstructionStep);
+
+/**
+ * Partial update for a step's viewer-authored motion path and/or camera pose,
+ * saved directly from the 3D editor (drag autosave, "Set view" button) without
+ * round-tripping the whole step form. `camera: null` clears it (auto-frame).
+ */
+export const assemblyInstructionStepMotionValidator = z.object({
+  motion: jsonField(motionSchema.optional()),
+  // Put back the motion the step had before the author first drew a path.
+  reset: zfd.checkbox(),
+  camera: jsonField(cameraSchema.nullable().optional()),
+  // The build's orientation from this step on; `null` = same as the step before.
+  orientation: jsonField(orientationSchema.nullable().optional())
+});
+
+/**
+ * Partial update for a step's assigned components, saved directly from the
+ * Details panel's Add/remove controls without round-tripping the whole step
+ * form. An empty array is valid — a process-only step with no components.
+ */
+export const assemblyInstructionStepComponentsValidator = z.object({
+  componentNodeIds: jsonField(z.array(z.string()))
+});
+
+export const assemblyInstructionStepHiddenComponentsValidator = z.object({
+  hiddenComponentNodeIds: jsonField(z.array(z.string()))
+});
+
+export const assemblySubAssemblyNewValidator = z.object({
+  stepId: z.string().min(1)
+});
+
+/** Empty `usedInStepId` = the sub-assembly joins the main build. */
+export const assemblySubAssemblyUpdateValidator = z.object({
+  title: zfd.text(z.string().optional()),
+  usedInStepId: zfd.text(z.string().optional())
+});
+
+export const assemblyStepComponentsReassignValidator = z
+  .object({
+    // Absent for "remove" (unassign from every step); required otherwise.
+    targetStepId: z.string().optional(),
+    componentNodeIds: jsonField(z.array(z.string()).min(1)),
+    mode: z.enum(["move", "duplicate", "remove"])
+  })
+  .refine((v) => v.mode === "remove" || !!v.targetStepId, {
+    message: "A target step is required",
+    path: ["targetStepId"]
+  });
+
+export const assemblyInstructionStepStatusValidator = z.object({
+  status: z.enum(assemblyStepStatuses)
+});
+
+export const assemblyInstructionStepOrderValidator = z.object({
+  updates: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        sortOrder: z.number()
+      })
+    )
+    .min(1)
+});
+
+/**
+ * Bill-of-material parts consumed at a step. Stores itemId (not a
+ * methodMaterial FK) so associations survive make-method re-versioning; the
+ * UI picker is limited to items on the instruction item's make-method BOM.
+ */
+export const assemblyStepMaterialValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  stepId: z.string().min(1),
+  itemId: z.string().min(1, { message: "Item is required" }),
+  quantity: zfd.numeric(z.number().min(0).optional()),
+  sortOrder: zfd.numeric(z.number().min(0).optional())
+});
+
+/**
+ * Tools used at a step. itemId is a tool-type item — the same target
+ * jobOperationTool.toolId references, so the BOP sync maps rows 1:1.
+ */
+export const assemblyStepToolValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  stepId: z.string().min(1),
+  itemId: z.string().min(1, { message: "Tool is required" }),
+  quantity: zfd.numeric(z.number().int().positive().optional()),
+  sortOrder: zfd.numeric(z.number().min(0).optional())
+});
+
+// An assembly unit: model leaf nodes the planner treats as one rigid body — a
+// user override on the automatic BOM-driven derivation. Scoped to the model
+// upload so it survives instruction delete/recreate (like component mappings).
+export const assemblyUnitValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  modelUploadId: z.string().min(1),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  componentNodeIds: jsonField(z.array(z.string()).min(1)),
+  itemId: zfd.text(z.string().optional())
+});
+
+export const peopleAssignmentValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  workCenterId: z.string().min(1, { message: "Work center is required" }),
+  employeeId: z.string().min(1, { message: "Employee is required" }),
+  locationId: z.string().min(1, { message: "Location is required" }),
+  date: z.string().min(1, { message: "Date is required" }), // YYYY-MM-DD
+  shiftId: zfd.text(z.string().optional()),
+  note: zfd.text(z.string().optional()),
+  // set when assigning a partial-day remainder; absent = whole shift
+  hours: zfd.numeric(z.number().gt(0).max(24).optional())
+});
+
+export const peopleAbsenceValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  employeeId: z.string().min(1, { message: "Employee is required" }),
+  date: z.string().min(1, { message: "Date is required" }),
+  shiftId: zfd.text(z.string().optional()),
+  note: zfd.text(z.string().optional())
+});
+
+export const copyPeopleBoardValidator = z.object({
+  locationId: z.string().min(1),
+  fromDate: z.string().min(1),
+  toDate: z.string().min(1),
+  shiftId: zfd.text(z.string().optional())
+});
+
+export const peopleWeekAssignValidator = z.object({
+  locationId: z.string().min(1),
+  employeeId: z.string().min(1, { message: "Employee is required" }),
+  workCenterId: z.string().min(1, { message: "Work center is required" }),
+  weekStart: z.string().min(1), // Monday, YYYY-MM-DD
+  shiftId: zfd.text(z.string().optional())
+});
+
+export const peopleWeekUnassignValidator = z.object({
+  employeeId: z.string().min(1, { message: "Employee is required" }),
+  workCenterId: z.string().min(1, { message: "Work center is required" }),
+  weekStart: z.string().min(1),
+  shiftId: zfd.text(z.string().optional())
+});
+
+export const peopleWeekMoveValidator = z.object({
+  employeeId: z.string().min(1, { message: "Employee is required" }),
+  fromWorkCenterId: z.string().min(1),
+  workCenterId: z.string().min(1, { message: "Work center is required" }),
+  weekStart: z.string().min(1),
+  shiftId: zfd.text(z.string().optional())
+});
+
+export const copyPeopleWeekValidator = z.object({
+  locationId: z.string().min(1),
+  fromWeekStart: z.string().min(1), // Monday, YYYY-MM-DD
+  toWeekStart: z.string().min(1),
+  shiftId: zfd.text(z.string().optional())
+});
+
+export const peopleAbsenceRangeValidator = z
+  .object({
+    employeeId: z.string().min(1, { message: "Employee is required" }),
+    fromDate: z.string().min(1, { message: "Start date is required" }),
+    toDate: z.string().min(1, { message: "End date is required" }),
+    shiftId: zfd.text(z.string().optional()),
+    note: zfd.text(z.string().optional())
+  })
+  .refine((value) => value.toDate >= value.fromDate, {
+    message: "End date must be on or after the start date",
+    path: ["toDate"]
+  })
+  .refine(
+    (value) =>
+      new Date(`${value.toDate}T00:00:00Z`).getTime() -
+        new Date(`${value.fromDate}T00:00:00Z`).getTime() <=
+      62 * 24 * 3_600_000,
+    { message: "Range is limited to 62 days", path: ["toDate"] }
+  );
+
+export const peopleMoveValidator = z.object({
+  id: z.string().min(1, { message: "Assignment is required" }),
+  workCenterId: z.string().min(1, { message: "Work center is required" })
+});
+
+// One atomic edit of a person's whole day: the given rows become the day's
+// assignments (update/insert/delete reconciliation in one transaction)
+export const peopleDayValidator = z.object({
+  employeeId: z.string().min(1, { message: "Employee is required" }),
+  locationId: z.string().min(1),
+  date: z.string().min(1),
+  shiftId: zfd.text(z.string().optional()),
+  // day-scoped note: written to every row of the person's day
+  note: zfd.text(z.string().optional()),
+  // day-scoped overtime: a longer DAY, not extra hours per station
+  overtimeHours: zfd.numeric(z.number().min(0).max(16)),
+  rows: jsonField(
+    z
+      .array(
+        z.object({
+          workCenterId: z.string().min(1),
+          hours: z.number().gt(0).max(24).nullable()
+        })
+      )
+      .max(20)
+  )
+});
+
+// Absent hours = back to the whole shift (stored as null)
+export const peopleHoursValidator = z.object({
+  id: z.string().min(1, { message: "Assignment is required" }),
+  hours: zfd.numeric(z.number().gt(0).max(24).optional())
+});
+
+export const peopleOvertimeBulkValidator = z
+  .object({
+    locationId: z.string().min(1),
+    date: z.string().min(1),
+    /** inclusive end of the range; omitted = the single `date` only */
+    toDate: zfd.text(z.string().optional()),
+    hours: zfd.numeric(z.number().min(0).max(16)),
+    departmentId: zfd.text(z.string().optional()),
+    shiftId: zfd.text(z.string().optional())
+  })
+  .refine((value) => !value.toDate || value.toDate >= value.date, {
+    message: "End date must be on or after the start date",
+    path: ["toDate"]
+  });
+
+export type Motion = z.infer<typeof motionSchema>;
+export type CameraPose = z.infer<typeof cameraSchema>;
+export type Fastener = z.infer<typeof fastenerSchema>;
+
+// Must match the demand window in get_job_quantity_on_hand and the scheduling
+// sequence.
+export const ACTIVE_JOB_STATUSES: Database["public"]["Enums"]["jobStatus"][] = [
+  "Planned",
+  "Ready",
+  "In Progress",
+  "Paused"
+];
+
+// Explicit list, not the complement of ACTIVE_JOB_STATUSES — active-but-late
+// states like Overdue still surface indicators.
+const JOB_STATUSES_WITHOUT_ORDER_STATUS = [
+  "Draft",
+  "Completed",
+  "Cancelled",
+  "Closed"
+];
+
+export function isJobOrderStatusHidden(
+  jobStatus: string | null | undefined
+): boolean {
+  return !!jobStatus && JOB_STATUSES_WITHOUT_ORDER_STATUS.includes(jobStatus);
+}
+
+// Highest priority first. Draft, cancelled, closed and rejected are
+// intentionally excluded — a dead PO isn't a real order.
+export const PO_STATUS_PRIORITY: PurchaseOrderStatus[] = [
+  "To Receive",
+  "To Receive and Invoice",
+  "Needs Approval",
+  "To Review",
+  "Planned",
+  "To Invoice",
+  "Completed"
+];
+
+// Highest priority first — picks the representative supply-job status when an
+// item is produced by more than one active job. In-flight states outrank merely
+// planned ones, mirroring PO_STATUS_PRIORITY.
+export const JOB_SUPPLY_STATUS_PRIORITY: JobStatus[] = [
+  "In Progress",
+  "Paused",
+  "Ready",
+  "Planned"
+];
+
+// The single source of truth for order-status precedence. Both the status filter
+// and JobOrderStatusBadge derive from this (the badge maps each category to its
+// icon/label), so they can never disagree. Order of the checks below IS the
+// precedence — keep the highest-priority indicator first.
+export function getJobOrderStatusCategory(
+  status: ItemOrderStatus | undefined
+): JobOrderStatusCategory | null {
+  // Already pulled into the job — procurement is moot, so this outranks all
+  // other indicators (and hides any stale PO still attached to the item).
+  if (status?.isIssued) return "issued";
+
+  // A still-unmet, priority-adjusted shortfall outranks the supply indicators —
+  // see JobOrderStatusBadge for why.
+  if (status?.needsOrder) return "needsOrder";
+
+  // Made-to-order with no job producing it yet — the make-side of needsOrder.
+  if (status?.needsJob) return "needsJob";
+
+  if (status?.coveredByOnHand) return "inStock";
+
+  switch (status?.status) {
+    case "Planned":
+      return "planned";
+    case "Needs Approval":
+    case "To Review":
+      return "awaitingApproval";
+    case "To Receive":
+    case "To Receive and Invoice": {
+      const fraction =
+        status.ordered > 0 ? status.received / status.ordered : 0;
+      if (fraction < 1) {
+        return status.received > 0 ? "received" : "onOrder";
+      }
+      break;
+    }
+  }
+
+  if (status?.supplyJobStatus) return "plannedJob";
+  return null;
+}
+
+/**
+ * Weekday flag columns on `shift`, Monday-first — the order people week rows
+ * are dealt out in.
+ */
+export const WEEKDAYS_MONDAY_FIRST = [
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+  "sunday"
+] as const;
+
+/**
+ * The same weekday names Sunday-first — indexable directly by
+ * `getDayOfWeek(date, "en-US")` (0 = Sunday).
+ */
+export const WEEKDAYS_SUNDAY_FIRST = [
+  "sunday",
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday"
+] as const;

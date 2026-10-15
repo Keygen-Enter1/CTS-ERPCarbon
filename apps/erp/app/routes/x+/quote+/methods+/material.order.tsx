@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import type { ActionFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { updateQuoteMaterialOrder } from "~/modules/sales";
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, userId } = await requirePermissions(request, {
+    update: "sales"
+  });
+
+  const updateMap = (await request.formData()).get("updates") as string;
+  if (!updateMap) {
+    return data(
+      {},
+      await flash(request, error(null, "Failed to receive a new sort order"))
+    );
+  }
+
+  const updates = Object.entries(JSON.parse(updateMap)).map(
+    ([id, orderString]) => ({
+      id,
+      order: Number(orderString),
+      updatedBy: userId
+    })
+  );
+
+  const updateSortOrders = await updateQuoteMaterialOrder(client, updates);
+  if (updateSortOrders.some((update) => update.error))
+    return data(
+      {},
+      await flash(
+        request,
+        error(updateSortOrders, "Failed to update sort order")
+      )
+    );
+
+  return null;
+}

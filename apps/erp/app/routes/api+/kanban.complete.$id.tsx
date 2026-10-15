@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { notFound } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import type { Database } from "@carbon/database";
+import { redirect, redirectExternal } from "@carbon/utils";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { LoaderFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { getKanban } from "~/modules/inventory";
+import { getActiveJobOperationByJobId } from "~/modules/production";
+import { path } from "~/utils/path";
+
+async function handleKanbanComplete({
+  client,
+  companyId,
+  id
+}: {
+  client: SupabaseClient<Database>;
+  companyId: string;
+  id: string;
+}): Promise<{ data: string; error: null } | { data: null; error: string }> {
+  const kanban = await getKanban(client, id, companyId);
+  if (kanban.error) {
+    return {
+      data: null,
+      error: "Kanban not found"
+    };
+  }
+
+  if (!kanban.data?.jobId) {
+    return {
+      data: null,
+      error: "No job found for kanban"
+    };
+  }
+
+  const operation = await getActiveJobOperationByJobId(
+    client,
+    kanban.data.jobId!,
+    companyId
+  );
+
+  if (!operation) {
+    return {
+      data: path.to.job(kanban.data.jobId!),
+      error: null
+    };
+  }
+
+  return {
+    data: path.to.external.mesJobOperationComplete(operation.id),
+    error: null
+  };
+}
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    role: "employee"
+  });
+
+  const { id } = params;
+  if (!id) throw notFound("id not found");
+
+  const result = await handleKanbanComplete({ client, companyId, id });
+
+  if (result.error || !result.data) {
+    return data({ error: result.error }, { status: 400 });
+  }
+
+  throw result.data.startsWith("/")
+    ? redirect(result.data)
+    : redirectExternal(result.data);
+}

@@ -1,0 +1,417 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Avatar,
+  AvatarGroup,
+  AvatarGroupList,
+  AvatarOverflowIndicator,
+  Badge,
+  Checkbox,
+  HStack,
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo } from "react";
+import {
+  LuAward,
+  LuBuilding2,
+  LuCheck,
+  LuFactory,
+  LuLayers,
+  LuPencil,
+  LuPower,
+  LuQrCode,
+  LuRedoDot,
+  LuRuler,
+  LuTrash,
+  LuTriangleAlert,
+  LuUser,
+  LuUsers
+} from "react-icons/lu";
+import { useNavigate } from "react-router";
+import {
+  EmployeeAvatar,
+  Hyperlink,
+  New,
+  OperationTypeIcon,
+  Table
+} from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { EnumerableGroup } from "~/components/EnumerableGroup";
+import { useWorkCenters } from "~/components/Form/WorkCenter";
+import { usePermissions, useUrlParams } from "~/hooks";
+import { useCustomColumns } from "~/hooks/useCustomColumns";
+import type { Process } from "~/modules/resources";
+import {
+  type OperationType,
+  operationTypes,
+  standardFactorType
+} from "~/modules/shared";
+import { usePeople } from "~/stores";
+import { path } from "~/utils/path";
+
+type ProcessesTableProps = {
+  data: Process[];
+  count: number;
+};
+
+const defaultColumnVisibility = {
+  createdAt: false,
+  createdBy: false,
+  updatedAt: false,
+  updatedBy: false
+};
+
+const ProcessesTable = memo(({ data, count }: ProcessesTableProps) => {
+  const { t } = useLingui();
+  const navigate = useNavigate();
+  const permissions = usePermissions();
+  const [params] = useUrlParams();
+  const [people] = usePeople();
+  const { options: workCenters } = useWorkCenters({});
+
+  const customColumns = useCustomColumns<Process>("process");
+  const columns = useMemo<ColumnDef<Process>[]>(() => {
+    const defaultColumns: ColumnDef<Process>[] = [
+      {
+        accessorKey: "name",
+        header: t`Process`,
+        cell: ({ row }) =>
+          row.original.processType === "Outside Processing" ||
+          ((row.original.workCenters as any[]) ?? []).length > 0 ? (
+            <Hyperlink to={row.original.id!}>
+              <Enumerable
+                value={row.original.name}
+                className="cursor-pointer"
+              />
+            </Hyperlink>
+          ) : (
+            <Hyperlink to={row.original.id!}>
+              <HStack spacing={2}>
+                <LuTriangleAlert />
+                <span>{row.original.name}</span>
+              </HStack>
+            </Hyperlink>
+          ),
+        meta: {
+          mobile: "P1",
+          icon: <LuRedoDot />
+        }
+      },
+      {
+        accessorKey: "processType",
+        header: t`Process Type`,
+        cell: (item) => {
+          const value = item.getValue<string>();
+          const icon = (
+            <OperationTypeIcon
+              type={value as OperationType}
+              className="mr-1 h-3 w-3 text-current"
+            />
+          );
+          return value === "Outside Processing" ? (
+            <Badge>
+              {icon}
+              Outside Processing
+            </Badge>
+          ) : (
+            <Badge variant="secondary">
+              {icon}
+              {value}
+            </Badge>
+          );
+        },
+        meta: {
+          mobile: "P2",
+          icon: <LuFactory />,
+          filter: {
+            type: "static",
+            options: operationTypes.map((pt) => ({
+              value: pt,
+              label: (
+                <span className="flex items-center gap-2">
+                  <OperationTypeIcon type={pt} />
+                  <span>{pt}</span>
+                </span>
+              )
+            }))
+          }
+        }
+      },
+      {
+        id: "workCenters",
+        header: t`Work Centers`,
+        cell: ({ row }) => (
+          <EnumerableGroup
+            items={((row.original.workCenters ?? []) as Array<string>).flatMap(
+              (wc) => {
+                const workCenter = workCenters.find((w) => w.value === wc);
+                if (!workCenter) return [];
+                return {
+                  label: workCenter.label,
+                  onClick: () => navigate(path.to.workCenter(workCenter.value))
+                };
+              }
+            )}
+          />
+        ),
+        meta: {
+          mobile: "P3",
+          icon: <LuBuilding2 />,
+          filter: {
+            type: "static",
+            options: workCenters.map((w) => ({
+              value: w.value,
+              label: <Enumerable value={w.label} />
+            })),
+            isArray: true
+          },
+          exportValue: (row) =>
+            ((row.workCenters ?? []) as Array<string>)
+              .map((wc) => workCenters.find((w) => w.value === wc)?.label)
+              .filter(Boolean)
+              .join(", ")
+        }
+      },
+      {
+        accessorKey: "defaultStandardFactor",
+        header: t`Default Unit`,
+        cell: (item) => item.getValue(),
+        meta: {
+          icon: <LuRuler />,
+          filter: {
+            type: "static",
+            options: standardFactorType.map((type) => ({
+              value: type,
+              label: type
+            }))
+          }
+        }
+      },
+      {
+        id: "suppliers",
+        header: t`Suppliers`,
+        cell: ({ row }) => (
+          <AvatarGroup limit={5}>
+            <AvatarGroupList>
+              {((row.original.suppliers ?? []) as Array<{ name: string }>).map(
+                (s) => (
+                  <Avatar key={s.name} name={s.name} />
+                )
+              )}
+            </AvatarGroupList>
+            <AvatarOverflowIndicator />
+          </AvatarGroup>
+        ),
+        meta: {
+          icon: <LuUsers />,
+          exportValue: (row) =>
+            ((row.suppliers ?? []) as Array<{ name: string }>)
+              .map((s) => s.name)
+              .join(", ")
+        }
+      },
+      {
+        accessorKey: "completeAllOnScan",
+        header: t`Complete All`,
+        cell: ({ row }) => (
+          <div className="flex w-full items-center justify-center">
+            <Checkbox isChecked={row.original.completeAllOnScan ?? false} />
+          </div>
+        ),
+        meta: {
+          icon: <LuQrCode />,
+          filter: {
+            type: "static",
+            options: [
+              { value: "true", label: "Yes" },
+              { value: "false", label: "No" }
+            ]
+          }
+        }
+      },
+      {
+        accessorKey: "batchable",
+        header: t`Batchable`,
+        cell: ({ row }) => (
+          <div className="flex w-full items-center justify-center">
+            <Checkbox isChecked={row.original.batchable ?? false} />
+          </div>
+        ),
+        meta: {
+          icon: <LuLayers />,
+          filter: {
+            type: "static",
+            options: [
+              { value: "true", label: "Yes" },
+              { value: "false", label: "No" }
+            ]
+          }
+        }
+      },
+      {
+        accessorKey: "requiresAbility",
+        header: t`Requires Ability`,
+        cell: ({ row }) => (
+          <div className="flex w-full items-center justify-center">
+            <Checkbox isChecked={row.original.requiresAbility ?? false} />
+          </div>
+        ),
+        meta: {
+          icon: <LuAward />,
+          filter: {
+            type: "static",
+            options: [
+              { value: "true", label: "Yes" },
+              { value: "false", label: "No" }
+            ]
+          }
+        }
+      },
+      {
+        accessorKey: "active",
+        header: t`Active`,
+        cell: ({ row }) => (
+          <div className="flex w-full items-center justify-center">
+            <Checkbox isChecked={row.original.active ?? true} />
+          </div>
+        ),
+        meta: {
+          icon: <LuCheck />,
+          filter: {
+            type: "static",
+            options: [
+              { value: "true", label: "Active" },
+              { value: "false", label: "Inactive" }
+            ]
+          },
+          pluralHeader: t`Active Statuses`
+        }
+      },
+      {
+        id: "createdBy",
+        header: t`Created By`,
+        cell: ({ row }) => (
+          <EmployeeAvatar employeeId={row.original.createdBy} />
+        ),
+        meta: {
+          icon: <LuUser />,
+          filter: {
+            type: "static",
+            options: people.map((employee) => ({
+              value: employee.id,
+              label: employee.name
+            }))
+          }
+        }
+      },
+      {
+        id: "updatedBy",
+        header: t`Updated By`,
+        cell: ({ row }) => (
+          <EmployeeAvatar employeeId={row.original.updatedBy} />
+        ),
+        meta: {
+          icon: <LuUser />,
+          filter: {
+            type: "static",
+            options: people.map((employee) => ({
+              value: employee.id,
+              label: employee.name
+            }))
+          }
+        }
+      }
+    ];
+    return [...defaultColumns, ...customColumns];
+  }, [workCenters, people, customColumns, navigate, t]);
+
+  const renderContextMenu = useCallback(
+    (row: (typeof data)[number]) => {
+      return (
+        <>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.edit}
+            onClick={() => {
+              navigate(`${path.to.process(row.id!)}?${params.toString()}`);
+            }}
+          >
+            <MenuIcon icon={<LuPencil />} />
+            <Trans>Edit Process</Trans>
+          </MenuItem>
+          {row.active ? (
+            <MenuItem
+              disabled={!permissions.can("delete", "resources")}
+              onClick={() => {
+                navigate(
+                  `${path.to.processDeactivate(row.id!)}?${params.toString()}`
+                );
+              }}
+            >
+              <MenuIcon icon={<LuPower />} />
+              <Trans>Deactivate Process</Trans>
+            </MenuItem>
+          ) : (
+            <MenuItem
+              disabled={!permissions.can("delete", "resources")}
+              onClick={() => {
+                navigate(
+                  `${path.to.processActivate(row.id!)}?${params.toString()}`
+                );
+              }}
+            >
+              <MenuIcon icon={<LuCheck />} />
+              <Trans>Activate Process</Trans>
+            </MenuItem>
+          )}
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.delete}
+            destructive
+            disabled={!permissions.can("delete", "resources")}
+            onClick={() => {
+              navigate(
+                `${path.to.deleteProcess(row.id!)}?${params.toString()}`
+              );
+            }}
+          >
+            <MenuIcon icon={<LuTrash />} />
+            <Trans>Delete Process</Trans>
+          </MenuItem>
+        </>
+      );
+    },
+    [navigate, params, permissions]
+  );
+
+  return (
+    <Table<Process>
+      data={data}
+      count={count}
+      columns={columns}
+      defaultColumnVisibility={defaultColumnVisibility}
+      importCSV={[
+        {
+          table: "process" as const,
+          label: "Processes"
+        }
+      ]}
+      primaryAction={
+        permissions.can("create", "resources") && (
+          <New label={t`Process`} to={`new?${params.toString()}`} />
+        )
+      }
+      renderContextMenu={renderContextMenu}
+      title={t`Processes`}
+      table="process"
+      withSavedView
+    />
+  );
+});
+
+ProcessesTable.displayName = "ProcessesTable";
+export default ProcessesTable;

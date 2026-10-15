@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { RecordOutlet, useRouteData } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import { useLingui } from "@lingui/react/macro";
+import { Suspense } from "react";
+import type { LoaderFunctionArgs } from "react-router";
+import { Await, useLoaderData, useParams } from "react-router";
+import { ResizablePanels } from "~/components/Layout";
+import type { ItemFile, MaterialSummary } from "~/modules/items";
+import {
+  getItemFiles,
+  getMakeMethods,
+  getMaterial,
+  getMaterialUsedIn,
+  getPickMethods,
+  getSupplierParts
+} from "~/modules/items";
+import { streamItemSupersession } from "~/modules/items/items.server";
+import type { UsedInNode } from "~/modules/items/ui/Item/UsedIn";
+import { UsedInSkeleton, UsedInTree } from "~/modules/items/ui/Item/UsedIn";
+import {
+  MaterialHeader,
+  MaterialProperties
+} from "~/modules/items/ui/Materials";
+import { getTagsList } from "~/modules/shared";
+import { detailBreadcrumb, type Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  breadcrumb: detailBreadcrumb(
+    { breadcrumb: msg`Materials`, to: path.to.materials },
+    (data) => data?.materialSummary?.readableIdWithRevision
+  ),
+  module: "items"
+};
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "parts",
+    bypassRls: true
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const { supersession, supersededBy } = streamItemSupersession(
+    client,
+    itemId,
+    companyId
+  );
+
+  const [materialSummary, supplierParts, pickMethods, tags] = await Promise.all(
+    [
+      getMaterial(client, itemId, companyId),
+      getSupplierParts(client, itemId, companyId),
+      getPickMethods(client, itemId, companyId),
+      getTagsList(client, companyId, "material")
+    ]
+  );
+
+  if (materialSummary.error) {
+    throw redirect(
+      path.to.items,
+      await flash(
+        request,
+        error(materialSummary.error, "Failed to load material summary")
+      )
+    );
+  }
+
+  return {
+    materialSummary: materialSummary.data,
+    supersession,
+    supersededBy,
+    files: getItemFiles(client, itemId, companyId),
+    supplierParts: supplierParts.data ?? [],
+    pickMethods: pickMethods.data ?? [],
+    makeMethods: getMakeMethods(client, itemId, companyId),
+    tags: tags.data ?? [],
+    usedIn: getMaterialUsedIn(client, itemId, companyId)
+  };
+}
+
+export default function MaterialRoute() {
+  const { t } = useLingui();
+  const { itemId } = useParams();
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const materialData = useRouteData<{
+    materialSummary: MaterialSummary;
+    files: Promise<ItemFile[]>;
+  }>(path.to.material(itemId));
+
+  if (!materialData) throw new Error("Could not find material data");
+
+  const { usedIn } = useLoaderData<typeof loader>();
+
+  return (
+    <div className="flex flex-col h-[calc(100dvh-var(--topbar-height)-var(--content-inset))] overflow-hidden w-full">
+      <MaterialHeader key={itemId} />
+      <div className="flex h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] overflow-hidden w-full">
+        <div className="flex flex-grow overflow-hidden">
+          <ResizablePanels
+            explorerLabel={t`Used In`}
+            explorer={
+              <div className="flex flex-col h-full">
+                <div className="flex-1 overflow-y-auto">
+                  <Suspense fallback={<UsedInSkeleton />}>
+                    <Await resolve={usedIn}>
+                      {(resolvedUsedIn) => {
+                        const {
+                          issues,
+                          jobMaterials,
+                          maintenanceDispatchItems,
+                          methodMaterials,
+                          purchaseOrderLines,
+                          receiptLines,
+                          quoteMaterials,
+                          salesOrderLines,
+                          shipmentLines,
+                          supplierQuotes,
+                          inspections,
+                          jobMaterialUsage
+                        } = resolvedUsedIn;
+
+                        const tree: UsedInNode[] = [
+                          {
+                            key: "issues",
+                            name: "Issues",
+                            module: "quality",
+                            children: issues
+                          },
+                          {
+                            key: "jobMaterials",
+                            name: "Job Materials",
+                            module: "production",
+                            children: jobMaterials
+                          },
+                          {
+                            key: "maintenanceDispatchItems",
+                            name: "Maintenance",
+                            module: "resources",
+                            children: maintenanceDispatchItems
+                          },
+                          {
+                            key: "methodMaterials",
+                            name: "Method Materials",
+                            module: "parts",
+                            // @ts-expect-error
+                            children: methodMaterials
+                          },
+                          {
+                            key: "purchaseOrderLines",
+                            name: "Purchase Orders",
+                            module: "purchasing",
+                            children: purchaseOrderLines.map((po) => ({
+                              ...po,
+                              methodType: "Purchase to Order"
+                            }))
+                          },
+                          {
+                            key: "receiptLines",
+                            name: "Receipts",
+                            module: "inventory",
+                            children: receiptLines.map((receipt) => ({
+                              ...receipt,
+                              methodType: "Pull from Inventory"
+                            }))
+                          },
+
+                          {
+                            key: "quoteMaterials",
+                            name: "Quote Materials",
+                            module: "sales",
+                            children: quoteMaterials?.map((qm) => ({
+                              ...qm,
+                              documentReadableId: qm.documentReadableId ?? ""
+                            }))
+                          },
+                          {
+                            key: "salesOrderLines",
+                            name: "Sales Orders",
+                            module: "sales",
+                            children: salesOrderLines
+                          },
+                          {
+                            key: "shipmentLines",
+                            name: "Shipments",
+                            module: "inventory",
+                            children: shipmentLines.map((shipment) => ({
+                              ...shipment,
+                              methodType: "Shipment"
+                            }))
+                          },
+                          {
+                            key: "supplierQuotes",
+                            name: "Supplier Quotes",
+                            module: "purchasing",
+                            children: supplierQuotes
+                          }
+                        ];
+
+                        tree.push({
+                          key: "inspections",
+                          name: "Inspections",
+                          module: "quality",
+                          children: inspections
+                        });
+
+                        return (
+                          <UsedInTree
+                            tree={tree}
+                            hasSizesInsteadOfRevisions={true}
+                            revisions={materialData.materialSummary?.revisions}
+                            itemReadableId={
+                              materialData.materialSummary?.readableId ?? ""
+                            }
+                            itemReadableIdWithRevision={
+                              materialData.materialSummary
+                                ?.readableIdWithRevision ?? ""
+                            }
+                            jobMaterialUsage={jobMaterialUsage}
+                          />
+                        );
+                      }}
+                    </Await>
+                  </Suspense>
+                </div>
+              </div>
+            }
+            content={
+              <div className="bg-card h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent w-full">
+                <RecordOutlet />
+              </div>
+            }
+            properties={<MaterialProperties key={itemId} />}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

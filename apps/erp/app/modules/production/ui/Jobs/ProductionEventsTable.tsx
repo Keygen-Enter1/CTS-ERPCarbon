@@ -1,0 +1,309 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Badge,
+  MENU_ITEM_SHORTCUTS,
+  MenuIcon,
+  MenuItem,
+  useDisclosure
+} from "@carbon/react";
+import { formatDurationMilliseconds } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo, useState } from "react";
+import { LuPencil, LuTimer, LuTrash } from "react-icons/lu";
+import { useNavigate, useParams } from "react-router";
+import {
+  DateTime,
+  EmployeeAvatar,
+  Hyperlink,
+  New,
+  Table,
+  TimeTypeIcon
+} from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { ConfirmDelete } from "~/components/Modals";
+import { usePermissions, useUrlParams } from "~/hooks";
+import type { WorkCenter } from "~/modules/resources/types";
+import { usePeople } from "~/stores";
+import { path } from "~/utils/path";
+import type { ProductionEvent } from "../../types";
+
+type ProductionEventsTableProps = {
+  data: ProductionEvent[];
+  count: number;
+  operations: { id: string; description: string | null }[];
+  workCenters: WorkCenter[];
+};
+
+const ProductionEventsTable = memo(
+  ({ data, count, operations, workCenters }: ProductionEventsTableProps) => {
+    const { jobId } = useParams();
+    const { t } = useLingui();
+    if (!jobId) throw new Error("Job ID is required");
+    const [people] = usePeople();
+
+    const columns = useMemo<ColumnDef<ProductionEvent>[]>(() => {
+      return [
+        {
+          accessorKey: "jobOperationId",
+          header: t`Operation`,
+          cell: ({ row }) => (
+            <Hyperlink to={row.original.id}>
+              {row.original.jobOperation?.description ?? null}
+            </Hyperlink>
+          ),
+          meta: {
+            mobile: "P1",
+            filter: {
+              type: "static",
+              options: operations.map((operation) => ({
+                value: operation.id,
+                label: <Enumerable value={operation.description} />
+              }))
+            }
+          }
+        },
+        {
+          id: "item",
+          header: t`Item`,
+          cell: ({ row }) => {
+            return row.original.jobOperation?.jobMakeMethod?.item
+              ?.readableIdWithRevision;
+          }
+        },
+        {
+          accessorKey: "employeeId",
+          header: t`Employee`,
+          cell: ({ row }) => (
+            <EmployeeAvatar employeeId={row.original.employeeId} />
+          ),
+          meta: {
+            mobile: "P3",
+            filter: {
+              type: "static",
+              options: people.map((employee) => ({
+                value: employee.id,
+                label: <Enumerable value={employee.name} />
+              }))
+            }
+          }
+        },
+        {
+          accessorKey: "type",
+          header: t`Type`,
+          cell: ({ row }) => (
+            <Badge
+              variant={
+                row.original.type === "Labor"
+                  ? "green"
+                  : row.original.type === "Machine"
+                    ? "blue"
+                    : "yellow"
+              }
+            >
+              <TimeTypeIcon type={row.original.type ?? ""} className="mr-2" />
+              {row.original.type}
+            </Badge>
+          ),
+          meta: {
+            mobile: "P2",
+            filter: {
+              type: "static",
+              options: ["Setup", "Labor", "Machine"].map((type) => ({
+                value: type,
+                label: (
+                  <Badge
+                    variant={
+                      type === "Labor"
+                        ? "green"
+                        : type === "Machine"
+                          ? "blue"
+                          : "yellow"
+                    }
+                  >
+                    <TimeTypeIcon type={type} className="mr-2" />
+                    {type}
+                  </Badge>
+                )
+              }))
+            }
+          }
+        },
+        {
+          accessorKey: "duration",
+          header: t`Duration`,
+          cell: ({ row }) =>
+            row.original.duration
+              ? formatDurationMilliseconds(row.original.duration * 1000)
+              : null,
+          meta: { mobile: "P2" }
+        },
+        {
+          accessorKey: "workCenterId",
+          header: t`Work Center`,
+          cell: ({ row }) => {
+            const workCenter = workCenters.find(
+              (wc) => wc.id === row.original.workCenterId
+            );
+            return <Enumerable value={workCenter?.name ?? null} />;
+          },
+          meta: {
+            filter: {
+              type: "static",
+              options: workCenters.map((workCenter) => ({
+                value: workCenter.id!,
+                label: <Enumerable value={workCenter.name} />
+              }))
+            }
+          }
+        },
+        {
+          accessorKey: "startTime",
+          header: t`Start Time`,
+          cell: ({ row }) => (
+            <DateTime value={row.original.startTime} variant="absolute" />
+          )
+        },
+        {
+          accessorKey: "endTime",
+          header: t`End Time`,
+          cell: ({ row }) => (
+            <DateTime value={row.original.endTime} variant="absolute" />
+          )
+        },
+        {
+          accessorKey: "notes",
+          header: t`Notes`,
+          cell: ({ row }) => (
+            <div
+              className="max-w-[200px] truncate"
+              title={row.original.notes ?? ""}
+            >
+              {row.original.notes}
+            </div>
+          )
+        }
+      ];
+    }, [operations, people, workCenters, t]);
+
+    const permissions = usePermissions();
+
+    const deleteModal = useDisclosure();
+    const [selectedEvent, setSelectedEvent] = useState<ProductionEvent | null>(
+      null
+    );
+
+    const onDelete = (data: ProductionEvent) => {
+      setSelectedEvent(data);
+      deleteModal.onOpen();
+    };
+
+    const onDeleteCancel = () => {
+      setSelectedEvent(null);
+      deleteModal.onClose();
+    };
+
+    const navigate = useNavigate();
+
+    // biome-ignore lint/correctness/useExhaustiveDependencies: suppressed due to migration
+    const renderContextMenu = useCallback<
+      (row: ProductionEvent) => JSX.Element
+    >(
+      (row) => (
+        <>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.edit}
+            disabled={!permissions.can("update", "production")}
+            onClick={() => navigate(row.id)}
+          >
+            <MenuIcon icon={<LuPencil />} />
+            Edit Event
+          </MenuItem>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.delete}
+            destructive
+            disabled={!permissions.can("delete", "production")}
+            onClick={() => onDelete(row)}
+          >
+            <MenuIcon icon={<LuTrash />} />
+            Delete Event
+          </MenuItem>
+        </>
+      ),
+
+      [permissions]
+    );
+    const [params] = useUrlParams();
+
+    // When arriving from a job's Estimates vs Actual view, the table is
+    // pre-filtered to a single operation (`filter=jobOperationId:eq:...`). An
+    // operation with no recorded time yet is a normal, expected state — not a
+    // failed search — so show a plain message instead of the generic
+    // "No results found / Remove Filters" empty state, which would imply the
+    // filter is the problem.
+    //
+    // Only override when the operation filter is the *sole* narrowing: if the
+    // user has also applied an employee/type filter or a search, "Remove
+    // Filters" is genuinely useful, so keep the generic empty state for those.
+    const activeFilters = params.getAll("filter");
+    const isFilteredToOperation =
+      !params.get("search") &&
+      activeFilters.length === 1 &&
+      activeFilters[0].startsWith("jobOperationId:");
+
+    const emptyState = isFilteredToOperation ? (
+      <>
+        <div className="flex justify-center items-center h-12 w-12 rounded-full bg-muted text-muted-foreground -mt-[10dvh]">
+          <LuTimer className="h-6 w-6 shrink-0" />
+        </div>
+        <span className="text-xs font-mono font-light text-muted-foreground uppercase text-center max-w-xs text-balance">
+          <Trans>No production events recorded for this operation yet</Trans>
+        </span>
+      </>
+    ) : undefined;
+
+    return (
+      <>
+        <Table<ProductionEvent>
+          compact
+          count={count}
+          columns={columns}
+          data={data}
+          emptyState={emptyState}
+          primaryAction={
+            permissions.can("update", "accounting") && (
+              <New
+                label={t`Production Event`}
+                to={`new?${params.toString()}`}
+              />
+            )
+          }
+          renderContextMenu={renderContextMenu}
+          title={t`Production Events`}
+        />
+        {deleteModal.isOpen && selectedEvent && (
+          <ConfirmDelete
+            action={path.to.deleteProductionEvent(selectedEvent.id)}
+            isOpen
+            name={`${
+              selectedEvent.jobOperation?.description ?? "Operation"
+            } by ${
+              people.find((p) => p.id === selectedEvent.employeeId)?.name ??
+              "Unknown Employee"
+            }`}
+            text="Are you sure you want to delete this production event? This action cannot be undone."
+            onCancel={onDeleteCancel}
+            onSubmit={onDeleteCancel}
+          />
+        )}
+      </>
+    );
+  }
+);
+
+ProductionEventsTable.displayName = "ProductionEventsTable";
+
+export default ProductionEventsTable;

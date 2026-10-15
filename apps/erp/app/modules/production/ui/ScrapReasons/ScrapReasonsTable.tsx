@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { MENU_ITEM_SHORTCUTS, MenuIcon, MenuItem } from "@carbon/react";
+import { useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useCallback, useMemo } from "react";
+import { LuPencil, LuTrash } from "react-icons/lu";
+import { useNavigate } from "react-router";
+import { Hyperlink, New, Table } from "~/components";
+import { Enumerable } from "~/components/Enumerable";
+import { usePermissions, useUrlParams } from "~/hooks";
+import { useCustomColumns } from "~/hooks/useCustomColumns";
+import { path } from "~/utils/path";
+import type { ScrapReason } from "../../types";
+
+type ScrapReasonsTableProps = {
+  data: ScrapReason[];
+  count: number;
+};
+
+const ScrapReasonsTable = memo(({ data, count }: ScrapReasonsTableProps) => {
+  const [params] = useUrlParams();
+  const { t } = useLingui();
+  const navigate = useNavigate();
+  const permissions = usePermissions();
+
+  const customColumns = useCustomColumns<ScrapReason>("scrapReason");
+  const columns = useMemo<ColumnDef<ScrapReason>[]>(() => {
+    const defaultColumns: ColumnDef<ScrapReason>[] = [
+      {
+        accessorKey: "name",
+        header: t`Scrap Reason`,
+        cell: ({ row }) => (
+          <Hyperlink to={row.original.id}>
+            <Enumerable value={row.original.name} />
+          </Hyperlink>
+        ),
+        meta: {
+          mobile: "P1",
+          icon: <LuTrash />
+        }
+      }
+    ];
+    return [...defaultColumns, ...customColumns];
+  }, [customColumns, t]);
+
+  const renderContextMenu = useCallback(
+    (row: ScrapReason) => {
+      return (
+        <>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.edit}
+            onClick={() => {
+              navigate(`${path.to.scrapReason(row.id)}?${params.toString()}`);
+            }}
+          >
+            <MenuIcon icon={<LuPencil />} />
+            Edit Scrap Reason
+          </MenuItem>
+          <MenuItem
+            shortcut={MENU_ITEM_SHORTCUTS.delete}
+            destructive
+            disabled={!permissions.can("delete", "production")}
+            onClick={() => {
+              navigate(
+                `${path.to.deleteScrapReason(row.id)}?${params.toString()}`
+              );
+            }}
+          >
+            <MenuIcon icon={<LuTrash />} />
+            Delete Scrap Reason
+          </MenuItem>
+        </>
+      );
+    },
+    [navigate, params, permissions]
+  );
+
+  return (
+    <Table<ScrapReason>
+      data={data}
+      columns={columns}
+      count={count}
+      importCSV={[
+        {
+          table: "scrapReason" as const,
+          label: t`Scrap Reasons`
+        }
+      ]}
+      primaryAction={
+        permissions.can("create", "production") && (
+          <New
+            label={t`Scrap Reason`}
+            to={`${path.to.newScrapReason}?${params.toString()}`}
+          />
+        )
+      }
+      renderContextMenu={renderContextMenu}
+      title={t`Scrap Reasons`}
+    />
+  );
+});
+
+ScrapReasonsTable.displayName = "ScrapReasonsTable";
+export default ScrapReasonsTable;

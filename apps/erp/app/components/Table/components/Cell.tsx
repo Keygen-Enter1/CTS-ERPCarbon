@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { getLogger } from "@carbon/logger";
+import { cn, Td } from "@carbon/react";
+import type { Cell as CellType, Column } from "@tanstack/react-table";
+import { flexRender } from "@tanstack/react-table";
+import type { CSSProperties } from "react";
+import { memo, useState } from "react";
+import { LuPencil } from "react-icons/lu";
+import type { EditableTableCellComponent } from "~/components/Editable";
+import { useMovingCellRef } from "~/hooks";
+import { getAccessorKey } from "../utils";
+import { CellContent } from "./CellContent";
+
+const logger = getLogger("erp", "cell");
+
+type CellProps<T> = {
+  cell: CellType<T, unknown>;
+  columnIndex: number;
+  editableComponents?: Record<string, EditableTableCellComponent<T>>;
+  editedCells?: string[];
+  isEditing: boolean;
+  isEditMode: boolean;
+  isRowSelected: boolean;
+  isSelected: boolean;
+  // Memo key only — see Row.tsx. Identity flips when the column defs are
+  // rebuilt or visibility/order/pinning changes, which is when a memoized cell
+  // would otherwise render a stale `columnDef.cell` renderer.
+  visibleColumns: Column<any, unknown>[];
+  // Render key only: `getPinnedStyles` is a fresh closure every render and is
+  // deliberately excluded from the memo comparator, so without a primitive that
+  // flips with the scroll state and the pinned columns' sticky offsets,
+  // memoized cells never pick up the pinned-edge shadow or a moved offset. The
+  // style itself still comes from `getPinnedStyles`.
+  pinnedStyleKey?: string;
+  getPinnedStyles: (column: Column<any, unknown>) => CSSProperties;
+  onClick?: () => void;
+  onUpdate?: (updates: Record<string, unknown>) => void;
+  table: any;
+};
+
+const Cell = <T extends object>({
+  cell,
+  columnIndex,
+  editableComponents,
+  editedCells,
+  isEditing,
+  isEditMode,
+  isSelected,
+  getPinnedStyles,
+  onClick,
+  onUpdate,
+  table
+}: CellProps<T>) => {
+  const { ref, tabIndex, onFocus } = useMovingCellRef(isSelected);
+  const [hasError, setHasError] = useState(false);
+  const accessorKey = getAccessorKey(cell.column.columnDef);
+
+  const wasEdited =
+    !!editedCells && !!accessorKey && editedCells.includes(accessorKey);
+
+  const hasEditableTableCellComponent =
+    accessorKey !== undefined &&
+    editableComponents &&
+    accessorKey in editableComponents;
+
+  const editableCell = hasEditableTableCellComponent
+    ? editableComponents[accessorKey]
+    : null;
+
+  const isPinned = cell.column.getIsPinned();
+
+  // Inline-editable cells render as plain text until clicked; surface a subtle
+  // pencil on hover so users can tell the value is editable.
+  const showEditAffordance =
+    isEditMode && hasEditableTableCellComponent && !isSelected;
+
+  return (
+    <Td
+      className={cn(
+        "group/cell relative py-2 whitespace-nowrap text-sm outline-none max-w-[30dvw] truncate",
+        // Phones: a grid's name column opts in to more width than the others.
+        "max-md:[&:has([data-key-cell])]:max-w-[45dvw]",
+        cell.column.id === "Select" ? "px-2" : "px-4",
+        wasEdited && "bg-yellow-100 dark:bg-yellow-900",
+        isEditMode && !hasEditableTableCellComponent && "bg-muted/50",
+        isEditMode && "border-border border-r",
+        hasError && "ring-inset ring-2 ring-red-500",
+        // Selection is always visible (Excel-like), or keyboard navigation
+        // has no landmark. Editable cells get the full-strength ring +
+        // background; read-only cells a muted ring so the selection doesn't
+        // signal "you can type here".
+        isSelected && "!ring-inset !ring-2",
+        isSelected &&
+          (hasEditableTableCellComponent ? "!ring-ring" : "!ring-ring/40"),
+        isSelected && hasEditableTableCellComponent && "!bg-background",
+        "transition-[left,right,box-shadow] duration-200",
+        isPinned && "bg-card"
+      )}
+      ref={ref}
+      style={{
+        ...getPinnedStyles(cell.column),
+        width: cell.column.getSize(),
+        margin: 0,
+        borderSpacing: 0
+      }}
+      data-row={cell.row.index}
+      data-column={columnIndex}
+      tabIndex={tabIndex}
+      onClick={onClick}
+      onFocus={onFocus}
+    >
+      {isSelected && isEditing && hasEditableTableCellComponent ? (
+        <div className="mx-[-0.65rem] my-[-0.25rem]">
+          {hasEditableTableCellComponent
+            ? flexRender(editableCell, {
+                accessorKey,
+                value: cell.renderValue(),
+                row: cell.row.original,
+                onUpdate: onUpdate
+                  ? onUpdate
+                  : () => logger.error("No update function provided"),
+                onError: () => {
+                  setHasError(true);
+                }
+              })
+            : null}
+        </div>
+      ) : (
+        <div ref={ref}>
+          <CellContent cell={cell} />
+          {showEditAffordance && (
+            <LuPencil
+              aria-hidden
+              className="pointer-events-none absolute right-1.5 top-1/2 size-3 -translate-y-1/2 text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/cell:opacity-60"
+            />
+          )}
+        </div>
+      )}
+    </Td>
+  );
+};
+
+const MemoizedCell = memo(
+  Cell,
+  (prev, next) =>
+    next.isRowSelected === prev.isRowSelected &&
+    next.isSelected === prev.isSelected &&
+    next.isEditing === prev.isEditing &&
+    next.isEditMode === prev.isEditMode &&
+    next.cell.getValue() === prev.cell.getValue() &&
+    next.cell.getContext() === prev.cell.getContext() &&
+    next.visibleColumns === prev.visibleColumns &&
+    next.pinnedStyleKey === prev.pinnedStyleKey &&
+    next.editedCells === prev.editedCells &&
+    next.columnIndex === prev.columnIndex
+) as typeof Cell;
+
+export default MemoizedCell;

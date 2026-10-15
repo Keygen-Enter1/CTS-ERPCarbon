@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, notFound, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { isUniqueViolation, redirect } from "@carbon/utils";
+import type { ActionFunctionArgs } from "react-router";
+import { data, useNavigate, useParams } from "react-router";
+import {
+  customerContactValidator,
+  insertCustomerContact
+} from "~/modules/sales";
+import { CustomerContactForm } from "~/modules/sales/ui/Customer";
+import { requireCompanyRecord } from "~/modules/shared/shared.server";
+import { setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { companyId } = await requirePermissions(request, {
+    create: "sales"
+  });
+
+  // RLS doesn't work for selecting a contact with no customer
+  const client = getCarbonServiceRole();
+
+  const { customerId } = params;
+  if (!customerId) throw notFound("customerId not found");
+
+  const formData = await request.formData();
+  const modal = formData.get("type") === "modal";
+
+  const validation = await validator(customerContactValidator).validate(
+    formData
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  // biome-ignore lint/correctness/noUnusedVariables: suppressed due to migration
+  const { id, contactId, customerLocationId, ...contact } = validation.data;
+
+  // The contact is written through the service role: the customer in the URL
+  // (and the location on the form) must belong to this company.
+  await Promise.all([
+    requireCompanyRecord(client, "customer", companyId, { id: customerId }),
+    customerLocationId
+      ? requireCompanyRecord(client, "customerLocation", companyId, {
+          id: customerLocationId,
+          customerId
+        })
+      : null
+  ]);
+
+  const createCustomerContact = await insertCustomerContact(client, {
+    customerId,
+    companyId,
+    contact,
+    customerLocationId,
+    customFields: setCustomFields(formData)
+  });
+  if (createCustomerContact.error) {
+    let errorMessage = "Failed to create customer contact";
+    if (isUniqueViolation(createCustomerContact.error)) {
+      const contact = await client
+        .from("contact")
+        .select("id")
+        .eq("email", validation.data.email)
+        .eq("companyId", companyId)
+        .single();
+      if (contact.data) {
+        const customerContact = await client
+          .from("customerContact")
+          .select("customerId")
+          .eq("contactId", contact.data.id)
+          .single();
+        if (customerContact.data) {
+          const customer = await client
+            .from("customer")
+            .select("name")
+            .eq("id", customerContact.data.customerId)
+            .single();
+          errorMessage = `Contact ${validation.data.email} already exists for ${customer.data?.name}`;
+        } else {
+          const supplierContact = await client
+            .from("supplierContact")
+            .select("supplierId")
+            .eq("contactId", contact.data.id)
+            .single();
+          if (supplierContact.data) {
+            const supplier = await client
+              .from("supplier")
+              .select("name")
+              .eq("id", supplierContact.data.supplierId)
+              .single();
+            errorMessage = `Contact ${validation.data.email} already exists for ${supplier.data?.name}`;
+          }
+        }
+      }
+    }
+
+    return modal
+      ? data(error(createCustomerContact.error, errorMessage), {
+          status: 400
+        })
+      : redirect(
+          path.to.customerContacts(customerId),
+          await flash(request, error(createCustomerContact.error, errorMessage))
+        );
+  }
+
+  return modal
+    ? data(createCustomerContact, { status: 201 })
+    : redirect(
+        path.to.customerContacts(customerId),
+        await flash(request, success("Customer contact created"))
+      );
+}
+
+export default function CustomerContactsNewRoute() {
+  const navigate = useNavigate();
+  const { customerId } = useParams();
+  if (!customerId) throw new Error("customerId not found");
+
+  const initialValues = {
+    firstName: "",
+    lastName: "",
+    email: ""
+  };
+
+  return (
+    <CustomerContactForm
+      customerId={customerId}
+      initialValues={initialValues}
+      onClose={() => navigate(path.to.customerContacts(customerId))}
+    />
+  );
+}

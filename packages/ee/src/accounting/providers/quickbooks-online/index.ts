@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: LicenseRef-Carbon-Commercial
+// Carbon Enterprise file, licensed only under the Carbon Commercial License
+// (packages/ee/LICENSE). Not AGPL. Running, modifying, or copying it beyond those terms requires a commercial license.
+
+import { ProviderID } from "../../core/models";
+import { type SyncerRegistry, SyncFactory } from "../../core/sync";
+import { QboBillSyncer } from "./entities/bill";
+import { QboChargeSyncer } from "./entities/charge";
+import { QboCreditMemoSyncer } from "./entities/credit-memo";
+import { QboCustomerSyncer } from "./entities/customer";
+import { QboSalesInvoiceSyncer } from "./entities/invoice";
+import { QboItemSyncer } from "./entities/item";
+import { QboJournalEntrySyncer } from "./entities/journal-entry";
+import { QboPaymentSyncer } from "./entities/payment";
+import { QboPurchaseOrderSyncer } from "./entities/purchase-order";
+import { QboReimbursementSyncer } from "./entities/reimbursement";
+import { QboVendorSyncer } from "./entities/vendor";
+import { QboVendorCreditSyncer } from "./entities/vendor-credit";
+
+export * from "./entities/bill";
+export * from "./entities/charge";
+// credit-memo additionally exports the shared memo source shape + loader the
+// vendor-credit syncer reads (declared once so the barrel cannot collide)
+export * from "./entities/credit-memo";
+export * from "./entities/customer";
+export * from "./entities/invoice";
+export * from "./entities/item";
+// journal-entry exports mapJournalEntryToQboJournalEntry + the syncer for a
+// future QBO daily-consolidation path, mirroring the Xero barrel's contract
+export * from "./entities/journal-entry";
+// payment exports the composite entity-id helpers + buildQboPaymentSyncChange
+// the inbound QBO webhook route uses to enqueue operations
+export * from "./entities/payment";
+export * from "./entities/purchase-order";
+export * from "./entities/reimbursement";
+export * from "./entities/shared";
+export * from "./entities/vendor";
+export * from "./entities/vendor-credit";
+export * from "./models";
+export * from "./provider";
+
+/**
+ * Every syncer QuickBooks Online implements, keyed by entity type. The
+ * module-scope SyncFactory.register call below runs whenever this barrel
+ * is imported — same contract as the Xero barrel (every consumer path
+ * evaluates it before SyncFactory.getSyncer can be called with a QBO
+ * context).
+ */
+export const qboSyncerRegistry: SyncerRegistry = {
+  // Master Data — QBO keeps Customer and Vendor as separate objects
+  // (no Xero-style dual-flag Contact), so each has its own syncer
+  customer: QboCustomerSyncer,
+  vendor: QboVendorSyncer,
+  item: QboItemSyncer,
+
+  // Transaction Data
+  bill: QboBillSyncer,
+  // Card charges (Ramp card spend) as CreditCard Purchases; their journals
+  // are DOC_BACKED-excluded per row (core/posting.ts) while this is enabled
+  charge: QboChargeSyncer,
+  invoice: QboSalesInvoiceSyncer,
+  purchaseOrder: QboPurchaseOrderSyncer,
+
+  // Memo credits (posted `memo` rows) as native QBO credit documents:
+  // a CUSTOMER memo -> CreditMemo, a SUPPLIER memo -> VendorCredit. Both are
+  // push-only and gated by their own posting-sync family (creditMemo /
+  // supplierCredit), which default to "none".
+  creditMemo: QboCreditMemoSyncer,
+  supplierCredit: QboVendorCreditSyncer,
+
+  // Employee reimbursements as a Bill against an employee VENDOR — QBO has
+  // no native reimbursement object. `APAccountRef` carries Carbon's
+  // segregated employee-payable control account, so the provider ledger keeps
+  // the segregation too.
+  reimbursement: QboReimbursementSyncer,
+
+  // Posting sync (push-only journal entries -> QBO JournalEntry objects)
+  journalEntry: QboJournalEntrySyncer,
+
+  // Pull-only (forced by buildQboSyncConfig): QBO Payment (AR) / BillPayment
+  // (AP) settlements flow back onto Carbon sales/purchase invoices
+  payment: QboPaymentSyncer
+
+  // Not yet implemented:
+  // - salesOrder / inventoryAdjustment / employee
+};
+
+SyncFactory.register(ProviderID.QUICKBOOKS, qboSyncerRegistry);

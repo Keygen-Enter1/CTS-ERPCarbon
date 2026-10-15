@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { LineageEdge, LineagePayload } from "../utils";
+import type { LayoutDirection, LayoutResult } from "./core";
+import { TracingGraphManager } from "./TracingGraphManager";
+
+export function useTracingGraphManager(): TracingGraphManager {
+  const ref = useRef<TracingGraphManager | null>(null);
+  if (!ref.current) ref.current = new TracingGraphManager();
+
+  useEffect(() => {
+    const mgr = ref.current;
+    mgr?.init();
+    return () => mgr?.dispose();
+  }, []);
+
+  return ref.current;
+}
+
+export function useAsyncLayout(
+  manager: TracingGraphManager,
+  payload: LineagePayload,
+  direction: LayoutDirection,
+  spacing: number,
+  rejectIds: Set<string>,
+  rootIds: string[],
+  layoutVersion: number
+): LayoutResult | null {
+  const [result, setResult] = useState<LayoutResult | null>(null);
+  const rejectIdsArray = useMemo(() => Array.from(rejectIds), [rejectIds]);
+  const rootKey = rootIds.join("|");
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: layoutVersion is a manual relayout trigger; rootIds is keyed by rootKey
+  useEffect(() => {
+    let cancelled = false;
+    manager
+      .layout({
+        payload,
+        direction,
+        spacing,
+        rejectIds: rejectIdsArray,
+        rootIds
+      })
+      .then((r) => {
+        if (cancelled || r === null) return;
+        setResult(r);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    manager,
+    payload,
+    direction,
+    spacing,
+    rejectIdsArray,
+    rootKey,
+    layoutVersion
+  ]);
+
+  return result;
+}
+
+export type SelectionPath = {
+  nodeIds: Set<string>;
+  edgeIds: Set<string>;
+};
+
+export function useAsyncSelectionPath(
+  manager: TracingGraphManager,
+  edges: LineageEdge[],
+  selectedIds: string[],
+  excludedIds: Set<string>,
+  additionalRootIds: Set<string>
+): SelectionPath | null {
+  const [path, setPath] = useState<SelectionPath | null>(null);
+  const excludedArray = useMemo(() => Array.from(excludedIds), [excludedIds]);
+  const additionalArray = useMemo(
+    () => Array.from(additionalRootIds),
+    [additionalRootIds]
+  );
+
+  // Pathfinding reads only topology and which nodes are selected, but `edges`
+  // and `selectedIds` are rebuilt whenever ANY node state changes — a drag frame
+  // included. Keying on the values instead of the array identities keeps the
+  // worker from re-running (and repainting the graph a frame later) for edits it
+  // would answer identically.
+  const topologyKey = useMemo(
+    () => edges.map((e) => `${e.id}>${e.source}>${e.target}`).join("|"),
+    [edges]
+  );
+  const selectedKey = selectedIds.join("|");
+
+  const latest = useRef({ edges, selectedIds });
+  latest.current = { edges, selectedIds };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on topologyKey/selectedKey, not the array identities they summarize
+  useEffect(() => {
+    const { edges: currentEdges, selectedIds: currentSelected } =
+      latest.current;
+    if (currentSelected.length === 0 && additionalArray.length === 0) {
+      setPath(null);
+      return;
+    }
+    let cancelled = false;
+    manager
+      .selection(currentEdges, currentSelected, excludedArray, additionalArray)
+      .then((r) => {
+        if (cancelled || r === null) return;
+        setPath({
+          nodeIds: new Set(r.pathNodeIds),
+          edgeIds: new Set(r.pathEdgeIds)
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [manager, topologyKey, selectedKey, excludedArray, additionalArray]);
+
+  return path;
+}

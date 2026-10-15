@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { openai } from "@ai-sdk/openai";
+import { notFound } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getLogger } from "@carbon/logger";
+import { generateText, Output } from "ai";
+import type { ActionFunctionArgs } from "react-router";
+import type { ZodSchema } from "zod";
+import { z } from "zod";
+import { fieldMappings, importSchemas } from "~/modules/shared";
+
+const logger = getLogger("erp", "table-columns");
+
+const inputSchema = z.object({
+  fileColumns: z.array(z.string())
+  // firstRows: z.array(z.record(z.string(), z.string())),
+});
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  await requirePermissions(request, {});
+
+  const { table } = params;
+  if (!table) {
+    throw notFound("No table parameter provided");
+  }
+
+  const result = inputSchema.safeParse(await request.json());
+  if (!result.success) {
+    throw notFound("Table not found in the list of supported tables");
+  }
+
+  const { fileColumns } = result.data;
+
+  const schema = importSchemas[table as keyof typeof importSchemas].partial();
+
+  if (!schema) {
+    throw notFound("Table not found in the list of supported tables");
+  }
+
+  const dbFields = Object.keys(getZodSchemaFieldsShallow(schema));
+  const fileColumnsLower = fileColumns.map((c) => c.toLowerCase().trim());
+  const mappings = fieldMappings[table as keyof typeof fieldMappings];
+
+  // Deterministic exact match pass — check both field name and label
+  const matched: Record<string, string> = {};
+  const unmatchedFields: string[] = [];
+
+  for (const field of dbFields) {
+    // Match by field name (e.g., "processType" === "processtype")
+    const nameIdx = fileColumnsLower.indexOf(field.toLowerCase());
+    if (nameIdx !== -1) {
+      matched[field] = fileColumns[nameIdx];
+      continue;
+    }
+    // Match by label (e.g., "Process Type" === "process type")
+    const label = (mappings as Record<string, { label: string }>)?.[
+      field as keyof typeof mappings
+    ]?.label;
+    if (label) {
+      const labelIdx = fileColumnsLower.indexOf(label.toLowerCase());
+      if (labelIdx !== -1) {
+        matched[field] = fileColumns[labelIdx];
+        continue;
+      }
+    }
+    unmatchedFields.push(field);
+  }
+
+  // If all fields matched, skip AI entirely
+  if (unmatchedFields.length === 0) {
+    return matched;
+  }
+
+  // Use AI only for unmatched fields. Each answer is a column NAME, so every field is a
+  // required string: OpenAI's strict structured output refuses optional keys.
+  const unmatchedSchema = z.object(
+    Object.fromEntries(unmatchedFields.map((f) => [f, z.string()]))
+  );
+
+  const unmatchedFileColumns = fileColumns.filter(
+    (c) => !Object.values(matched).includes(c)
+  );
+
+  try {
+    const { output: object } = await generateText({
+      model: openai("gpt-4o"),
+      output: Output.object({ schema: unmatchedSchema }),
+      prompt: `
+      The following columns are the headings from a CSV import file for importing a ${table}.
+      Map these column names to the correct fields in our database (${unmatchedFields.join(", ")}) by providing the matching column name for each field.
+
+      If you are not sure or there is no matching column, please return "N/A".
+
+      Columns:
+      ${unmatchedFileColumns.join(",")}
+      `,
+      temperature: 0.2
+    });
+
+    return { ...matched, ...object };
+  } catch (error) {
+    logger.error("Error", { error: error });
+    return matched;
+  }
+}
+
+export function getZodSchemaFieldsShallow(schema: ZodSchema) {
+  const fields: Record<string, true> = {};
+  const proxy = new Proxy(fields, {
+    get(_, key) {
+      if (key === "then" || typeof key !== "string") {
+        return;
+      }
+      fields[key] = true;
+    }
+  });
+  schema.safeParse(proxy);
+  return fields;
+}

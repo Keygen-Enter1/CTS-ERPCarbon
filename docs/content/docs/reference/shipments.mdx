@@ -1,0 +1,85 @@
+---
+title: Shipments
+description: Goods going out — one posting model serving sales orders, returns, and transfers.
+---
+
+A **shipment** records goods leaving the company against a <Term id="sales-order">sales order</Term>, purchase order, outbound transfer, or [rental agreement](/docs/reference/rental-agreements). Its source type selects the corresponding posting behavior.
+
+Creating a shipment does not affect inventory. **<Term id="posting">Posting</Term>** relieves inventory, updates the source document, and records cost in a journal. Partial shipments allow one order to be fulfilled in multiple deliveries.
+
+## Fields
+
+<FieldTable>
+  <Field name="Source document" type="reference">The order, return, transfer, or rental agreement being shipped. A rental shipment keeps its agreement: create it from the agreement's **"Deliver"** button, not by changing the source.</Field>
+  <Field name="Shipped quantity" type="number">Units on this shipment, per line.</Field>
+  <Field name="Fulfillment" type="enum">Where a line is sourced: *Inventory* (from stock) or *Job* (from a production job).</Field>
+</FieldTable>
+
+## Status
+
+<StatusFlow entity="shipment">
+  <Status name="Draft">Being prepared; nothing posted.</Status>
+  <Status name="Pending" branch>Queued to post.</Status>
+  <Status name="Posted" accent>Inventory relieved and the source document advanced.</Status>
+  <Status name="Voided" terminal>Reversed after posting.</Status>
+</StatusFlow>
+
+<Callout type="info">
+Posting decrements inventory and bumps the source line's sent quantity; a sales order line's *sent complete* flag flips only once the cumulative shipped quantity reaches the ordered quantity. Posting a shipment does **not** create the <Term id="invoice">invoice</Term> — billing is a separate step.
+</Callout>
+
+## Rental shipments
+
+A shipment from a rental agreement delivers fleet units. It lists one row per unit with a tick box and a **"Meter"** reading, and its post dialog asks for **"Delivered on"**, which cannot be later than today. Posting puts the ticked units on rent, and the rows, meter readings included, become read-only. A rental unit stays a fixed asset, so posting writes no inventory movement and no journal entry. Its PDF prints as a **Delivery Ticket** that lists each unit with its serial number.
+
+<Screenshot label="Draft rental shipment listing fleet units with tick boxes and Meter fields" caption="A rental shipment from an agreement: untick the units that stay, then post." />
+
+## Related
+
+<Cards>
+  <Card title="Ship, invoice, get paid" href="/guides/order-to-cash">
+    Posting a shipment in the quote-to-cash flow.
+  </Card>
+  <Card title="Sales orders" href="/docs/reference/sales-orders">
+    The document a sales shipment advances.
+  </Card>
+  <Card title="Rental agreements" href="/docs/reference/rental-agreements">
+    Units delivered on a rental shipment.
+  </Card>
+</Cards>
+
+<AgentContext>
+## Troubleshooting
+
+Exact errors users hit when posting, voiding, or picking shipments.
+
+### "Shipment is empty"
+The post dialog blocks posting when no line has a shipped quantity above zero (and no fixed-asset line is marked shipped). Enter the shipped quantity on at least one line first.
+
+### "Tracked entity is not available"
+A batch assigned to a shipment line isn't in **Available** status — it may be Reserved, On Hold (for example pending inbound inspection), Consumed, or Rejected. Free it up (clear the hold, finish the inspection) or allocate a different batch.
+
+### "Serial numbers are missing or unavailable"
+A serial-tracked line doesn't have enough available serial units to cover the shipped quantity. Allocate more available serials or reduce the shipped quantity.
+
+### "Cannot post shipment with expired batch"
+The full message names the batch id. The company's expired-stock rule is **Block** (or **Block with override**) and a batch on the shipment is past its expiration date. Options: allocate a different batch, correct the expiration date on the tracked entity (reason required), or change the rule in Settings → Inventory to Warn. See [Shelf life](/docs/reference/shelf-life).
+
+### "Posted shipment with expired batch"
+The Warn-policy counterpart of the error above — the shipment posted, this is informational. Switch the company rule to Block if this should stop future posts.
+
+### "Batch has insufficient quantity"
+The quantity allocated to the line exceeds what that batch has on hand. Reduce the allocation or pick an additional batch.
+
+### "Can only void posted shipments"
+Voiding applies only to a shipment at **"Posted"**. A Draft or Pending shipment can be edited or deleted instead.
+
+### "Cannot delete a posted shipment"
+A posted shipment can't be deleted — void it instead, which writes reversing entries.
+
+### "A posted shipment can no longer be changed"
+A unit row on a rental shipment was edited after the shipment left Draft. The meter reading out is a record once posted; correct the unit on its agreement or asset instead.
+
+### "Failed to post shipment"
+Generic wrapper when the posting function fails. Common underlying causes: the [accounting period](/docs/reference/accounting) for the posting date is closed or locked, or default accounts are missing ("Error getting account defaults"). Ask the user for the full error text if available.
+</AgentContext>

@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { Badge, HStack } from "@carbon/react";
+import { useLingui } from "@lingui/react/macro";
+import type { ColumnDef } from "@tanstack/react-table";
+import { memo, useMemo } from "react";
+import { Hyperlink, MethodIcon, MethodItemTypeIcon, Table } from "~/components";
+import { methodItemType, methodType } from "~/modules/shared";
+import { useParts, useTools } from "~/stores";
+import type { MethodMaterial } from "../../types";
+import { getPathToMakeMethod } from "./utils";
+
+type MethodMaterialsTableProps = {
+  data: MethodMaterial[];
+  count: number;
+};
+
+const MethodMaterialsTable = memo(
+  ({ data, count }: MethodMaterialsTableProps) => {
+    const { t } = useLingui();
+    const parts = useParts();
+    const tools = useTools();
+
+    const items = useMemo(() => [...parts, ...tools], [parts, tools]);
+
+    const columns = useMemo<ColumnDef<MethodMaterial>[]>(() => {
+      return [
+        {
+          accessorKey: "makeMethod.item.readableIdWithRevision",
+          header: t`Method Id`,
+          cell: ({ row }) => (
+            <HStack className="py-1">
+              <Hyperlink
+                to={getPathToMakeMethod(
+                  // @ts-expect-error
+                  row.original.makeMethod?.item?.type,
+                  row.original.makeMethod?.item?.id,
+                  // @ts-expect-error
+                  row.original.makeMethod?.id
+                )}
+                className="max-w-[260px] truncate"
+              >
+                {row.original.makeMethod?.item?.readableIdWithRevision}
+              </Hyperlink>
+            </HStack>
+          ),
+          meta: { mobile: "P1" }
+        },
+        {
+          accessorKey: "itemReadableIdWithRevision",
+          header: t`Material ID`,
+          cell: (item) => item.getValue(),
+          meta: {
+            mobile: "P3",
+            filter: {
+              type: "static",
+              options: items?.map((item) => ({
+                value: item.readableIdWithRevision,
+                label: item.readableIdWithRevision
+              }))
+            }
+          }
+        },
+        {
+          accessorKey: "item.name",
+          header: t`Description`,
+          cell: ({ row }) => row.original.item?.name,
+          meta: {
+            // The accessor is a dot path; the exporter does a flat `row[key]`
+            // read, so without this the column exports blank.
+            exportValue: (row) => row.item?.name ?? null
+          }
+        },
+        {
+          accessorKey: "methodType",
+          header: t`Method Type`,
+          cell: (item) => (
+            <Badge variant="secondary">
+              <MethodIcon type={item.getValue<string>()} className="mr-2" />
+              <span>{item.getValue<string>()}</span>
+            </Badge>
+          ),
+          meta: {
+            filter: {
+              type: "static",
+              options: methodType.map((value) => ({
+                value,
+                label: (
+                  <Badge variant="secondary">
+                    <MethodIcon type={value} className="mr-2" />
+                    <span>{value}</span>
+                  </Badge>
+                )
+              }))
+            }
+          }
+        },
+        {
+          accessorKey: "itemType",
+          header: t`Type`,
+          cell: ({ row }) => (
+            <Badge variant="secondary">
+              <MethodItemTypeIcon
+                type={row.original.itemType}
+                className="mr-2"
+              />
+              <span>{row.original.itemType}</span>
+            </Badge>
+          ),
+          meta: {
+            filter: {
+              type: "static",
+              options: methodItemType.map((type) => ({
+                label: (
+                  <HStack spacing={2}>
+                    <MethodItemTypeIcon type={type} />
+                    <span>{type}</span>
+                  </HStack>
+                ),
+                value: type
+              }))
+            }
+          }
+        },
+
+        {
+          accessorKey: "unitOfMeasureCode",
+          header: t`UoM`,
+          cell: (item) => item.getValue()
+        },
+        {
+          accessorKey: "quantity",
+          header: t`Qty. per Parent`,
+          cell: (item) => item.getValue(),
+          meta: { mobile: "P2" }
+        }
+      ];
+    }, [items, t]);
+
+    return (
+      <Table<MethodMaterial>
+        count={count}
+        columns={columns}
+        data={data}
+        title={t`Method Materials`}
+      />
+    );
+  }
+);
+
+MethodMaterialsTable.displayName = "MethodMaterialsTable";
+
+export default MethodMaterialsTable;

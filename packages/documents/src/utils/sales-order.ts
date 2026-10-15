@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { Database } from "@carbon/database";
+import { distinctItemText } from "@carbon/utils";
+
+export function getLineDescription(
+  line: Database["public"]["Views"]["salesOrderLines"]["Row"]
+) {
+  switch (line?.salesOrderLineType) {
+    case "Fixed Asset":
+      return (
+        (line as any)?.assetReadableId ??
+        (line as any)?.assetName ??
+        "Fixed Asset"
+      );
+    case "Comment":
+      return line?.description;
+    default:
+      let customerPartNumber = line.customerPartId
+        ? ` (${line.customerPartId}${
+            line.customerPartRevision ? ` Rev ${line.customerPartRevision}` : ""
+          })`
+        : "";
+
+      return line?.itemReadableId + customerPartNumber;
+  }
+}
+
+export function getLineDescriptionDetails(
+  line: Database["public"]["Views"]["salesOrderLines"]["Row"]
+) {
+  switch (line?.salesOrderLineType) {
+    case "Fixed Asset":
+      return line?.description;
+    case "Comment":
+    default:
+      const itemDescription = line?.customerPartId
+        ? `\n${line.customerPartId}${
+            line.customerPartRevision ? ` Rev ${line.customerPartRevision}` : ""
+          }`
+        : "";
+      // A service's readable id is its name — don't print it twice.
+      return (
+        (distinctItemText(line?.itemReadableId, line?.description) ?? "") +
+        itemDescription
+      );
+  }
+}
+
+export function getLineSubtotal(
+  line: Database["public"]["Views"]["salesOrderLines"]["Row"]
+) {
+  return (
+    (line?.saleQuantity ?? 0) * (line?.convertedUnitPrice ?? 0) +
+    (line?.convertedAddOnCost ?? 0) +
+    (line?.convertedNonTaxableAddOnCost ?? 0) +
+    (line?.convertedShippingCost ?? 0)
+  );
+}
+
+export function getLineTaxableSubtotal(
+  line: Database["public"]["Views"]["salesOrderLines"]["Row"]
+) {
+  return (
+    (line?.saleQuantity ?? 0) * (line?.convertedUnitPrice ?? 0) +
+    (line?.convertedAddOnCost ?? 0) +
+    (line?.convertedShippingCost ?? 0)
+  );
+}
+
+export function getLineTaxesAndFees(
+  line: Database["public"]["Views"]["salesOrderLines"]["Row"]
+) {
+  const taxPercent = line.taxPercent ?? 0;
+  const tax = getLineTaxableSubtotal(line) * taxPercent;
+  const fees =
+    (line.convertedAddOnCost ?? 0) +
+    (line.convertedNonTaxableAddOnCost ?? 0) +
+    (line.convertedShippingCost ?? 0);
+  return tax + fees;
+}
+
+export function getLineTotal(
+  line: Database["public"]["Views"]["salesOrderLines"]["Row"]
+) {
+  const taxPercent = line.taxPercent ?? 0;
+  const tax = getLineTaxableSubtotal(line) * taxPercent;
+  return getLineSubtotal(line) + tax;
+}
+
+export function getTotal(
+  lines: Database["public"]["Views"]["salesOrderLines"]["Row"][],
+  salesOrder: Database["public"]["Views"]["salesOrders"]["Row"]
+) {
+  let total = 0;
+
+  lines.forEach((line) => {
+    total += getLineTotal(line);
+  });
+
+  return (
+    total + (salesOrder.shippingCost ?? 0) * (salesOrder.exchangeRate ?? 1)
+  );
+}

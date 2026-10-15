@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { CreatableCombobox } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import { useDisclosure } from "@carbon/react";
+import { useMemo, useRef, useState } from "react";
+import { useUser } from "~/hooks/useUser";
+import type { getCostCentersList } from "~/modules/accounting";
+import CostCenterForm from "~/modules/accounting/ui/CostCenters/CostCenterForm";
+import { path } from "~/utils/path";
+import { useEmptyState } from "./emptyStates";
+
+type CostCenterSelectProps = Omit<ComboboxProps, "options">;
+
+const CostCenter = (props: CostCenterSelectProps) => {
+  const { id: userId } = useUser();
+  const newCostCenterModal = useDisclosure();
+  const [created, setCreated] = useState<string>("");
+
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const options = useCostCenters();
+
+  const emptyMessage = useEmptyState("costCenter", {
+    onCreate: () => newCostCenterModal.onOpen()
+  });
+
+  return (
+    <>
+      <CreatableCombobox
+        ref={triggerRef}
+        options={options}
+        emptyMessage={emptyMessage}
+        {...props}
+        label={props?.label ?? "Cost Center"}
+        onCreateOption={(option) => {
+          newCostCenterModal.onOpen();
+          setCreated(option);
+        }}
+      />
+      {newCostCenterModal.isOpen && (
+        <CostCenterForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newCostCenterModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            name: created,
+            ownerId: userId
+          }}
+        />
+      )}
+    </>
+  );
+};
+
+CostCenter.displayName = "CostCenter";
+
+export default CostCenter;
+
+export const useCostCenters = () => {
+  const costCenterFetcher = useLoaderQuery<
+    Awaited<ReturnType<typeof getCostCentersList>>
+  >(path.to.api.costCenters);
+
+  const options = useMemo(
+    () =>
+      costCenterFetcher.data?.data
+        ? costCenterFetcher.data?.data.map((c) => ({
+            value: c.id,
+            label: c.name
+          }))
+        : [],
+    [costCenterFetcher.data]
+  );
+
+  return options;
+};

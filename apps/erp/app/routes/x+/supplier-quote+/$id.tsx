@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { flash } from "@carbon/auth/session.server";
+import { RecordOutlet, VStack } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { LoaderFunctionArgs } from "react-router";
+import { useParams } from "react-router";
+import { PanelProvider, ResizablePanels } from "~/components/Layout/Panels";
+import { getCurrencyByCode, getExchangeRate } from "~/modules/accounting";
+import {
+  getSiblingQuotesForQuote,
+  getSupplier,
+  getSupplierInteraction,
+  getSupplierInteractionDocuments,
+  getSupplierQuote,
+  getSupplierQuoteLinePricesByQuoteId,
+  getSupplierQuoteLines
+} from "~/modules/purchasing";
+import {
+  SupplierQuoteHeader,
+  SupplierQuoteProperties
+} from "~/modules/purchasing/ui/SupplierQuote";
+import SupplierQuoteExplorer from "~/modules/purchasing/ui/SupplierQuote/SupplierQuoteExplorer";
+import { getCompanySettings } from "~/modules/settings";
+import { detailBreadcrumb, type Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+export const handle: Handle = {
+  realtime: [
+    { table: "supplierQuote", column: "id", param: "id" },
+    { table: "supplierQuoteLine", column: "supplierQuoteId", param: "id" }
+  ],
+  breadcrumb: detailBreadcrumb(
+    { breadcrumb: msg`Supplier Quotes`, to: path.to.supplierQuotes },
+    (data) => data?.quote?.supplierQuoteId
+  ),
+  module: "purchasing"
+};
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { companyId, companyGroupId } = await requirePermissions(request, {
+    view: "purchasing"
+  });
+
+  const { id } = params;
+  if (!id) throw new Error("Could not find id");
+  const serviceRole = await getCarbonServiceRole();
+
+  // These reads run service-role (RLS bypassed), and `id` is the untrusted URL
+  // param, so resolve the quote and confirm it belongs to the caller's company
+  // BEFORE reading anything else keyed off it — otherwise a cross-company id
+  // would load that quote's lines/prices/siblings (CWE-639 IDOR).
+  const quote = await getSupplierQuote(serviceRole, id);
+
+  if (quote.error || !quote.data) {
+    throw redirect(
+      path.to.supplierQuotes,
+      await flash(request, error(quote.error, "Failed to load quote"))
+    );
+  }
+
+  if (quote.data.companyId !== companyId) {
+    throw redirect(
+      path.to.supplierQuotes,
+      await flash(request, error(null, "Failed to load quote"))
+    );
+  }
+
+  const [
+    lines,
+    prices,
+    siblingQuotes,
+    supplierInteraction,
+    presentationCurrency,
+    supplier,
+    companySettings,
+    rate
+  ] = await Promise.all([
+    getSupplierQuoteLines(serviceRole, id),
+    getSupplierQuoteLinePricesByQuoteId(serviceRole, id),
+    getSiblingQuotesForQuote(serviceRole, id),
+    getSupplierInteraction(serviceRole, quote.data.supplierInteractionId!),
+    getCurrencyByCode(serviceRole, companyGroupId, quote.data.currencyCode!),
+    getSupplier(serviceRole, quote.data.supplierId!),
+    getCompanySettings(serviceRole, companyId),
+    quote.data.currencyCode
+      ? getExchangeRate(
+          serviceRole,
+          quote.data.companyId,
+          quote.data.currencyCode
+        )
+      : null
+  ]);
+
+  if (supplierInteraction.error) {
+    throw redirect(
+      path.to.supplierQuotes,
+      await flash(
+        request,
+        error(
+          supplierInteraction.error,
+          "Failed to load supplier interaction record"
+        )
+      )
+    );
+  }
+
+  // A missing LIVE rate must not make the quote unopenable — this page hosts
+  // the refresh button that fixes it. Fall back to the document's own stamped
+  // snapshot (the PDF routes' policy); writes still refuse.
+  const exchangeRate = !rate
+    ? 1
+    : rate.error || rate.data === null
+      ? (quote.data.exchangeRate ?? 1)
+      : rate.data;
+
+  // Extract sibling quotes from the linked data
+  const siblingQuotesData =
+    siblingQuotes.data
+      ?.map((link) => link.supplierQuote)
+      .filter(Boolean)
+      // Deduplicate by quote ID (a quote might be linked to multiple shared RFQs)
+      .filter(
+        (quote, index, self) =>
+          self.findIndex((q) => q?.id === quote?.id) === index
+      ) ?? [];
+  // Compute default CC: use supplier's if set, otherwise company's
+  const defaultCc =
+    // @ts-expect-error TS18048 - TODO: fix type
+    supplier.data?.defaultCc?.length > 0
+      ? // @ts-expect-error TS18047 - TODO: fix type
+        supplier.data.defaultCc
+      : (companySettings.data?.defaultSupplierCc ?? []);
+
+  return {
+    quote: quote.data,
+    presentationCurrency: presentationCurrency.data ?? null,
+    lines: lines.data ?? [],
+    prices: prices.data ?? [],
+    files: getSupplierInteractionDocuments(
+      serviceRole,
+      companyId,
+      quote.data.supplierInteractionId!
+    ),
+    interaction: supplierInteraction.data,
+    exchangeRate,
+    siblingQuotes: siblingQuotesData,
+    defaultCc,
+    supplier: supplier?.data ?? null
+  };
+}
+
+export default function SupplierQuoteRoute() {
+  const params = useParams();
+  const { id } = params;
+  if (!id) throw new Error("Could not find id");
+
+  return (
+    <PanelProvider>
+      <div className="flex flex-col h-[calc(100dvh-var(--topbar-height)-var(--content-inset))] overflow-hidden w-full">
+        <SupplierQuoteHeader />
+        <div className="flex h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] overflow-hidden w-full">
+          <div className="flex flex-grow overflow-hidden">
+            <ResizablePanels
+              explorer={<SupplierQuoteExplorer />}
+              content={
+                <div className="bg-card h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent w-full">
+                  <VStack spacing={4} className="p-4">
+                    <RecordOutlet />
+                  </VStack>
+                </div>
+              }
+              properties={<SupplierQuoteProperties key={id} />}
+            />
+          </div>
+        </div>
+      </div>
+    </PanelProvider>
+  );
+}

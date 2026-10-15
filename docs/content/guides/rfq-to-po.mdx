@@ -1,0 +1,57 @@
+---
+title: From RFQ to PO
+description: Shop one item to many suppliers, then turn the winning quote into an order.
+label: "(I)"
+index: 0
+flow: rfq-to-bill
+flowName: RFQ to bill
+flowIndex: 2
+---
+
+This guide covers supplier solicitation and purchase-order creation. The [next guide](/guides/receive-and-bill) covers receipt, invoice matching, and payment.
+
+<Figure illustration="rfq-fanout" caption="One purchasing RFQ fans out to a supplier quote each; the winning bid converts to a purchase order." />
+
+## One RFQ, many suppliers
+
+A <Term id="rfq">purchasing RFQ</Term> sends the same requested lines to multiple suppliers for comparison. A new RFQ starts in **"Draft"**.
+
+Finalizing the RFQ creates one **Draft supplier quote** per supplier and links each quote to the request. Carbon can email each supplier a private response link. The RFQ moves to **"Requested"**.
+
+<Callout tone="neutral" badge="LOOSELY COUPLED" title="RFQ and supplier quote are both optional.">
+RFQs and supplier quotes are optional; you can create a purchase order directly. When used, junction records connect one RFQ to multiple supplier quotes and purchase orders.
+</Callout>
+
+<Screenshot src="/screens/rfq-supplier-comparison.png" label="Purchasing RFQ — supplier comparison" caption="One request, the same lines, fanned out to several suppliers to compare." ratio="wide" />
+
+## Suppliers quote back
+
+Each supplier quote has a private share link that requires no login. The supplier enters pricing, quantity breaks, and lead times. Submission moves the quote to **"Active"** and records the prices; rejection moves it to **"Declined"**.
+
+<Callout tone="blue" badge="SUPPLIER PORTAL" title="The portal hangs off the quote, not the request.">
+Each supplier responds through a separate quote. Compare the quotes and convert the selected one to an order.
+</Callout>
+
+<Screenshot src="/screens/rfq-supplier-portal.png" label="Supplier quote portal" caption="The supplier's view: enter unit price, quantity breaks, and lead time, then submit." ratio="wide" />
+
+## Into a purchase order
+
+Converting a supplier quote creates a <Term>purchase order</Term> with its supplier, lines, negotiated pricing, <Term>conversion factors</Term>, exchange rate, and supplier-interaction history. The order type is **"Purchase"** for items or **<Term id="outside-operation">"Outside Processing"</Term>** for subcontracted operations.
+
+Carbon derives the purchase-order status from its lines. A finalized order starts at **"To Receive and Invoice"**. If its value exceeds an approval threshold, it moves to **"Needs Approval"** until approved.
+
+<Callout tone="amber" badge="STATUS IS COMPUTED" title="A PO's status is derived from its lines, every time.">
+Each line tracks whether it is fully received and invoiced. Carbon rolls those values into **"To Receive and Invoice"**, **"To Receive"**, **"To Invoice"**, or **"Completed"**.
+</Callout>
+
+<Screenshot src="/screens/rfq-purchase-order.png" label="Purchase order" caption="The order converted from the chosen supplier quote, sitting at 'To Receive and Invoice'." ratio="wide" />
+
+## Send work out, too
+
+Use an **"Outside Processing"** order for a job operation performed by a vendor, such as plating, heat treatment, or anodizing. The order links to the job operation instead of a stock item.
+
+Posting an outside-processing receipt does not add inventory. It advances the job operation and posts the vendor charge to the job's [work-in-process](/guides/job-costing).
+
+<Callout tone="blue" badge="OUTSIDE PROCESSING" title="A PO can buy an operation, not just an item.">
+Receiving an outside-processing order advances the [make-to-order](/guides/order) operation and charges its cost to WIP.
+</Callout>

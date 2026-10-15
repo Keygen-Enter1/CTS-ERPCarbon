@@ -1,0 +1,823 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useCarbon } from "@carbon/auth";
+import { Number, SelectControlled, Submit, ValidatedForm } from "@carbon/form";
+import { useAction } from "@carbon/query";
+import {
+  Alert,
+  AlertTitle,
+  Badge,
+  Button,
+  Checkbox,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+  HStack,
+  MENU_ITEM_SHORTCUTS,
+  Menubar,
+  MenubarItem,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalDescription,
+  ModalFooter,
+  ModalHeader,
+  ModalTitle,
+  PrefetchLink,
+  toast,
+  useDisclosure,
+  VStack
+} from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Fragment, useEffect, useState } from "react";
+import { flushSync } from "react-dom";
+import {
+  LuCheck,
+  LuChevronDown,
+  LuChevronRight,
+  LuCirclePlus,
+  LuCopy,
+  LuGitBranch,
+  LuGitFork,
+  LuGitMerge,
+  LuGitPullRequestArrow,
+  LuStar,
+  LuTriangleAlert
+} from "react-icons/lu";
+import { Link, useParams } from "react-router";
+import { Hidden, Item, useConfigurableItems } from "~/components/Form";
+import { createPortalSlot } from "~/components/Layout/Mobile/slots";
+import { RecordAction } from "~/components/Layout/RecordHeader";
+import { Confirm } from "~/components/Modals";
+import { usePermissions, useUser } from "~/hooks";
+import type { ItemType } from "~/modules/shared";
+import { path } from "~/utils/path";
+import {
+  getMethodValidator,
+  makeMethodVersionValidator
+} from "../../items.models";
+import type { MakeMethod } from "../../types";
+import {
+  CreateChangeNoticeModal,
+  ItemChangeNoticeLock,
+  useItemOpenChangeNotices
+} from "../ChangeNotice";
+import { getPathToMakeMethod } from "../Methods/utils";
+import { getLinkToItemDetails } from "./ItemForm";
+import MakeMethodVersionStatus from "./MakeMethodVersionStatus";
+
+type MakeMethodToolsProps = {
+  itemId: string;
+  type: ItemType;
+  makeMethods: MakeMethod[];
+  currentMethodId?: string;
+  /**
+   * Phones: show the version control where the page places
+   * `methodVersionSlot.Target` (above Bill of Process) instead of in the
+   * tools row.
+   */
+  versionInSlot?: boolean;
+};
+
+/** Phones: where a page shows the method version control (see versionInSlot). */
+export const methodVersionSlot = createPortalSlot();
+
+const MakeMethodTools = ({
+  itemId,
+  makeMethods,
+  type,
+  currentMethodId,
+  versionInSlot = false
+}: MakeMethodToolsProps) => {
+  const permissions = usePermissions();
+  const { t } = useLingui();
+  const fetcher = useAction<{ error: string | null }>({
+    onError: (data) => {
+      if (data?.error) {
+        toast.error(data.error);
+      }
+    }
+  });
+  const params = useParams();
+  const { methodId, makeMethodId } = params;
+  const activeMethodId = currentMethodId ?? makeMethodId ?? methodId;
+
+  const isGetMethodLoading =
+    fetcher.state !== "idle" && fetcher.formAction === path.to.makeMethodGet;
+  const isSaveMethodLoading =
+    fetcher.state !== "idle" && fetcher.formAction === path.to.makeMethodSave;
+
+  const [includeInactive, setIncludeInactive] = useState<boolean>(true);
+  const configurableItemIds = useConfigurableItems();
+
+  const getMethodModal = useDisclosure();
+  const saveMethodModal = useDisclosure();
+  const [hasMethodParts, setHasMethodParts] = useState(true);
+  const newVersionModal = useDisclosure();
+  const changeNoticeModal = useDisclosure();
+  const activeMethodModal = useDisclosure();
+  const canCreateChangeNotice =
+    (type === "Part" || type === "Tool") && permissions.can("create", "parts");
+  const itemLink = type && itemId ? getLinkToItemDetails(type, itemId) : null;
+
+  // Version creation is locked while an open change notice owns this item
+  const { changeNotices: openChangeNotices, isLocked: isChangeNoticeLocked } =
+    useItemOpenChangeNotices(type, itemId);
+
+  const activeMethod =
+    makeMethods.find((m) => m.id === activeMethodId) ?? makeMethods[0];
+
+  const maxVersion = Math.max(...makeMethods.map((m) => m.version));
+  const [selectedVersion, setSelectedVersion] =
+    useState<MakeMethod>(activeMethod);
+
+  // Reset selectedVersion when itemId or activeMethod changes
+  useEffect(() => {
+    setSelectedVersion(activeMethod);
+  }, [activeMethod]);
+
+  // State for Get and Save Method modals
+  const { carbon } = useCarbon();
+  const {
+    company: { id: companyId }
+  } = useUser();
+
+  // State for Get Method modal - source versions
+  const [sourceMakeMethods, setSourceMakeMethods] = useState<
+    { label: JSX.Element; value: string }[]
+  >([]);
+  const [selectedSourceMethod, setSelectedSourceMethod] = useState<
+    string | null
+  >(null);
+
+  // State for Save Method modal - target versions
+  const [targetMakeMethods, setTargetMakeMethods] = useState<
+    { label: JSX.Element; value: string }[]
+  >([]);
+  const [selectedTargetMethod, setSelectedTargetMethod] = useState<
+    string | null
+  >(null);
+
+  const getSourceMakeMethods = async (sourceItemId: string) => {
+    setSourceMakeMethods([]);
+    setSelectedSourceMethod(null);
+    if (!carbon) return;
+    const { data, error } = await carbon
+      .from("makeMethod")
+      .select("id, version, status")
+      .eq("itemId", sourceItemId)
+      .eq("companyId", companyId)
+      .order("version", { ascending: false });
+
+    if (error) {
+      toast.error(error.message);
+    }
+
+    // For source, we can select any version (Draft, Active, or Archived)
+    setSourceMakeMethods(
+      data?.map(({ id, version, status }) => ({
+        label: (
+          <div className="flex items-center gap-2">
+            <Badge variant="outline">V{version}</Badge>{" "}
+            <MakeMethodVersionStatus status={status} />
+          </div>
+        ),
+        value: id
+      })) ?? []
+    );
+
+    if (data?.length === 1) {
+      setSelectedSourceMethod(data[0].id);
+    }
+  };
+
+  const getTargetMakeMethods = async (targetItemId: string) => {
+    setTargetMakeMethods([]);
+    setSelectedTargetMethod(null);
+    if (!carbon) return;
+    const { data, error } = await carbon
+      .from("makeMethod")
+      .select("id, version, status, changeOrderId")
+      .eq("itemId", targetItemId)
+      .eq("companyId", companyId)
+      .order("version", { ascending: false });
+
+    if (error) {
+      toast.error(error.message);
+    }
+
+    // Only Draft versions can be overwritten - Active and Archived are read-only.
+    // Exclude CO-owned drafts (changeOrderId set) — a CO's draft is authored via
+    // its own BOM/BOP surfaces, not clobbered wholesale by this copy-method tool.
+    const availableVersions =
+      data?.filter((m) => m.status === "Draft" && !m.changeOrderId) ?? [];
+
+    setTargetMakeMethods(
+      availableVersions.map(({ id, version, status }) => ({
+        label: (
+          <div className="flex items-center gap-2">
+            <Badge variant="outline">V{version}</Badge>{" "}
+            <MakeMethodVersionStatus status={status} />
+          </div>
+        ),
+        value: id
+      }))
+    );
+
+    if (availableVersions.length === 1) {
+      setSelectedTargetMethod(availableVersions[0].id);
+    }
+  };
+
+  const versionMenu = (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" rightIcon={<LuChevronDown />}>
+          <div className="flex items-center gap-2">
+            <Badge variant="outline">V{activeMethod.version}</Badge>
+            <MakeMethodVersionStatus status={activeMethod.status} />
+          </div>
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {makeMethods && makeMethods.length > 0 && (
+          <>
+            {makeMethods
+              .sort((a, b) => b.version - a.version)
+              .map((makeMethod) => {
+                const isCurrent = makeMethod.id === activeMethodId;
+
+                return (
+                  <DropdownMenuSub key={makeMethod.id}>
+                    <DropdownMenuSubTrigger>
+                      <Link
+                        to={getPathToMakeMethod(type, itemId, makeMethod.id)}
+                        className="flex items-center justify-between gap-4"
+                      >
+                        <div className="flex items-center gap-2">
+                          <LuCheck className={cn(!isCurrent && "opacity-0")} />
+                          <span>Version {makeMethod.version}</span>
+                        </div>
+                        <MakeMethodVersionStatus
+                          status={makeMethod.status}
+                          isActive={
+                            makeMethod.status === "Active" ||
+                            makeMethods.length === 1
+                          }
+                        />
+                      </Link>
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuPortal>
+                      <DropdownMenuSubContent>
+                        <ItemChangeNoticeLock
+                          changeNotices={openChangeNotices}
+                          isLocked={isChangeNoticeLocked}
+                        >
+                          <DropdownMenuItem
+                            shortcut={MENU_ITEM_SHORTCUTS.duplicate}
+                            disabled={isChangeNoticeLocked}
+                            onClick={() => {
+                              flushSync(() => {
+                                setSelectedVersion(makeMethod);
+                              });
+                              newVersionModal.onOpen();
+                            }}
+                          >
+                            <DropdownMenuIcon icon={<LuCopy />} />
+                            Duplicate Version
+                          </DropdownMenuItem>
+                        </ItemChangeNoticeLock>
+
+                        {/* <DropdownMenuItem
+                        destructive
+                        disabled={
+                          makeMethod.status === "Active" ||
+                          !permissions.can("delete", "parts")
+                        }
+                      >
+                        <DropdownMenuIcon icon={<LuTrash />} />
+                        Delete Version
+                      </DropdownMenuItem> */}
+                        <DropdownMenuSeparator />
+                        <ItemChangeNoticeLock
+                          changeNotices={openChangeNotices}
+                          isLocked={isChangeNoticeLocked}
+                        >
+                          <DropdownMenuItem
+                            disabled={
+                              makeMethod.status === "Active" ||
+                              isChangeNoticeLocked
+                            }
+                            onClick={() => {
+                              flushSync(() => {
+                                setSelectedVersion(makeMethod);
+                              });
+                              activeMethodModal.onOpen();
+                            }}
+                          >
+                            <DropdownMenuIcon icon={<LuStar />} />
+                            Set as Active Version
+                          </DropdownMenuItem>
+                        </ItemChangeNoticeLock>
+                      </DropdownMenuSubContent>
+                    </DropdownMenuPortal>
+                  </DropdownMenuSub>
+                );
+              })}
+            <DropdownMenuSeparator />
+            {permissions.can("create", "production") && (
+              <ItemChangeNoticeLock
+                changeNotices={openChangeNotices}
+                isLocked={isChangeNoticeLocked}
+              >
+                <DropdownMenuItem
+                  disabled={isChangeNoticeLocked}
+                  onClick={newVersionModal.onOpen}
+                >
+                  <DropdownMenuIcon icon={<LuCirclePlus />} />
+                  New Version
+                </DropdownMenuItem>
+              </ItemChangeNoticeLock>
+            )}
+            {canCreateChangeNotice && (
+              <DropdownMenuItem onClick={changeNoticeModal.onOpen}>
+                <DropdownMenuIcon icon={<LuGitPullRequestArrow />} />
+                <Trans>New Change Notice</Trans>
+              </DropdownMenuItem>
+            )}
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
+  return (
+    <Fragment key={itemId}>
+      {versionInSlot ? (
+        <methodVersionSlot.Fill>{versionMenu}</methodVersionSlot.Fill>
+      ) : null}
+      <Menubar className={cn(versionInSlot && "max-md:hidden")}>
+        <HStack className="w-full justify-between">
+          <HStack spacing={0}>
+            <RecordAction slot="overflow">
+              <MenubarItem
+                className="rounded-md"
+                isLoading={isGetMethodLoading}
+                isDisabled={
+                  !permissions.can("update", "parts") ||
+                  isGetMethodLoading ||
+                  activeMethod.status !== "Draft" // Can only overwrite Draft versions
+                }
+                leftIcon={<LuGitBranch />}
+                onClick={getMethodModal.onOpen}
+              >
+                <Trans>Get Method</Trans>
+              </MenubarItem>
+            </RecordAction>
+            <RecordAction slot="overflow">
+              <MenubarItem
+                className="rounded-md"
+                isDisabled={
+                  !permissions.can("update", "parts") || isSaveMethodLoading
+                }
+                isLoading={isSaveMethodLoading}
+                leftIcon={<LuGitMerge />}
+                onClick={saveMethodModal.onOpen}
+              >
+                <Trans>Save Method</Trans>
+              </MenubarItem>
+            </RecordAction>
+            {itemLink && (
+              <RecordAction slot="overflow">
+                <MenubarItem
+                  className="rounded-md"
+                  leftIcon={<LuGitFork />}
+                  asChild
+                >
+                  <PrefetchLink to={itemLink}>
+                    <Trans>Item Master</Trans>
+                  </PrefetchLink>
+                </MenubarItem>
+              </RecordAction>
+            )}
+          </HStack>
+
+          {versionInSlot ? (
+            <div className="max-md:hidden">{versionMenu}</div>
+          ) : (
+            versionMenu
+          )}
+        </HStack>
+      </Menubar>
+
+      {getMethodModal.isOpen && (
+        <Modal
+          open
+          onOpenChange={(open) => {
+            if (!open) {
+              getMethodModal.onClose();
+              setSourceMakeMethods([]);
+              setSelectedSourceMethod(null);
+            }
+          }}
+        >
+          <ModalContent>
+            <ValidatedForm
+              method="post"
+              fetcher={fetcher}
+              action={path.to.makeMethodGet}
+              validator={getMethodValidator}
+              onSubmit={getMethodModal.onClose}
+            >
+              <ModalHeader>
+                <ModalTitle>Get Method</ModalTitle>
+                <ModalDescription>
+                  Overwrite the current version with the source method
+                </ModalDescription>
+              </ModalHeader>
+              <ModalBody>
+                <Hidden name="targetId" value={activeMethodId} />
+                <VStack spacing={4}>
+                  <Alert variant="destructive" className="mt-4">
+                    <LuTriangleAlert className="h-4 w-4" />
+                    <AlertTitle>
+                      This will overwrite version {activeMethod.version} of this
+                      manufacturing method
+                    </AlertTitle>
+                  </Alert>
+                  <Item
+                    name="itemId"
+                    label={t`Source Item`}
+                    type={type}
+                    blacklist={[itemId, ...configurableItemIds]}
+                    includeInactive={includeInactive}
+                    replenishmentSystem="Make"
+                    onChange={(value) => {
+                      if (value) {
+                        getSourceMakeMethods(value?.value);
+                      } else {
+                        setSourceMakeMethods([]);
+                        setSelectedSourceMethod(null);
+                      }
+                    }}
+                  />
+                  <SelectControlled
+                    name="sourceId"
+                    options={sourceMakeMethods}
+                    label={t`Source Version`}
+                    value={selectedSourceMethod ?? undefined}
+                    onChange={(value) => {
+                      if (value) {
+                        setSelectedSourceMethod(value?.value);
+                      } else {
+                        setSelectedSourceMethod(null);
+                      }
+                    }}
+                    placeholder={
+                      sourceMakeMethods.length === 0
+                        ? t`Select an item first`
+                        : undefined
+                    }
+                  />
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="include-inactive"
+                      checked={includeInactive}
+                      onCheckedChange={(checked) =>
+                        setIncludeInactive(!!checked)
+                      }
+                    />
+                    <label
+                      htmlFor="include-inactive"
+                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                    >
+                      Include Inactive
+                    </label>
+                  </div>
+
+                  <AdvancedSection onChange={setHasMethodParts} />
+                </VStack>
+              </ModalBody>
+              <ModalFooter>
+                <Button onClick={getMethodModal.onClose} variant="secondary">
+                  Cancel
+                </Button>
+                <Submit
+                  isDisabled={!hasMethodParts || !selectedSourceMethod}
+                  variant="destructive"
+                >
+                  Confirm
+                </Submit>
+              </ModalFooter>
+            </ValidatedForm>
+          </ModalContent>
+        </Modal>
+      )}
+
+      {saveMethodModal.isOpen && (
+        <Modal
+          open
+          onOpenChange={(open) => {
+            if (!open) {
+              saveMethodModal.onClose();
+              setTargetMakeMethods([]);
+              setSelectedTargetMethod(null);
+            }
+          }}
+        >
+          <ModalContent>
+            <ValidatedForm
+              method="post"
+              fetcher={fetcher}
+              action={path.to.makeMethodSave}
+              validator={getMethodValidator}
+              onSubmit={saveMethodModal.onClose}
+            >
+              <ModalHeader>
+                <ModalTitle>Save Method</ModalTitle>
+                <ModalDescription>
+                  Save version {activeMethod.version} to another item's method
+                </ModalDescription>
+              </ModalHeader>
+              <ModalBody>
+                <Hidden name="sourceId" value={activeMethodId} />
+                <VStack spacing={4}>
+                  <Item
+                    name="itemId"
+                    label={t`Target Item`}
+                    type={type}
+                    includeInactive={includeInactive}
+                    blacklist={[itemId, ...configurableItemIds]}
+                    replenishmentSystem="Make"
+                    onChange={(value) => {
+                      if (value) {
+                        getTargetMakeMethods(value?.value);
+                      } else {
+                        setTargetMakeMethods([]);
+                        setSelectedTargetMethod(null);
+                      }
+                    }}
+                  />
+                  <SelectControlled
+                    name="targetId"
+                    options={targetMakeMethods}
+                    label={t`Target Version`}
+                    value={selectedTargetMethod ?? undefined}
+                    onChange={(value) => {
+                      if (value) {
+                        setSelectedTargetMethod(value?.value);
+                      } else {
+                        setSelectedTargetMethod(null);
+                      }
+                    }}
+                    placeholder={
+                      targetMakeMethods.length === 0
+                        ? t`No draft versions available`
+                        : undefined
+                    }
+                  />
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="include-inactive"
+                      checked={includeInactive}
+                      onCheckedChange={(checked) =>
+                        setIncludeInactive(!!checked)
+                      }
+                    />
+                    <label
+                      htmlFor="include-inactive"
+                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                    >
+                      Include Inactive
+                    </label>
+                  </div>
+                  <AdvancedSection onChange={setHasMethodParts} />
+                </VStack>
+              </ModalBody>
+              <ModalFooter>
+                <Button onClick={saveMethodModal.onClose} variant="secondary">
+                  Cancel
+                </Button>
+                <Submit isDisabled={!hasMethodParts || !selectedTargetMethod}>
+                  <Trans>Confirm</Trans>
+                </Submit>
+              </ModalFooter>
+            </ValidatedForm>
+          </ModalContent>
+        </Modal>
+      )}
+
+      {newVersionModal.isOpen && (
+        <Modal
+          open
+          onOpenChange={(open) => {
+            if (!open) {
+              newVersionModal.onClose();
+            }
+          }}
+        >
+          <ModalContent>
+            <ValidatedForm
+              method="post"
+              fetcher={fetcher}
+              action={`${path.to.newMakeMethodVersion}?methodToReplace=${activeMethodId}`}
+              validator={makeMethodVersionValidator}
+              defaultValues={{
+                copyFromId: selectedVersion.id,
+                activeVersionId:
+                  makeMethods.length === 1 ? selectedVersion.id : undefined,
+                version: maxVersion + 1
+              }}
+              onSubmit={newVersionModal.onClose}
+            >
+              <ModalHeader>
+                <ModalTitle>New Version</ModalTitle>
+                <ModalDescription>
+                  Create a new version of the manufacturing method
+                </ModalDescription>
+              </ModalHeader>
+              <ModalBody>
+                <Hidden name="copyFromId" />
+                <Hidden name="activeVersionId" />
+                <VStack spacing={4}>
+                  {makeMethods.length == 1 && (
+                    <Alert variant="warning">
+                      <LuTriangleAlert className="h-4 w-4" />
+                      <AlertTitle>
+                        This will set the current version of the make method to{" "}
+                        <MakeMethodVersionStatus status="Active" /> making it
+                        read-only.
+                      </AlertTitle>
+                    </Alert>
+                  )}
+                  <Number
+                    name="version"
+                    label={t`New Version`}
+                    helperText={t`The new version number of the method`}
+                    minValue={maxVersion + 1}
+                    maxValue={100000}
+                    step={1}
+                  />
+                </VStack>
+              </ModalBody>
+              <ModalFooter>
+                <Button onClick={newVersionModal.onClose} variant="secondary">
+                  Cancel
+                </Button>
+                <Submit>
+                  <Trans>Create Version</Trans>
+                </Submit>
+              </ModalFooter>
+            </ValidatedForm>
+          </ModalContent>
+        </Modal>
+      )}
+
+      {activeMethodModal.isOpen && (
+        <Confirm
+          action={`${path.to.activeMethodVersion(
+            selectedVersion.id
+          )}?methodToReplace=${activeMethodId}`}
+          confirmText={t`Make Active`}
+          title={t`Set Version ${selectedVersion.version} as Active Version?`}
+          text={t`This will make this version read-only and replace any material make methods with this version.`}
+          isOpen
+          onSubmit={() => {
+            activeMethodModal.onClose();
+            setSelectedVersion(activeMethod);
+          }}
+          onCancel={activeMethodModal.onClose}
+        />
+      )}
+
+      {changeNoticeModal.isOpen && (
+        <CreateChangeNoticeModal
+          itemId={itemId}
+          onClose={changeNoticeModal.onClose}
+        />
+      )}
+    </Fragment>
+  );
+};
+
+function AdvancedSection({
+  onChange
+}: {
+  onChange?: (hasSelection: boolean) => void;
+}) {
+  const { t } = useLingui();
+  const [open, setOpen] = useState(false);
+  const [billOfMaterial, setBillOfMaterial] = useState(true);
+  const [billOfProcess, setBillOfProcess] = useState(true);
+  const [parameters, setParameters] = useState(true);
+  const [tools, setTools] = useState(true);
+  const [steps, setSteps] = useState(true);
+  const [workInstructions, setWorkInstructions] = useState(true);
+
+  const hasSelection =
+    billOfMaterial ||
+    (billOfProcess && (parameters || tools || steps || workInstructions));
+
+  useEffect(() => {
+    onChange?.(hasSelection);
+  }, [hasSelection, onChange]);
+
+  const processChildren = [
+    {
+      name: "parameters",
+      label: t`Parameters`,
+      checked: parameters,
+      onChange: setParameters
+    },
+    { name: "tools", label: t`Tools`, checked: tools, onChange: setTools },
+    { name: "steps", label: t`Steps`, checked: steps, onChange: setSteps },
+    {
+      name: "workInstructions",
+      label: t`Work Instructions`,
+      checked: workInstructions,
+      onChange: setWorkInstructions
+    }
+  ];
+
+  return (
+    <Collapsible className="w-full" open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger asChild>
+        <Button variant="ghost" className="w-full justify-start gap-2 px-0">
+          <LuChevronRight
+            className={cn("h-4 w-4 transition-transform", open && "rotate-90")}
+          />
+          Advanced
+        </Button>
+      </CollapsibleTrigger>
+      <CollapsibleContent forceMount className={cn(!open && "hidden")}>
+        <VStack spacing={2} className="pt-2">
+          <div className="flex items-center space-x-2">
+            <Checkbox
+              id="billOfMaterial"
+              name="billOfMaterial"
+              checked={billOfMaterial}
+              onCheckedChange={(checked) => setBillOfMaterial(!!checked)}
+            />
+            <label
+              htmlFor="billOfMaterial"
+              className="text-sm font-medium leading-none"
+            >
+              Bill of Material
+            </label>
+          </div>
+          <div className="flex items-center space-x-2">
+            <Checkbox
+              id="billOfProcess"
+              name="billOfProcess"
+              checked={billOfProcess}
+              onCheckedChange={(checked) => setBillOfProcess(!!checked)}
+            />
+            <label
+              htmlFor="billOfProcess"
+              className="text-sm font-medium leading-none"
+            >
+              Bill of Process
+            </label>
+          </div>
+          <VStack spacing={2} className="pl-6">
+            {processChildren.map(({ name, label, checked, onChange }) => (
+              <div key={name} className="flex items-center space-x-2">
+                <Checkbox
+                  id={name}
+                  name={name}
+                  disabled={!billOfProcess}
+                  checked={billOfProcess ? checked : false}
+                  onCheckedChange={(val) => onChange(!!val)}
+                />
+                <label
+                  htmlFor={name}
+                  className={cn(
+                    "text-sm font-medium leading-none",
+                    !billOfProcess && "text-muted-foreground"
+                  )}
+                >
+                  {label}
+                </label>
+              </div>
+            ))}
+          </VStack>
+        </VStack>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+export default MakeMethodTools;

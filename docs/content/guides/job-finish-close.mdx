@@ -1,0 +1,53 @@
+---
+title: Finish, sell, close
+description: WIP becomes finished goods, finished goods become COGS, and the job settles.
+label: "(II)"
+index: 1
+flow: manufacturing-accounting
+flowName: Manufacturing accounting
+flowIndex: 3
+---
+
+A <Term>job</Term> accumulates cost in <Term id="wip">work-in-process</Term>. Three distinct postings settle that balance in sequence: job completion transfers WIP to inventory, shipment transfers inventory to cost of goods sold, and job close clears any residual WIP.
+
+<Figure illustration="wip-to-cogs" caption="A job's WIP empties into inventory at finish, flows to COGS at the sale, and any residual sweeps to Production Variance at close." />
+
+## Finish into inventory
+
+After the final operation, use **"Complete Job"**. The dialog displays **"Quantity Completed"**, derived from serials and batches completed in MES and not editable here, and warns that the job will leave the shop-floor view. Carbon <Term id="backflush">backflushes</Term> outstanding untracked material, posts any outstanding labor, and receives finished goods into inventory. Serial- and batch-tracked material must be scanned and is never backflushed. The *Job Receipt* entry debits inventory and credits work-in-process, and the job moves to **"Completed"**.
+
+The receipt uses the job's **actual accumulated WIP cost**. Carbon does not receive finished goods at standard cost or post a completion variance.
+
+<Callout tone="blue" badge="ACTUAL, NOT STANDARD" title="Finished goods are valued at what the job actually cost.">
+Completion transfers the entire WIP balance to inventory with equal debit and credit entries, so it creates no variance. The item's costing method determines how inventory carries the cost forward, not the receipt value.
+</Callout>
+
+<Screenshot src="/screens/job-completion.png" label="Job completion" caption="The Complete Job dialog: the quantity completed comes from the serials and batches finished in MES and can't be edited here." ratio="wide" />
+
+## Make-to-order still goes through stock
+
+A make-to-order job links to a <Term>sales order</Term> line but follows the same costing flow as a stock job. Completion receives the output into inventory, and the sales order ships it from inventory. Job completion and shipment are separate postings.
+
+<Callout tone="amber" badge="MTO = MTS, FOR COSTING" title="A make-to-order job receives to stock, then ships from stock.">
+Finished goods never ship directly from a job. Stock and make-to-order jobs both complete into inventory before shipment.
+</Callout>
+
+## Sell it
+
+When the order ships, cost leaves **inventory**, not WIP. Posting the <Term>shipment</Term> values the quantity from inventory cost layers and creates a *Sales Shipment* entry that debits <Term id="cogs">cost of goods sold</Term> and credits inventory. See the [quote-to-cash flow](/guides/order-to-cash) for the complete shipment process.
+
+Completion has already cleared the unit's WIP. COGS comes from the inventory layer, so margin uses that stock's landed cost.
+
+## Close the job
+
+Completion normally reduces job WIP to zero. Rounding, late material, or late production events can leave a residual balance, which **closing** clears.
+
+Closing calculates the job's remaining WIP. If it exceeds the rounding threshold, the *Job Close* entry debits **Production Variance** and credits work-in-process. The job moves to **"Closed"** with zero WIP. Carbon posts job variance only at this step.
+
+<Callout tone="green" badge="CLOSE = SWEEP WIP" title="Closing settles the residual to Production Variance.">
+Carbon does not post standard-cost variance during production or completion. Completion uses actual cost, and close posts only the residual WIP as variance.
+</Callout>
+
+<Divider />
+
+Job cost flows into WIP during production, into inventory at completion, into COGS at shipment, and into production variance for any residual at close. Carbon writes these journals from the first job; before the company sets up accounting they are Provisional and count in no balance.

@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { redirect } from "@carbon/utils";
+import { msg } from "@lingui/core/macro";
+import type { ActionFunctionArgs } from "react-router";
+import { z } from "zod";
+import { NewRecordPage } from "~/components/NewRecordPage";
+import { useCompanyToday, useUrlParams, useUser } from "~/hooks";
+import type { PurchaseOrderStatus } from "~/modules/purchasing";
+import {
+  insertPurchaseOrder,
+  purchaseOrderValidator
+} from "~/modules/purchasing";
+import { PurchaseOrderForm } from "~/modules/purchasing/ui/PurchaseOrder";
+import { requireCompanyRecord } from "~/modules/shared/shared.server";
+import { setCustomFields } from "~/utils/form";
+import type { Handle } from "~/utils/handle";
+import { path } from "~/utils/path";
+
+const newPurchaseOrderValidator = purchaseOrderValidator.extend({
+  locationId: z.string().min(1, { message: "Location is required" })
+});
+
+export const handle: Handle = {
+  breadcrumb: msg`Orders`,
+  to: path.to.purchaseOrders
+};
+
+export async function action({ request }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, companyGroupId, userId } =
+    await requirePermissions(request, {
+      create: "purchasing",
+      bypassRls: true
+    });
+
+  const formData = await request.formData();
+  const validation = await validator(newPurchaseOrderValidator).validate(
+    formData
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  // bypassRls hands back the service role, and insertPurchaseOrder copies the
+  // supplier's payment and shipping defaults by these form ids.
+  const { supplierId, supplierLocationId, supplierContactId, locationId } =
+    validation.data;
+  await Promise.all([
+    requireCompanyRecord(client, "supplier", companyId, { id: supplierId }),
+    supplierLocationId
+      ? requireCompanyRecord(client, "supplierLocation", companyId, {
+          id: supplierLocationId
+        })
+      : null,
+    supplierContactId
+      ? requireCompanyRecord(client, "supplierContact", companyId, {
+          id: supplierContactId
+        })
+      : null,
+    locationId
+      ? requireCompanyRecord(client, "location", companyId, { id: locationId })
+      : null
+  ]);
+
+  const result = await insertPurchaseOrder(client, {
+    ...validation.data,
+    purchaseOrderId: validation.data.purchaseOrderId || undefined,
+    companyId,
+    companyGroupId,
+    createdBy: userId,
+    customFields: setCustomFields(formData)
+  });
+
+  if (result.error || !result.data) {
+    throw redirect(
+      path.to.purchaseOrders,
+      await flash(
+        request,
+        error(result.error, "Failed to insert purchase order")
+      )
+    );
+  }
+
+  throw redirect(path.to.purchaseOrder(result.data.id));
+}
+
+export default function PurchaseOrderNewRoute() {
+  const [params] = useUrlParams();
+  const supplierId = params.get("supplierId");
+  const { defaults } = useUser();
+  const companyToday = useCompanyToday();
+  const initialValues = {
+    id: undefined,
+    purchaseOrderId: undefined,
+    supplierId: supplierId ?? "",
+    locationId: defaults?.locationId ?? "",
+    orderDate: companyToday,
+    status: "Draft" as PurchaseOrderStatus,
+    purchaseOrderType: "Purchase" as const
+  };
+
+  return (
+    <NewRecordPage>
+      <PurchaseOrderForm initialValues={initialValues} />
+    </NewRecordPage>
+  );
+}

@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { requireFeature } from "@carbon/ee/plan.server";
+import { unassignStorageRule } from "@carbon/ee/rules.server";
+import { redirect } from "@carbon/utils";
+import type { ActionFunctionArgs } from "react-router";
+import { path, requestReferrer } from "~/utils/path";
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId } = await requirePermissions(request, {
+    delete: "parts"
+  });
+
+  await requireFeature({
+    request,
+    client,
+    companyId,
+    feature: "STORAGE_RULES",
+    redirectTo: path.to.storageRules
+  });
+
+  const { itemId, ruleId } = params;
+  if (!itemId || !ruleId) throw new Error("itemId and ruleId required");
+
+  const result = await unassignStorageRule(client, {
+    targetType: "item",
+    targetId: itemId,
+    ruleId,
+    companyId
+  });
+  if (result.error) {
+    throw redirect(
+      requestReferrer(request) ?? path.to.storageRules,
+      await flash(request, error(result.error, "Failed to unassign rule"))
+    );
+  }
+
+  throw redirect(
+    requestReferrer(request) ?? path.to.storageRules,
+    await flash(request, success("Rule unassigned"))
+  );
+}

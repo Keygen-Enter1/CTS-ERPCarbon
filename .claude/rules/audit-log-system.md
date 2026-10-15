@@ -1,0 +1,189 @@
+---
+paths:
+  - packages/ee/src/audit/audit.ts
+  - packages/database/src/audit.config.ts
+  - packages/database/src/audit.types.ts
+  - packages/jobs/src/inngest/functions/events/audit.ts
+  - packages/jobs/src/inngest/functions/scheduled/audit-archive.ts
+  - apps/erp/app/components/AuditLog/**
+---
+
+# Audit Log System
+
+Per-company change log for key business entities. Rows live in dynamically created
+`auditLog_{companyId}` tables, written via the **Inngest** event pipeline (not directly),
+and queried through Postgres RPC functions. Entity-centric: a change to any table that
+makes up an entity is attributed to the parent entity.
+
+## Schema (`auditLog_{companyId}`)
+
+The partition key *is the table name* — there is **no `companyId` column**. Columns:
+
+- `id` TEXT PK `DEFAULT id('aud')`
+- `tableName` TEXT — raw DB table the change came from (e.g. `itemCost`)
+- `entityType` TEXT — semantic entity (e.g. `item`); see config below
+- `entityId` TEXT — business entity PK the change rolls up to
+- `recordId` TEXT — raw PK of the changed row; equals `entityId` for root tables, differs for children
+- `operation` TEXT CHECK IN (`INSERT`,`UPDATE`,`DELETE`)
+- `actorId` TEXT | null — user who made the change; null = system/service-role. Captured via `auth.uid()` in `dispatch_event_batch`, which is NULL on a direct Kysely connection (no `request.jwt.claims` GUC). The handler therefore falls back to the row's own audit columns — `record.actorId ?? new.updatedBy ?? new.createdBy ?? old.updatedBy ?? old.createdBy` (`packages/jobs/src/inngest/functions/events/audit.ts`) — so a Kysely write is still attributed, provided it stamps `updatedBy`/`createdBy`. A write that stamps neither logs as "System"
+- `diff` JSONB | null — `{ field: { old, new, snapshot? } }`
+- `metadata` JSONB | null — `ipAddress`, `userAgent`, `origin`, `requestId`
+- `createdAt` TIMESTAMPTZ — original event time (handler passes `event.timestamp`; falls back to `clock_timestamp()` per row)
+
+Indexes on `(entityType,entityId)`, `tableName`, `recordId`, `actorId`, `createdAt DESC`.
+RLS is permissive (`USING true WITH CHECK true`) — isolation is the table name; auth is enforced
+at the app layer (`requirePermissions`). A separate `auditLogArchive` table tracks archive metadata
+(`archivePath`, `startDate`, `endDate`, `rowCount`, `sizeBytes`).
+
+## Append-only (NIST 800-171 3.3.8 / AU-9)
+
+Every `auditLog_{companyId}` table carries a `BEFORE UPDATE OR DELETE` trigger `append_only`
+(`prevent_audit_log_mutation()`, migration `20260818014100_audit-log-append-only.sql`). UPDATE is
+**always** rejected; DELETE is rejected unless the transaction has set the local flag
+`app.audit_archiving = 'on'`. Even a service-role client cannot rewrite or casually erase history —
+only the retention/archival path may delete. `delete_old_audit_logs` was forked to
+`set_config('app.audit_archiving','on',true)` before its purge, and `create_audit_log_table` was
+forked to attach the trigger to every new (and pre-existing) table via the idempotent helper
+`attach_audit_log_append_only(table)`. The DELETE branch of `prevent_audit_log_mutation` is what the
+`audit-archive` job relies on: it runs `delete_old_audit_logs`, so its per-day deletes carry the flag.
+
+## Access (migration `20260924171942_audit-log-company-scope.sql`)
+
+Each `auditLog_{companyId}` table has ONE policy, `"SELECT"`, true only for callers holding
+`settings_view` in that company. INSERT/UPDATE/DELETE/TRUNCATE are revoked from `anon`/`authenticated`.
+`secure_audit_log_table(companyId)` applies both, and `create_audit_log_table` calls it on every table it
+creates or touches, because the default privileges on `public` re-grant ALL to the API roles on each new
+table. (Before this, the policy was `audit_log_access` FOR ALL USING (true), and any holder of the anon
+key could read or append to any company's log.)
+
+The RPCs are all SECURITY DEFINER, so each one begins with
+`assert_audit_log_access(p_company_id, <permission>)`:
+
+| Permission | Functions |
+|---|---|
+| `settings_view` | `get_entity_audit_log`, `get_audit_log`, `get_audit_log_count` |
+| `settings_update` | `create_audit_log_table` |
+| `NULL` (service role only) | `insert_audit_log_batch`, `get_audit_logs_for_archive`, `delete_old_audit_logs`, `drop_audit_log_table` |
+
+The guard only applies when `current_setting('role')` is `anon` or `authenticated`, so the service role
+and direct Postgres connections pass. **Never swap it for `REVOKE EXECUTE`**: on supabase/postgres
+15.14.1.112, calling any function the caller lacks EXECUTE on, as `anon`/`authenticated`, segfaults the
+backend (see `.ai/lessons.md`). The controlled-environment auto-enable in the `settings+/audit-logs.tsx`
+loader therefore runs as the service role, because that loader only requires `settings_view`.
+
+## On-by-default in controlled environments (3.3.1)
+
+Audit is opt-in per company (`company.auditLogEnabled`), **except** under `CONTROLLED_ENVIRONMENT`
+(ITAR/CUI), where it is mandatory and non-disableable — mirroring the `requireMfa` gate:
+- Enabled at company creation: `company.new.tsx` + `companies.new.tsx` call `enableAuditLog` after
+  `seedCompany` when `CONTROLLED_ENVIRONMENT`.
+- The `audit-logs.tsx` loader enables it on demand for any controlled company not yet capturing
+  (covers companies that predate the flag), and returns `controlled: CONTROLLED_ENVIRONMENT`.
+- The `disable` action case refuses under `CONTROLLED_ENVIRONMENT`; `AuditLogSettings` receives
+  `controlled` and locks the toggle with an explanatory note.
+
+## Config (`packages/database/src/audit.config.ts`)
+
+`auditConfig.entities` maps an **entity key** → `{ label, tables }`. Each table has a role:
+`root` (PK = entityId), `extension` (1:1, PK = parent FK, INSERTs skipped),
+`{ entityIdColumn }` (child with own PK), or `{ resolve: { junction, fk, entityIdColumn } }` (indirect via junction, needs a DB query at write time).
+
+Entity keys are **not** all bare table names — notably `salesQuote` (label "Quote", tables `quote`/`quoteLine`),
+`productionJob` (label "Job", tables `job`/...), plus `itemShelfLife`, `supplierQuote`, `customer`, `supplier`,
+`item`, `salesOrder`, `purchaseOrder`, `salesInvoice`, `purchaseInvoice`, `employee`, `nonConformance`, `gauge`,
+`shipment`, `receipt`, `warehouseTransfer`, `stockTransfer`, `inventoryCount` (root `inventoryCount` +
+child `inventoryCountLine`), `workCenter`, `maintenanceSchedule`,
+`maintenanceDispatch`, `pricingRule`, `priceOverride`, `priceOverrideBreak`, `fixedAsset`, `accountingPeriod`,
+`rentalAgreement`, and the posting documents added for the `DocumentPage` Activity tab — `journalEntry`
+(`journal` + `journalLine`), `payment` / `memo` (each with `invoiceSettlement` as a child, keyed by
+`paymentId` / `memoId`), `reimbursement` (+ `reimbursementLine`), `pickingList` (+ `pickingListLine`),
+`depreciationRun` (+ `depreciationRunLine`), `revenueRecognitionRun` (+ `revenueRecognitionRunLine`);
+each table queues its changes through `events: true` in `packages/database/src/event-system/attachments.ts`
+(shipped by `20261006221901_posting-documents-audit-events.sql`). An audited table needs that entry.
+(~36 entities; the old `quote`/`job`/`itemCost` entity keys are gone — `itemCost` is now an extension
+table of `item`.) Every table logs INSERT, UPDATE and DELETE except an extension table's INSERT
+(created 1:1 with its parent). A child's `entityIdColumn` may be a list: the row is logged once per
+distinct non-null parent it names (`invoiceSettlement` under the payment that made it, the one a memo
+was applied through, and the prior credit it draws on). `journalLine` sets `createFields` (account
+snapshotted to number + name), so an added line shows what it is.
+
+Other config knobs:
+- `tableLabels` — friendly per-`tableName` labels for diff provenance (fallback: camelCase → Title Case).
+- `skipFields: ["updatedAt", "updatedBy", "embedding"]` — excluded from diffs (matched top-level and as nested `.suffix`).
+- `retentionDays: 30`
+- `archivePath: "audit-logs/{companyId}/{year}/{month}.jsonl.gz"` and `archiveBucket: "private"`.
+- `createFields` (allowlist of columns surfaced on INSERT) is declared per table.
+- `fkDisplayRegistry` — display columns per FK *target* table (e.g. `supplier: ["name"]`, `user: ["fullName"]`, ~64 targets). FK columns are discovered from the schema at runtime via the `get_foreign_key_map` RPC (reads `pg_constraint`; only FKs referencing the target's `id`; returns `targetHasCompanyId` so non-tenant targets like `user` skip the companyId filter). Any changed FK column whose target is in the registry gets its display values frozen into the diff automatically; targets missing from the registry degrade to showing the raw id. Per-column `snapshotFields` on a table config still exist as overrides and win over the registry — they're REQUIRED for columns with no FK constraint in the DB (e.g. `salesOrder.salesPersonId`, several line-level `locationId`s), which `get_foreign_key_map` cannot see. An override target's tenancy is inherited from any schema FK referencing the same table (so a `user` override is correctly unscoped).
+- `fkDisplayHops` — junction targets whose display value lives one hop away (`customerContact`/`supplierContact` → `contact.fullName`). The handler resolves these in two batched lookups (junction id → hop column → display row); hops win over the registry for the same target.
+
+Types live in `audit.types.ts`: `AuditLogEntry`, `CreateAuditLogEntry`, `AuditDiff`, `AuditDiffEntry`,
+`AuditMetadata`, `AuditOperation`, `AuditLogFilters`, `AuditLogResponse`, `AuditLogArchive`, `AuditLogConfig`.
+
+## Write path (Inngest)
+
+Old Trigger.dev task (`packages/jobs/trigger/event/audit.ts`) is **gone**.
+
+DB triggers added via `attach_event_trigger(...)` push table changes onto a PGMQ queue with
+`handlerType = 'AUDIT'`. The queue dispatcher (`packages/jobs/src/inngest/.../queue.ts`) batches AUDIT
+records and emits `carbon/event-audit`. `auditFunction` in
+`packages/jobs/src/inngest/functions/events/audit.ts` (Inngest id `event-handler-audit`) computes diffs
+(`computeDiff` / `computeCreateDiff` / `computeNestedDiff` in `events/diff.ts` — pure, unit-tested; honors `skipFields` and suppresses empty↔empty transitions like `null → {}` / `null → ""`), resolves FK snapshots
+(`applyFkSnapshots`: FK topology from `get_foreign_key_map` cached per process, display columns from
+`fkDisplayRegistry`, override precedence in `events/fk-snapshots.ts` → `resolveSnapshotSpec`, one batched
+lookup per target table), and writes via `client.rpc("insert_audit_log_batch", { p_company_id, p_entries })`.
+
+## Query / management functions
+
+- RPCs: `create_audit_log_table`, `insert_audit_log_batch`, `get_entity_audit_log` (optional `p_record_id`),
+  `get_audit_log` (filters + `totalCount`), `get_audit_logs_for_archive`, `delete_old_audit_logs`.
+- `packages/ee/src/audit/audit.ts` wrappers (commercial — `@carbon/ee/audit.server`; `enableAuditLog` embeds `requireEntitlement("AUDIT_LOG")`, skipped under `CONTROLLED_ENVIRONMENT` where audit is mandatory): `getEntityAuditLog`, `getGlobalAuditLog`, `insertAuditLogEntries`,
+  `enableAuditLog`, `disableAuditLog` (keeps data), `isAuditLogEnabled`, `syncAuditSubscriptions`
+  (adds triggers for entities added to config after enable), `getAuditLogArchives`, `getArchiveDownloadUrl`,
+  `getAuditLogsForArchive`, `deleteOldAuditLogs`, `recordAuditLogArchive`.
+
+## Archival (scheduled)
+
+`auditArchiveFunction` in `packages/jobs/src/inngest/functions/scheduled/audit-archive.ts`
+(Inngest id `audit-log-archive`, cron `0 2 * * *`): per company, fetch rows older than `retentionDays`,
+gzip to JSONL, upload to the `private` bucket, record an `auditLogArchive` row, then delete the rows.
+
+GOTCHA: the runtime path is `audit-logs/{companyId}/{year}/{month}/{YYYY-MM-DD}.jsonl.gz`, which does
+**not** match `auditConfig.archivePath` (`.../{month}.jsonl.gz`) — the job builds the path inline rather
+than from config.
+
+## UI
+
+- `apps/erp/app/modules/settings/ui/AuditLog/AuditLogTable.tsx` — global table (expandable diffs, operation
+  badges, actor + entity links). `getEntityPath(entityId)` maps the id **prefix** (before first `_`) to a
+  `path.to.*` route: `pi`→purchaseInvoice, `si`→salesInvoice, `po`→purchaseOrder, `so`→salesOrder,
+  `cust`→customer, `sup`→supplier, `item`→part, `job`→job, `quote`→quote, `emp`→employeeAccount, `nc`→issue,
+  `sh`→shipment, `rec`→receipt, `ic`→inventoryCount, `g`→gauge, `sq`→supplierQuote, `wc`→workCenter, `main`→maintenanceDispatch.
+  Unknown prefixes render as plain text.
+- `.../AuditLog/AuditLogSettings.tsx` — enable/disable + archive download list.
+- `apps/erp/app/components/AuditLog/` — per-entity history `AuditLogDrawer.tsx` + `useAuditLog.tsx` hook,
+  fetching `api+/audit-log.ts` by `entityType`/`entityId`/`recordId`. The body is `AuditLogFeed` (same
+  file), also rendered inline as the Activity tab of `components/DocumentPage/DocumentSidebar.tsx`. The
+  API requires `view: settings` and answers anyone else with a redirect — which a fetcher FOLLOWS — so the
+  feed never fetches without that permission and the sidebar hides the tab. `AuditLogDrawer.tsx` also exports
+  `ChangeRow`, the snapshot-aware diff-row renderer (FK name from `diff[col].snapshot`, raw id on hover)
+  used by BOTH the drawer and the global `AuditLogTable` expanded rows — don't render `change.old/new`
+  raw or FKs regress to bare ids.
+- Actor column: `<EmployeeAvatar employeeId={actorId} />` linked to `path.to.employeeAccount`; null actor → "System".
+  (`actorName` column was removed; the UI resolves names from `actorId`.)
+
+## Routes
+
+- `apps/erp/app/routes/x+/settings+/audit-logs.tsx` — settings (enable/disable, download), syncs subscriptions.
+- `apps/erp/app/routes/x+/settings+/audit-logs.details.tsx` — full-screen filtered table (`getGlobalAuditLog`).
+- `apps/erp/app/routes/api+/audit-log.ts` — entity-scoped entries endpoint (50 newest; `all=true` pages through every live entry, capped at 10,000 with `truncated: true` when the history is longer (the download warns), for the drawer's opt-in CSV Download — `useAuditLog({ downloadable, downloadName })`, built client-side by `components/AuditLog/useAuditLogDownload.ts` with the pure row builder `buildAuditLogCsvRows` in `components/AuditLog/utils.ts`; a failed `all=true` read answers 500).
+
+## Key migrations (newest = truth)
+
+`20260212152709_audit_log_system.sql` (initial + RPCs/`auditLogArchive`),
+`20260212153753_event_system_add_actor.sql` (`actorId` via `auth.uid()`),
+`20260212174458_remove_actor_name_from_audit_log.sql`,
+`20260217120000_audit_log_add_table_name.sql`, `20260218000000_expand_audit_log_entities.sql`,
+`20260418000000_audit_log_add_record_id.sql`, `20260427120000_audit-event-timestamp.sql`,
+`20260513130000_audit-item-shelf-life-history.sql`,
+`20260713095136_attach-inventory-count-audit-triggers.sql` (attaches triggers on `inventoryCount`/`inventoryCountLine`),
+`20260818014100_audit-log-append-only.sql`, `20260924171942_audit-log-company-scope.sql` (access guards).

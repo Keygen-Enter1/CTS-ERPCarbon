@@ -1,0 +1,491 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import type { JSONContent } from "@carbon/react";
+import {
+  Badge,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  cn,
+  HStack,
+  Spinner,
+  useMount,
+  VStack
+} from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { Suspense } from "react";
+import { LuShoppingCart } from "react-icons/lu";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { Await, useLoaderData, useParams } from "react-router";
+import {
+  CadModel,
+  DeferredFiles,
+  Hyperlink,
+  SupplierAvatar
+} from "~/components";
+import { usePanels } from "~/components/Layout";
+import { usePermissions, useRouteData } from "~/hooks";
+import type { Job, JobPurchaseOrderLine } from "~/modules/production";
+import {
+  getJob,
+  getJobDocumentsWithItemId,
+  getJobMakeMethodById,
+  getJobMaterialsByMethodId,
+  getJobOperationsByMethodId,
+  getJobPurchaseOrderLines,
+  getProductionDataByOperations,
+  getRootMakeMethod,
+  isJobLocked,
+  jobValidator,
+  makeToAssetItemError,
+  recalculateJobRequirements,
+  updateJob
+} from "~/modules/production";
+import {
+  JobBillOfMaterial,
+  JobBillOfProcess,
+  JobDocuments,
+  JobEstimatesVsActuals,
+  JobNotes,
+  JobRiskRegister
+} from "~/modules/production/ui/Jobs";
+import JobMakeMethodTools from "~/modules/production/ui/Jobs/JobMakeMethodTools";
+import PurchasingStatus from "~/modules/purchasing/ui/PurchaseOrder/PurchasingStatus";
+import { getTagsList } from "~/modules/shared";
+import { requireCompanyRecord } from "~/modules/shared/shared.server";
+import { getDatabaseClient } from "~/services/database.server";
+import { useItems } from "~/stores";
+import type { StorageItem } from "~/types";
+import { setCustomFields } from "~/utils/form";
+import { requireUnlocked } from "~/utils/lockedGuard.server";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "production",
+    bypassRls: true
+  });
+
+  const { jobId } = params;
+  if (!jobId) throw new Error("Could not find jobId");
+
+  // `client` is the service role (bypassRls) and every read keys on the URL id,
+  // so the job must be this company's. The check runs beside the reads it
+  // guards, not before them: it rejects the whole batch, and nothing read here
+  // is returned unless it passes.
+  const [, job, rootMethod, tags] = await Promise.all([
+    requireCompanyRecord(client, "job", companyId, { id: jobId }),
+    getJob(client, jobId),
+    getRootMakeMethod(client, jobId, companyId),
+    getTagsList(client, companyId, "operation")
+  ]);
+  if (job.error) {
+    throw redirect(
+      path.to.jobs,
+      await flash(request, error(job.error, "Failed to load job"))
+    );
+  }
+
+  if (rootMethod.error) {
+    return {
+      notes: (job.data?.notes ?? {}) as JSONContent,
+      purchaseOrderLines: getJobPurchaseOrderLines(client, jobId),
+      materials: [],
+      operations: [],
+      makeMethod: null,
+      files: Promise.resolve([] as StorageItem[]),
+      productionData: Promise.resolve({
+        quantities: [],
+        events: [],
+        notes: []
+      }),
+      tags: []
+    };
+  }
+
+  const methodId = rootMethod.data.id;
+
+  const [materials, operations, makeMethod] = await Promise.all([
+    getJobMaterialsByMethodId(client, methodId),
+    getJobOperationsByMethodId(client, methodId),
+    getJobMakeMethodById(client, methodId, companyId)
+  ]);
+
+  return {
+    notes: (job.data?.notes ?? {}) as JSONContent,
+    purchaseOrderLines: getJobPurchaseOrderLines(client, jobId),
+    materials:
+      materials?.data?.map((m) => ({
+        ...m,
+        itemType: m.itemType as "Part",
+        unitOfMeasureCode: m.unitOfMeasureCode ?? "",
+        jobOperationId: m.jobOperationId ?? undefined
+      })) ?? [],
+    operations:
+      operations.data?.map((o) => ({
+        ...o,
+        description: o.description ?? "",
+        workCenterId: o.workCenterId ?? undefined,
+        laborRate: o.laborRate ?? 0,
+        machineRate: o.machineRate ?? 0,
+        operationSupplierProcessId: o.operationSupplierProcessId ?? undefined,
+        jobMakeMethodId: o.jobMakeMethodId ?? methodId,
+        workInstruction: o.workInstruction as JSONContent
+      })) ?? [],
+    makeMethod: makeMethod.data ?? null,
+    files: getJobDocumentsWithItemId(
+      client,
+      companyId,
+      job.data,
+      rootMethod.data.itemId
+    ),
+    productionData: getProductionDataByOperations(
+      client,
+      operations?.data?.map((o) => o.id) ?? []
+    ),
+    tags: tags.data ?? []
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    update: "production"
+  });
+
+  const { jobId: id } = params;
+  if (!id) throw new Error("Could not find jobId");
+
+  const { client: viewClient } = await requirePermissions(request, {
+    view: "production"
+  });
+  const job = await getJob(viewClient, id);
+  await requireUnlocked({
+    request,
+    isLocked: isJobLocked(job.data?.status),
+    redirectTo: path.to.job(id),
+    message: "Cannot modify a locked job. Reopen it first."
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(jobValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  // The asset target ids come from the form: prove they are this company's
+  // before the job points at them. The service role, since a production user
+  // may not hold accounting view and RLS would read their own class as absent.
+  const serviceRole = getCarbonServiceRole();
+  await Promise.all([
+    validation.data.fixedAssetClassId
+      ? requireCompanyRecord(serviceRole, "fixedAssetClass", companyId, {
+          id: validation.data.fixedAssetClassId
+        })
+      : null,
+    validation.data.fixedAssetId
+      ? requireCompanyRecord(serviceRole, "fixedAsset", companyId, {
+          id: validation.data.fixedAssetId
+        })
+      : null
+  ]);
+
+  // The same Make to Asset item rule the job form, release and completion
+  // apply, so a saved target or item is refused with the field it is about.
+  if (validation.data.fixedAssetClassId || validation.data.fixedAssetId) {
+    const item = await client
+      .from("item")
+      .select("itemTrackingType")
+      .eq("id", validation.data.itemId)
+      .eq("companyId", companyId)
+      .single();
+    const itemError = makeToAssetItemError({
+      ...validation.data,
+      itemTrackingType: item.data?.itemTrackingType
+    });
+    if (itemError) {
+      return validationError({ fieldErrors: { itemId: itemError } });
+    }
+  }
+
+  const result = await updateJob(client, {
+    id,
+    companyId,
+    quantity: validation.data.quantity,
+    scrapQuantity: validation.data.scrapQuantity,
+    itemId: validation.data.itemId,
+    dueDate: validation.data.dueDate || null,
+    startDate: validation.data.startDate || null,
+    deadlineType: validation.data.deadlineType,
+    locationId: validation.data.locationId,
+    unitOfMeasureCode: validation.data.unitOfMeasureCode,
+    customerId: validation.data.customerId || null,
+    modelUploadId: validation.data.modelUploadId || null,
+    fixedAssetClassId: validation.data.fixedAssetClassId || null,
+    fixedAssetId: validation.data.fixedAssetId || null,
+    customFields: setCustomFields(formData),
+    updatedBy: userId
+  });
+  if (result.error) {
+    throw redirect(
+      path.to.job(id),
+      await flash(request, error(result.error, "Failed to update job"))
+    );
+  }
+
+  const recalculate = await recalculateJobRequirements(
+    getCarbonServiceRole(),
+    getDatabaseClient(),
+    {
+      id,
+      companyId,
+      userId
+    }
+  );
+  if (recalculate.error) {
+    throw redirect(
+      path.to.job(id),
+      await flash(
+        request,
+        error(recalculate.error, "Failed to recalculate job requirements")
+      )
+    );
+  }
+
+  throw redirect(path.to.job(id), await flash(request, success("Updated job")));
+}
+
+export default function JobDetailsRoute() {
+  const {
+    notes,
+    purchaseOrderLines,
+    materials,
+    operations,
+    makeMethod,
+    productionData,
+    tags,
+    files
+  } = useLoaderData<typeof loader>();
+  const { jobId } = useParams();
+  if (!jobId) throw new Error("Could not find jobId");
+  const permissions = usePermissions();
+
+  const { setIsExplorerCollapsed, isExplorerCollapsed } = usePanels();
+
+  useMount(() => {
+    if (isExplorerCollapsed) {
+      setIsExplorerCollapsed(false);
+    }
+  });
+
+  const jobData = useRouteData<{ job: Job }>(path.to.job(jobId));
+
+  if (!jobData) throw new Error("Could not find job data");
+
+  const methodId = makeMethod?.id;
+
+  return (
+    <div className="h-full w-full items-start overflow-y-auto scrollbar-hide">
+      <VStack spacing={4} className="p-4">
+        <JobMakeMethodTools makeMethod={makeMethod ?? undefined} />
+
+        <JobNotes
+          id={jobId}
+          title={jobData?.job.jobId ?? ""}
+          subTitle={jobData?.job.itemReadableIdWithRevision ?? ""}
+          notes={notes}
+        />
+
+        {methodId && (
+          <>
+            <JobBillOfProcess
+              key={`bop:${methodId}`}
+              jobMakeMethodId={methodId}
+              materials={materials}
+              // @ts-expect-error
+              operations={operations}
+              locationId={jobData?.job?.locationId ?? ""}
+              tags={tags}
+              itemId={makeMethod.itemId}
+              salesOrderLineId={jobData?.job.salesOrderLineId ?? ""}
+              customerId={jobData?.job.customerId ?? ""}
+            />
+            <JobBillOfMaterial
+              key={`bom:${methodId}`}
+              jobMakeMethodId={methodId}
+              // @ts-expect-error
+              materials={materials}
+              // @ts-expect-error
+              operations={operations}
+            />
+          </>
+        )}
+        <Suspense>
+          <Await resolve={purchaseOrderLines}>
+            {(purchaseOrderLines) => (
+              <JobPurchaseOrderLines
+                purchaseOrderLines={purchaseOrderLines.data ?? []}
+              />
+            )}
+          </Await>
+        </Suspense>
+
+        <Suspense
+          fallback={
+            <div className="flex w-full h-full rounded bg-gradient-to-tr from-background to-card items-center justify-center min-h-[200px]">
+              <Spinner className="h-10 w-10" />
+            </div>
+          }
+        >
+          <Await resolve={productionData}>
+            {(resolvedProductionData) => (
+              <JobEstimatesVsActuals
+                materials={materials ?? []}
+                // @ts-expect-error
+                operations={operations}
+                productionEvents={resolvedProductionData.events}
+                productionQuantities={resolvedProductionData.quantities}
+                notes={resolvedProductionData.notes}
+              />
+            )}
+          </Await>
+        </Suspense>
+
+        <DeferredFiles resolve={files}>
+          {(resolvedFiles) => (
+            <JobDocuments
+              files={resolvedFiles}
+              jobId={jobData.job.id ?? ""}
+              bucket="parts"
+              itemId={makeMethod?.itemId ?? jobData.job.itemId}
+              modelUpload={{ ...jobData.job }}
+            />
+          )}
+        </DeferredFiles>
+
+        <CadModel
+          isReadOnly={!permissions.can("update", "production")}
+          metadata={{
+            jobId: jobData?.job?.id ?? undefined,
+            itemId: jobData?.job?.itemId ?? undefined
+          }}
+          modelUpload={jobData?.job ?? null}
+          title="CAD Model"
+          uploadClassName="aspect-square min-h-[420px] max-h-[70vh]"
+          viewerClassName="aspect-square min-h-[420px] max-h-[70vh]"
+        />
+        <JobRiskRegister jobId={jobId} itemId={jobData?.job?.itemId ?? ""} />
+      </VStack>
+    </div>
+  );
+}
+
+function JobPurchaseOrderLines({
+  purchaseOrderLines
+}: {
+  purchaseOrderLines: JobPurchaseOrderLine[];
+}) {
+  if (purchaseOrderLines.length === 0) {
+    return null;
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Purchase Orders</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="border rounded-lg">
+          {purchaseOrderLines.map((line, index) => (
+            <div
+              key={line.id}
+              className={cn(
+                "border-b p-6",
+                index === purchaseOrderLines.length - 1 && "border-b-0"
+              )}
+            >
+              <JobPurchaseOrderLineItem line={line} />
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function JobPurchaseOrderLineItem({ line }: { line: JobPurchaseOrderLine }) {
+  const [items] = useItems();
+  const item = items.find((i) => i.id === line.itemId);
+
+  const isPartiallyShipped = (line.quantityShipped ?? 0) > 0;
+  const isShipped = (line.quantityShipped ?? 0) >= (line.purchaseQuantity ?? 0);
+
+  const isPartiallyReceived = (line.quantityReceived ?? 0) > 0;
+  const isReceived =
+    (line.quantityReceived ?? 0) >= (line.purchaseQuantity ?? 0);
+
+  const status = isReceived
+    ? "Received"
+    : isPartiallyReceived
+      ? "Partially Received"
+      : isShipped
+        ? "Shipped"
+        : isPartiallyShipped
+          ? "Partially Shipped"
+          : "To Ship";
+
+  const statusColor = isReceived
+    ? "green"
+    : isPartiallyReceived
+      ? "yellow"
+      : isShipped
+        ? "blue"
+        : isPartiallyShipped
+          ? "orange"
+          : "gray";
+
+  return (
+    <div className="flex flex-1 justify-between items-center w-full">
+      <HStack spacing={4} className="w-2/3">
+        <HStack spacing={4} className="flex-1">
+          <div className="bg-muted border rounded-full flex items-center justify-center p-2">
+            <LuShoppingCart className="size-4" />
+          </div>
+          <VStack spacing={0}>
+            <Hyperlink
+              className="text-sm font-medium"
+              to={path.to.purchaseOrder(line.purchaseOrder.id)}
+            >
+              {line.purchaseOrder.purchaseOrderId}
+            </Hyperlink>
+            <PurchasingStatus status={line.purchaseOrder.status} />
+          </VStack>
+          <VStack className="items-center" spacing={0}>
+            <span className="text-sm font-medium text-center">
+              {item?.readableIdWithRevision}
+            </span>
+            <span className="text-xs text-muted-foreground text-center">
+              {item?.name}
+            </span>
+          </VStack>
+        </HStack>
+      </HStack>
+      <div className="flex flex-col items-end justify-center gap-1">
+        <SupplierAvatar
+          className="text-sm"
+          supplierId={line.purchaseOrder.supplierId}
+        />
+        <Badge variant={statusColor}>{status}</Badge>
+      </div>
+    </div>
+  );
+}

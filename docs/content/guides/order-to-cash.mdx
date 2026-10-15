@@ -1,0 +1,67 @@
+---
+title: Ship, invoice, get paid
+description: Fulfill the order, post the shipment and invoice, then record payment.
+label: "(II)"
+index: 1
+flow: quote-to-cash
+flowName: Quote to cash
+flowIndex: 1
+---
+
+A <Term>sales order</Term> at **"To Ship and Invoice"** requires four explicit steps: fulfill the lines, post a <Term>shipment</Term>, create and post an invoice, and apply a payment. Carbon does not chain these actions automatically.
+
+<Figure illustration="cash-cycle" caption="Four posted moves carry a confirmed order to recorded cash. None of them auto-chains." />
+
+## The line stays open
+
+A sales order line tracks `saleQuantity`, `quantitySent`, and `quantityInvoiced`. Carbon computes `quantityToSend` and `quantityToInvoice`. The line closes only when it is fully shipped and fully invoiced, so partial shipments and invoices retain the outstanding quantities.
+
+## Three ways to fulfill a line
+
+The <Term>method type</Term> on each line decides where the goods come from:
+
+- **<Term>Make to Order</Term>** raises a production <Term id="job">job</Term> for the line, the [make-to-order tour](/guides/order) in full.
+- **<Term>Pull from Inventory</Term>** ships from stock you already hold: no job, just a pick.
+- **<Term>Purchase to Order</Term>** buys it in for this order; its **<Term>drop-ship</Term>** variant has the supplier ship straight to your customer, so the goods never touch your dock.
+
+Regardless of sourcing method, a shipment fulfills the line from either inventory or a job.
+
+<Callout tone="blue" badge="STATUS vs DISPLAY" title="The list can read 'In Progress' before the stored status changes.">
+The sales-order list shows **"In Progress"** while a make-to-order line has incomplete jobs, even when the stored status is **"To Ship and Invoice"**. Filters and workflow use the stored status; the display status summarizes production progress.
+</Callout>
+
+## Post the shipment
+
+Create a **Draft** shipment from the order. The shipment records **Sales Order** as its source.
+
+Creating a shipment does not change inventory. **<Term id="posting">Posting</Term>** it moves the shipment to **"Posted"**, reduces inventory through the item ledger, increments `quantitySent`, and recalculates the order status. `sentComplete` becomes true only when cumulative shipments reach the ordered quantity.
+
+<Callout tone="amber" badge="POSTING ≠ CREATING" title="Posting moves inventory and the order — and stops there.">
+A posted shipment reduces stock and advances the order. It also writes the <Term id="cogs">COGS</Term> entries. It does not create an invoice.
+</Callout>
+
+<Screenshot src="/screens/otc-post-shipment.png" label="Post shipment" caption="The Post Shipment confirmation. Posting is the move that drops inventory, raises the line's sent quantity, and advances the order." ratio="wide" />
+
+## Raise the invoice
+
+Create a sales invoice from either the **sales order** or a **posted shipment**. A shipment-based invoice links to that shipment and limits the invoiced quantity to the shipped quantity.
+
+The invoice is editable while **"Draft"** and locks when it leaves Draft.
+
+<Screenshot src="/screens/otc-sales-invoice.png" label="Sales invoice" caption="AR000001 in Draft, its SAT-1000 line and Net 30 terms carried across from the order, still fully editable until it's posted." ratio="wide" />
+
+## Post and get paid
+
+Posting increments each line's `quantityInvoiced`, records the posting date, and moves the invoice to **"Submitted"**. It posts Accounts Receivable against Sales and COGS against Inventory. Posting does not mark the invoice **"Paid"**.
+
+Record cash received as a **<Term>payment</Term>** of type **"Receipt"**. Apply it to one or more invoices through **<Term id="invoice-settlement">settlements</Term>**. Each settlement records applied principal plus any discount or write-off. Apply a posted credit memo through the same mechanism. A payment moves through **"Draft"**, **"Posted"**, and **"Voided"**; posting writes the cash and Accounts Receivable entries.
+
+Carbon derives invoice status from its settlements: **"Partially Paid"** when partially covered, **"Paid"** when fully covered, and **"Overdue"** after the due date while a balance remains. Voiding a posted invoice writes reversing entries instead of deleting the transaction.
+
+<Callout tone="green" badge="PAYMENT IS AN ENTITY" title="Settlement is a posted payment applied to the invoice, not a field.">
+A **"Receipt"** records incoming cash. Settlements apply receipts or credit memos to invoices. Carbon computes payment status from the applied amounts. Every receipt writes a journal: until the company sets up accounting it is Provisional and counts in no balance.
+</Callout>
+
+<Divider />
+
+The quote-to-cash sequence is quote, order, shipment, invoice, and settlement. Each step creates a separate auditable transaction.

@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import type { JSONContent } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import type { FileObject } from "@supabase/storage-js";
+import { useRef } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useParams } from "react-router";
+import { DeferredFiles } from "~/components";
+import { useRouteData, useUser } from "~/hooks";
+import type {
+  PurchaseOrder,
+  PurchaseOrderDelivery,
+  PurchaseOrderLine,
+  SupplierInteraction
+} from "~/modules/purchasing";
+import {
+  getPurchaseOrder,
+  getPurchaseOrderPayment,
+  isPurchaseOrderLocked,
+  purchaseOrderValidator,
+  updatePurchaseOrder
+} from "~/modules/purchasing";
+import {
+  PurchaseOrderDeliveryForm,
+  PurchaseOrderPaymentForm,
+  PurchaseOrderSummary
+} from "~/modules/purchasing/ui/PurchaseOrder";
+import type { PurchaseOrderDeliveryFormRef } from "~/modules/purchasing/ui/PurchaseOrder/PurchaseOrderDeliveryForm";
+import {
+  SupplierInteractionDocuments,
+  SupplierInteractionNotes
+} from "~/modules/purchasing/ui/SupplierInteraction";
+import SupplierInteractionState from "~/modules/purchasing/ui/SupplierInteraction/SupplierInteractionState";
+import { getCustomFields, setCustomFields } from "~/utils/form";
+import { requireUnlocked } from "~/utils/lockedGuard.server";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client } = await requirePermissions(request, {
+    view: "purchasing"
+  });
+
+  const { orderId } = params;
+  if (!orderId) throw new Error("Could not find orderId");
+
+  const [purchaseOrder, purchaseOrderPayment] = await Promise.all([
+    getPurchaseOrder(client, orderId),
+    getPurchaseOrderPayment(client, orderId)
+  ]);
+
+  if (purchaseOrderPayment.error) {
+    throw redirect(
+      path.to.purchaseOrders,
+      await flash(
+        request,
+        error(
+          purchaseOrderPayment.error,
+          "Failed to load purchase order payment"
+        )
+      )
+    );
+  }
+
+  return {
+    purchaseOrderPayment: purchaseOrderPayment.data,
+    internalNotes: (purchaseOrder.data?.internalNotes ?? {}) as JSONContent,
+    externalNotes: (purchaseOrder.data?.externalNotes ?? {}) as JSONContent
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+
+  const { orderId } = params;
+  if (!orderId) throw new Error("Could not find orderId");
+
+  // First check with basic update permission to get the PO
+  const { client: viewClient } = await requirePermissions(request, {
+    view: "purchasing"
+  });
+
+  // Check if PO is locked
+  const purchaseOrder = await getPurchaseOrder(viewClient, orderId);
+  if (purchaseOrder.error) {
+    throw redirect(
+      path.to.purchaseOrder(orderId),
+      await flash(
+        request,
+        error(purchaseOrder.error, "Failed to load purchase order")
+      )
+    );
+  }
+
+  const isLocked = isPurchaseOrderLocked(purchaseOrder.data?.status);
+
+  // If locked, require delete permission; otherwise require update permission
+  const { client, userId } = await requirePermissions(request, {
+    ...(isLocked ? { delete: "purchasing" } : { update: "purchasing" })
+  });
+
+  // If locked, block all edits (no header changes allowed on locked POs)
+  await requireUnlocked({
+    request,
+    isLocked,
+    redirectTo: path.to.purchaseOrder(orderId),
+    message:
+      "Cannot modify a finalized purchase order. To make changes, please cancel this PO and create a new one."
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(purchaseOrderValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const result = await updatePurchaseOrder(client, {
+    id: orderId,
+    status: validation.data.status,
+    supplierId: validation.data.supplierId,
+    currencyCode: validation.data.currencyCode,
+    orderDate: validation.data.orderDate,
+    supplierContactId: validation.data.supplierContactId || null,
+    supplierLocationId: validation.data.supplierLocationId || null,
+    supplierReference: validation.data.supplierReference,
+    purchaseOrderType: validation.data.purchaseOrderType,
+    notes: validation.data.notes,
+    customFields: setCustomFields(formData),
+    updatedBy: userId
+  });
+  if (result.error) {
+    throw redirect(
+      path.to.purchaseOrder(orderId),
+      await flash(
+        request,
+        error(result.error, "Failed to update purchase order")
+      )
+    );
+  }
+
+  throw redirect(
+    path.to.purchaseOrder(orderId),
+    await flash(request, success("Updated purchase order"))
+  );
+}
+
+export default function PurchaseOrderBasicRoute() {
+  const { purchaseOrderPayment, internalNotes, externalNotes } =
+    useLoaderData<typeof loader>();
+
+  const { orderId } = useParams();
+  if (!orderId) throw new Error("Could not find orderId");
+  const orderData = useRouteData<{
+    purchaseOrder: PurchaseOrder;
+    purchaseOrderDelivery: PurchaseOrderDelivery;
+    lines: PurchaseOrderLine[];
+    files: Promise<FileObject[]>;
+    interaction: SupplierInteraction & {
+      purchasingRfq?: { id: string; rfqId: string; status: string } | null;
+    };
+  }>(path.to.purchaseOrder(orderId));
+  if (!orderData) throw new Error("Could not find order data");
+
+  const deliveryFormRef = useRef<PurchaseOrderDeliveryFormRef>(null);
+
+  const handleEditShippingCost = () => {
+    deliveryFormRef.current?.focusShippingCost();
+  };
+
+  const initialValues = {
+    id: orderData?.purchaseOrder?.id ?? "",
+    purchaseOrderId: orderData?.purchaseOrder?.purchaseOrderId ?? "",
+    supplierId: orderData?.purchaseOrder?.supplierId ?? "",
+    supplierContactId: orderData?.purchaseOrder?.supplierContactId ?? "",
+    supplierLocationId: orderData?.purchaseOrder?.supplierLocationId ?? "",
+    supplierReference: orderData?.purchaseOrder?.supplierReference ?? "",
+    orderDate: orderData?.purchaseOrder?.orderDate ?? "",
+    type: "Purchase",
+    status: orderData?.purchaseOrder?.status ?? ("Draft" as "Draft"),
+    receiptRequestedDate: orderData?.purchaseOrder?.receiptRequestedDate ?? "",
+    receiptPromisedDate: orderData?.purchaseOrder?.receiptPromisedDate ?? "",
+    currencyCode: orderData?.purchaseOrder?.currencyCode ?? "",
+    ...getCustomFields(orderData?.purchaseOrder?.customFields)
+  };
+
+  const deliveryInitialValues = {
+    id: orderData?.purchaseOrderDelivery.id,
+    locationId: orderData?.purchaseOrderDelivery.locationId ?? "",
+    supplierShippingCost:
+      orderData?.purchaseOrderDelivery.supplierShippingCost ?? 0,
+    shippingMethodId: orderData?.purchaseOrderDelivery.shippingMethodId ?? "",
+    shippingTermId: orderData?.purchaseOrderDelivery.shippingTermId ?? "",
+    trackingNumber: orderData?.purchaseOrderDelivery.trackingNumber ?? "",
+    receiptRequestedDate:
+      orderData?.purchaseOrderDelivery.receiptRequestedDate ?? "",
+    receiptPromisedDate:
+      orderData?.purchaseOrderDelivery.receiptPromisedDate ?? "",
+    deliveryDate: orderData?.purchaseOrderDelivery.deliveryDate ?? "",
+    notes: orderData?.purchaseOrderDelivery.notes ?? "",
+    dropShipment: orderData?.purchaseOrderDelivery.dropShipment ?? false,
+    customerId: orderData?.purchaseOrderDelivery.customerId ?? "",
+    customerLocationId:
+      orderData?.purchaseOrderDelivery.customerLocationId ?? "",
+    incoterm: orderData?.purchaseOrderDelivery.incoterm ?? undefined,
+    incotermLocation: orderData?.purchaseOrderDelivery.incotermLocation ?? "",
+    ...getCustomFields(orderData?.purchaseOrderDelivery.customFields)
+  };
+  const paymentInitialValues = {
+    id: purchaseOrderPayment.id,
+    invoiceSupplierId: purchaseOrderPayment.invoiceSupplierId ?? "",
+    invoiceSupplierLocationId:
+      purchaseOrderPayment.invoiceSupplierLocationId ?? undefined,
+    invoiceSupplierContactId:
+      purchaseOrderPayment.invoiceSupplierContactId ?? undefined,
+    paymentTermId: purchaseOrderPayment.paymentTermId ?? undefined,
+    paymentComplete: purchaseOrderPayment.paymentComplete ?? undefined,
+    ...getCustomFields(purchaseOrderPayment.customFields)
+  };
+
+  const { company } = useUser();
+
+  return (
+    <>
+      <SupplierInteractionState interaction={orderData.interaction} />
+      <PurchaseOrderSummary onEditShippingCost={handleEditShippingCost} />
+      <SupplierInteractionNotes
+        key={`notes-${initialValues.id}`}
+        id={orderData.purchaseOrder.id}
+        title="Notes"
+        table="purchaseOrder"
+        internalNotes={internalNotes}
+        externalNotes={externalNotes}
+      />
+      <DeferredFiles key={`documents-${orderId}`} resolve={orderData.files}>
+        {(resolvedFiles) => (
+          <SupplierInteractionDocuments
+            attachments={resolvedFiles}
+            id={orderId}
+            interactionId={orderData.purchaseOrder.supplierInteractionId!}
+            type="Purchase Order"
+          />
+        )}
+      </DeferredFiles>
+      <PurchaseOrderDeliveryForm
+        key={`delivery-${orderId}`}
+        ref={deliveryFormRef}
+        initialValues={deliveryInitialValues}
+        currencyCode={initialValues.currencyCode || company.baseCurrencyCode}
+        defaultCollapsed={false}
+      />
+
+      <PurchaseOrderPaymentForm
+        key={`payment-${orderId}`}
+        initialValues={paymentInitialValues}
+      />
+    </>
+  );
+}

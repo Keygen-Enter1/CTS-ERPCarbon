@@ -1,0 +1,35 @@
+{
+  "name": "@carbon/config",
+  "private": true,
+  "version": "0.0.0",
+  "exports": {
+    "./vitest": "./dist/vitest.mjs",
+    "./tsconfig/base.json": "./tsconfig/base.json",
+    "./tsconfig/react-library.json": "./tsconfig/react-library.json",
+    "./tsconfig/vite.json": "./tsconfig/vite.json",
+    "./tsconfig/nextjs.json": "./tsconfig/nextjs.json",
+    "./tailwind/theme.css": "./tailwind/theme.css"
+  },
+  "scripts": {
+    "build": "tsup",
+    "clean": "rimraf .turbo node_modules dist",
+    "dev": "tsup --watch"
+  },
+  "dependencies": {
+    "cookie": "catalog:",
+    "dompurify": "catalog:",
+    "nanoid": "catalog:",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@tailwindcss/typography": "catalog:",
+    "tailwind-merge": "catalog:",
+    "tailwind-scrollbar": "catalog:",
+    "tailwind-scrollbar-hide": "catalog:",
+    "tailwindcss": "catalog:",
+    "tailwindcss-animate": "catalog:"
+  },
+  "devDependencies": {
+    "tsup": "catalog:"
+  }
+}

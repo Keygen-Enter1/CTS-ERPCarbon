@@ -1,0 +1,182 @@
+@import "tailwindcss";
+@import "non.geist";
+@import "non.geist/mono";
+@import "../../../../packages/config/tailwind/theme.css";
+
+@layer base {
+  *::-webkit-scrollbar {
+    width: 5px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 5px;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  :root {
+    --header-height: 50px;
+    /* Phones: the MES tab bar, safe area included. */
+    --mes-tab-bar-h: calc(54px + env(safe-area-inset-bottom));
+    --filters-height: 38px;
+    /* Side control panel; only in play at lg+ (below that it stacks inline). */
+    --controls-width: 220px;
+    --sidebar-width: 240px;
+
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+
+    --base-shadow-color: rgb(0 0 0 / 0.05);
+
+    --button-drop-shadow: rgb(0 0 0 / 0);
+    --button-shadow: inset 0px 1px 0px 0px rgb(255 255 255 / 1),
+      0px 0px 0px 1px rgb(0 0 0 / 0.06), 0px 1px 0px 0px rgb(0 0 0 / 0.08),
+      0px 2px 2px 0px rgb(0 0 0 / 0.04), 0px 3px 3px 0px rgb(0 0 0 / 0.02),
+      0px 4px 4px 0px rgb(0 0 0 / 0.01);
+    --popover-shadow: 0px 0px 3.6px rgba(0, 0, 0, 0.04),
+      0px 0px 10px rgba(0, 0, 0, 0.04), 0px 0px 24.1px rgba(0, 0, 0, 0.05),
+      0px 0px 80px rgba(0, 0, 0, 0.08);
+    --dropdown-item-shadow: inset 0px 1px 0px rgb(255 255 255 / 0.02),
+      inset 0px 0px 0px 1px rgb(255 255 255 / 0.02),
+      0px 1px 2px rgb(0 0 0 / 0.12), 0px 2px 4px rgb(0 0 0 / 0.08),
+      0px 0px 0px 0.5px rgb(0 0 0 / 0.24);
+    --button-base-shadow: 0px 1px 1px -1px rgb(0 0 0 / 0.08),
+      0px 2px 2px -1px rgb(0 0 0 / 0.08), 0px 0px 0px 1px rgb(0 0 0 / 0.06),
+      inset 0px 1px 0px #fff, inset 0px 1px 2px 1px #fff,
+      inset 0px 1px 2px rgb(0 0 0 / 0.06);
+  }
+
+  @media (min-width: 1280px) {
+    :root {
+      --controls-width: 260px;
+    }
+  }
+
+  .dark {
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+
+    --button-drop-shadow: rgb(0 0 0 / 0.4);
+    --danger-drop-shadow: rgb(127 29 29 / 0.8);
+    --button-shadow: 0px -1px 0px 0px rgb(255 255 255 / 0.04),
+      0px 0px 0px 1px rgb(255 255 255 / 0.12), 0px 0px 1px 0px rgb(0 0 0 / 0.04),
+      0px 2px 2px 0px rgb(0 0 0 / 0.04), 0px 4px 2px 0px rgb(0 0 0 / 0.04),
+      0px 6px 3px 0px rgb(0 0 0 / 0.04);
+    --popover-shadow: 0px 0px 4px rgba(0, 0, 0, 0.08),
+      0px 0px 10px rgba(0, 0, 0, 0.12), 0px 0px 24px rgba(0, 0, 0, 0.16),
+      0px 0px 80px rgba(0, 0, 0, 0.2);
+    --button-base-shadow: 0px 0px 0px 0.5px rgb(0 0 0 / 0.4),
+      0px 1px 1px -1px rgb(0 0 0 / 0.12), 0px 2px 2px -1px rgb(0 0 0 / 0.12),
+      inset 0px 0.5px 0px rgb(255 255 255 / 0.06),
+      inset 0px 0px 1px 0px rgb(255 255 255 / 0.16),
+      inset 0px -6px 12px -4px rgb(0 0 0 / 0.16);
+    --button-primary-shadow: 0px 1px 1px -1px rgb(0 0 0 / 0.08),
+      0px 2px 2px -1px rgb(0 0 0 / 0.08), 0px 0px 0px 1px rgb(0 0 0 / 0.06),
+      inset 0px 1px 0px #fff, inset 0px 0px 2px 1px #fff,
+      inset 0px 1px 2px rgb(0 0 0 / 0.06),
+      inset 0px -4px 8px -4px rgb(0 0 0 / 0.06);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+p.is-editor-empty:first-child:before {
+  color: var(--muted-foreground);
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+
+@keyframes loading {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.loading-dot {
+  animation: loading 1.4s ease-in-out infinite;
+  opacity: 0;
+}
+.loading-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.loading-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+.tiptap.ProseMirror-focused div[data-video-embed],
+.tiptap.ProseMirror-selectedNode div[data-video-embed] {
+  @apply ring-2 ring-primary cursor-move p-2 rounded-lg;
+}
+
+.mention {
+  @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-400;
+}
+
+@keyframes spinner-fade {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.15;
+  }
+}
+
+.animate-spinner {
+  animation: spinner-fade 1.2s linear infinite;
+}
+
+/*
+ * Phones (< 768px): toasts sit above the MES tab bar while it shows, or above
+ * a page's bottom action bar. Sonner's own mobileOffset only applies up to 600px.
+ * A bottom bar carries `data-mes-bottom-bar`; `useMesBottomBar` publishes
+ * `--mes-bottom-bar-h` on <html>: its top edge from the screen bottom, safe
+ * area included.
+ */
+@media (width < 48rem) {
+  body:has([data-mes-tab-bar][data-visible="true"]):not(
+      :has([data-mes-bottom-bar])
+    )
+    [data-sonner-toaster][data-y-position="bottom"] {
+    bottom: calc(var(--mes-tab-bar-h) + 16px);
+  }
+
+  body:has([data-mes-bottom-bar])
+    [data-sonner-toaster][data-y-position="bottom"] {
+    bottom: calc(var(--mes-bottom-bar-h, 64px) + 16px);
+  }
+}

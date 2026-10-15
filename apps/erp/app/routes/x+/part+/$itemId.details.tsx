@@ -1,0 +1,432 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, success } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { flash } from "@carbon/auth/session.server";
+import { validationError, validator } from "@carbon/form";
+import { getLogger } from "@carbon/logger";
+import type { JSONContent } from "@carbon/react";
+import { Menubar, VStack } from "@carbon/react";
+import { redirect } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import type { PostgrestResponse } from "@supabase/supabase-js";
+import { Suspense } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { Await, useLoaderData, useParams } from "react-router";
+import { CadModel, DeferredFiles } from "~/components";
+import { usePermissions, useRouteData } from "~/hooks";
+import type { ItemFile, MakeMethod, PartSummary } from "~/modules/items";
+import {
+  getConfigurationParameters,
+  getConfigurationRules,
+  getItemManufacturing,
+  getMethodMaterialsByMakeMethod,
+  getMethodOperationsByMakeMethodId,
+  itemManufacturingValidator,
+  partValidator,
+  upsertItemManufacturing,
+  upsertPart
+} from "~/modules/items";
+import {
+  getItemChangeNoticeDataOnce,
+  getMakeMethodByIdOnce,
+  getMakeMethodsOnce,
+  getRevisionLock
+} from "~/modules/items/items.server";
+import {
+  ChangeNoticeDraftLockReason,
+  getChangeNoticeDraftLock,
+  ItemChangeNotices,
+  ItemOpenChangeNoticeAlert,
+  LockedHint
+} from "~/modules/items/ui/ChangeNotice";
+import {
+  BillOfMaterial,
+  BillOfProcess,
+  ItemDocuments,
+  ItemNotes,
+  ItemRiskRegister,
+  MakeMethodTools
+} from "~/modules/items/ui/Item";
+import ItemManufacturingForm from "~/modules/items/ui/Item/ItemManufacturingForm";
+import { methodVersionSlot } from "~/modules/items/ui/Item/MakeMethodTools";
+import { ConfigurationParametersForm } from "~/modules/items/ui/Parts";
+import { replanAfterItemChange } from "~/modules/production/production.server";
+import type { MethodItemType, MethodType } from "~/modules/shared";
+import { getTagsList } from "~/modules/shared";
+import { getDatabaseClient } from "~/services/database.server";
+import { getCustomFields, setCustomFields } from "~/utils/form";
+import { path } from "~/utils/path";
+
+const logger = getLogger("erp", "itemid-details");
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "parts",
+    bypassRls: true
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const url = new URL(request.url);
+  const requestedMethodId = url.searchParams.get("methodId");
+
+  // Two waves, not four: everything that needs only the item id goes here, and
+  // everything that needs only the chosen method's id goes in the next. Read
+  // one after another, this loader took the sum of its queries (about half a
+  // second) instead of the slowest of them.
+  const [makeMethods, revisionLock, changeNoticeData, tags, partManufacturing] =
+    await Promise.all([
+      getMakeMethodsOnce(client, itemId, companyId),
+      getRevisionLock(client, { itemId, companyId }),
+      // Part → CO traceability (4b): CO history for this part + type labels.
+      getItemChangeNoticeDataOnce(client, itemId, companyId),
+      getTagsList(client, companyId, "operation"),
+      getItemManufacturing(client, itemId, companyId)
+    ]);
+  const revisionStatus = revisionLock.revisionStatus;
+  const releaseControl = revisionLock.releaseControl;
+
+  // Include CO-owned draft methods so a revision/new-part item created by an open
+  // Change Notice still shows its BOM/BOP on the item master. The draft is the same
+  // makeMethod the CO edits, so the two surfaces stay in sync. Active is still
+  // preferred below, so a Version CO's item keeps its live method as the default.
+  const selectable = makeMethods.data ?? [];
+  const makeMethod = requestedMethodId
+    ? (selectable.find((m) => m.id === requestedMethodId) ??
+      selectable.find((m) => m.status === "Active") ??
+      selectable[0])
+    : (selectable.find((m) => m.status === "Active") ?? selectable[0]);
+
+  if (!makeMethod) {
+    return {
+      methodData: null,
+      tags: [],
+      revisionStatus,
+      releaseControl,
+      ...changeNoticeData
+    };
+  }
+
+  const [fullMethod, methodMaterials, methodOperations, configData] =
+    await Promise.all([
+      getMakeMethodByIdOnce(client, makeMethod.id, companyId),
+      getMethodMaterialsByMakeMethod(client, makeMethod.id),
+      getMethodOperationsByMakeMethodId(client, makeMethod.id),
+      partManufacturing.data?.requiresConfiguration
+        ? Promise.all([
+            getConfigurationParameters(client, itemId, companyId),
+            getConfigurationRules(client, itemId, companyId)
+          ]).then(([configurationParametersAndGroups, configurationRules]) => ({
+            configurationParametersAndGroups,
+            configurationRules
+          }))
+        : {
+            configurationParametersAndGroups: { groups: [], parameters: [] },
+            configurationRules: []
+          }
+    ]);
+  if (fullMethod.error || !fullMethod.data) {
+    return {
+      methodData: null,
+      tags: [],
+      revisionStatus,
+      releaseControl,
+      ...changeNoticeData
+    };
+  }
+
+  return {
+    methodData: {
+      makeMethod: fullMethod.data,
+      methodMaterials:
+        methodMaterials.data?.map((m) => ({
+          ...m,
+          description: m.item?.name ?? "",
+          methodType: m.methodType as MethodType,
+          itemType: m.itemType as MethodItemType
+        })) ?? [],
+      methodOperations:
+        methodOperations.data?.map((operation) => ({
+          ...operation,
+          workCenterId: operation.workCenterId ?? undefined,
+          operationSupplierProcessId:
+            operation.operationSupplierProcessId ?? undefined,
+          workInstruction: operation.workInstruction as JSONContent | null
+        })) ?? [],
+      partManufacturing: partManufacturing.data,
+      ...configData
+    },
+    tags: tags.data ?? [],
+    revisionStatus,
+    releaseControl,
+    ...changeNoticeData
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+  const { client, companyId, userId } = await requirePermissions(request, {
+    update: "parts"
+  });
+
+  const { itemId } = params;
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "manufacturing") {
+    const validation = await validator(itemManufacturingValidator).validate(
+      formData
+    );
+
+    if (validation.error) {
+      logger.error(validation.error);
+      return validationError(validation.error);
+    }
+
+    const updatePartManufacturing = await upsertItemManufacturing(client, {
+      ...validation.data,
+      requiresConfiguration: validation.data.requiresConfiguration ?? false,
+      itemId,
+      updatedBy: userId,
+      customFields: setCustomFields(formData)
+    });
+    if (updatePartManufacturing.error) {
+      throw redirect(
+        path.to.part(itemId),
+        await flash(
+          request,
+          error(
+            updatePartManufacturing.error,
+            "Failed to update part manufacturing"
+          )
+        )
+      );
+    }
+
+    // The planning pages list MRP's suggestions; re-plan so they follow the
+    // new settings now, not at the next scheduled run.
+    await replanAfterItemChange(getDatabaseClient(), {
+      itemId,
+      companyId,
+      userId
+    });
+
+    throw redirect(
+      path.to.partDetails(itemId),
+      await flash(request, success("Updated part manufacturing"))
+    );
+  }
+
+  const validation = await validator(partValidator).validate(formData);
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  const updatePart = await upsertPart(client, {
+    ...validation.data,
+    id: itemId,
+    companyId,
+    customFields: setCustomFields(formData),
+    updatedBy: userId
+  });
+  if (updatePart.error) {
+    throw redirect(
+      path.to.part(itemId),
+      await flash(request, error(updatePart.error, "Failed to update part"))
+    );
+  }
+
+  throw redirect(
+    path.to.part(itemId),
+    await flash(request, success("Updated part"))
+  );
+}
+
+export default function PartDetailsRoute() {
+  const { t } = useLingui();
+  const { itemId } = useParams();
+  if (!itemId) throw new Error("Could not find itemId");
+
+  const permissions = usePermissions();
+  const {
+    methodData,
+    tags,
+    revisionStatus,
+    releaseControl,
+    changeNotices,
+    changeNoticeTypes
+  } = useLoaderData<typeof loader>();
+
+  const draftLock = getChangeNoticeDraftLock(
+    methodData?.makeMethod.changeOrderId,
+    changeNotices
+  );
+  const lockReason = draftLock ? (
+    <ChangeNoticeDraftLockReason lock={draftLock} />
+  ) : undefined;
+  const lockHint = lockReason ? <LockedHint reason={lockReason} /> : undefined;
+
+  const partData = useRouteData<{
+    partSummary: PartSummary;
+    files: Promise<ItemFile[]>;
+    makeMethods: Promise<PostgrestResponse<MakeMethod>>;
+  }>(path.to.part(itemId));
+
+  if (!partData) throw new Error("Could not find part data");
+
+  const manufacturingInitialValues = methodData?.partManufacturing
+    ? {
+        ...methodData.partManufacturing,
+        lotSize: methodData.partManufacturing.lotSize ?? 0,
+        ...getCustomFields(methodData.partManufacturing.customFields)
+      }
+    : null;
+
+  return (
+    <VStack spacing={4} className="p-4">
+      {permissions.is("employee") &&
+        methodData &&
+        ["Make", "Buy and Make"].includes(
+          partData.partSummary?.replenishmentSystem ?? ""
+        ) && (
+          <Suspense fallback={<Menubar />}>
+            <Await resolve={partData?.makeMethods}>
+              {(makeMethods) => (
+                <MakeMethodTools
+                  itemId={methodData.makeMethod.itemId}
+                  makeMethods={makeMethods?.data ?? []}
+                  type="Part"
+                  currentMethodId={methodData.makeMethod.id}
+                  versionInSlot
+                />
+              )}
+            </Await>
+          </Suspense>
+        )}
+      {permissions.is("employee") && (
+        <ItemOpenChangeNoticeAlert changeNotices={changeNotices ?? []} />
+      )}
+      {permissions.is("employee") && methodData && (
+        <>
+          {["Make", "Buy and Make"].includes(
+            partData.partSummary?.replenishmentSystem ?? ""
+          ) && (
+            <>
+              {manufacturingInitialValues && (
+                <ItemManufacturingForm
+                  key={itemId}
+                  initialValues={manufacturingInitialValues}
+                />
+              )}
+              {methodData.partManufacturing?.requiresConfiguration && (
+                <ConfigurationParametersForm
+                  key={`options:${itemId}`}
+                  parameters={
+                    methodData.configurationParametersAndGroups.parameters
+                  }
+                  groups={methodData.configurationParametersAndGroups.groups}
+                />
+              )}
+            </>
+          )}
+          <ItemNotes
+            id={partData.partSummary?.id ?? null}
+            title={partData.partSummary?.name ?? ""}
+            subTitle={partData.partSummary?.readableIdWithRevision ?? ""}
+            notes={partData.partSummary?.notes as JSONContent}
+          />
+          {["Make", "Buy and Make"].includes(
+            partData.partSummary?.replenishmentSystem ?? ""
+          ) && (
+            <>
+              {/* Phones: the method version chip, right above the method. */}
+              <methodVersionSlot.Target className="flex md:hidden [&_button]:h-9 [&_button]:rounded-full [&_button]:border [&_button]:border-border [&_button]:bg-card [&_button]:px-3" />
+              <BillOfProcess
+                key={`bop:${itemId}`}
+                makeMethod={methodData.makeMethod}
+                // @ts-expect-error
+                operations={methodData.methodOperations ?? []}
+                configurable={
+                  methodData.partManufacturing?.requiresConfiguration
+                }
+                materials={methodData.methodMaterials ?? []}
+                configurationRules={methodData.configurationRules}
+                parameters={
+                  methodData.configurationParametersAndGroups.parameters
+                }
+                tags={tags}
+                revisionStatus={revisionStatus}
+                releaseControl={releaseControl}
+                isDisabled={!!draftLock}
+                disabledReason={lockReason}
+              />
+              <BillOfMaterial
+                key={`bom:${itemId}`}
+                makeMethod={methodData.makeMethod}
+                // @ts-expect-error
+                materials={methodData.methodMaterials ?? []}
+                // @ts-expect-error
+                operations={methodData.methodOperations}
+                configurable={
+                  methodData.partManufacturing?.requiresConfiguration
+                }
+                configurationRules={methodData.configurationRules}
+                parameters={
+                  methodData.configurationParametersAndGroups.parameters
+                }
+                replenishmentSystem={partData.partSummary?.replenishmentSystem}
+                revisionStatus={revisionStatus}
+                releaseControl={releaseControl}
+                isDisabled={!!draftLock}
+                disabledReason={lockReason}
+              />
+            </>
+          )}
+        </>
+      )}
+      {permissions.is("employee") && (
+        <>
+          <DeferredFiles resolve={partData?.files}>
+            {(resolvedFiles) => (
+              <ItemDocuments
+                files={resolvedFiles}
+                itemId={itemId}
+                modelUpload={partData.partSummary ?? undefined}
+                type="Part"
+                isReadOnly={!!draftLock}
+                titleExtras={lockHint}
+              />
+            )}
+          </DeferredFiles>
+
+          {/* <DefaultAttachmentsPanel
+            files={defaultAttachments ?? []}
+            storagePathPrefix={`default-attachments/item/${itemId}`}
+            title={t`Default Attachments on Purchase Orders`}
+            description={t`Files attached here ride along whenever this item appears on a purchase order email.`}
+          /> */}
+
+          <CadModel
+            isReadOnly={!permissions.can("update", "parts") || !!draftLock}
+            metadata={{ itemId }}
+            modelUpload={partData?.partSummary ?? null}
+            title={t`CAD Model`}
+            titleExtras={lockHint}
+          />
+          <ItemRiskRegister itemId={itemId} />
+          <ItemChangeNotices
+            changeNotices={changeNotices ?? []}
+            types={changeNoticeTypes ?? []}
+          />
+        </>
+      )}
+    </VStack>
+  );
+}

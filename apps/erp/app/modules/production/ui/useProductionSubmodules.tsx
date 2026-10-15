@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { getIntegrationIdsByRole } from "@carbon/ee";
+import { useLingui } from "@lingui/react/macro";
+import {
+  LuChartBarBig,
+  LuChartLine,
+  LuCirclePlay,
+  LuLayers,
+  LuListChecks,
+  LuListTodo,
+  LuSquareChartGantt,
+  LuSquareKanban,
+  LuStepForward,
+  LuTimerOff,
+  LuTrash,
+  LuTruck
+} from "react-icons/lu";
+import { GroupedContentSidebar } from "~/components/Layout";
+import { usePermissions } from "~/hooks";
+import { useIntegrations } from "~/hooks/useIntegrations";
+import { useSavedViews } from "~/hooks/useSavedViews";
+import type { AuthenticatedRouteGroup } from "~/types";
+import { path } from "~/utils/path";
+
+export default function useProductionSubmodules() {
+  const { t } = useLingui();
+  const permissions = usePermissions();
+  // Unattributed Time only exists once an OEE provider is reporting machines.
+  const integrations = useIntegrations();
+  const oeeIntegrationIds = new Set<string>(getIntegrationIdsByRole("oee"));
+  const hasOeeProvider = integrations.list.some(
+    (integration) =>
+      integration.active &&
+      integration.id !== null &&
+      oeeIntegrationIds.has(integration.id)
+  );
+
+  const productionRoutes: AuthenticatedRouteGroup[] = [
+    {
+      name: t`Production`,
+      routes: [
+        {
+          name: t`Jobs`,
+          to: path.to.jobs,
+          icon: <LuCirclePlay />,
+          table: "job"
+        },
+        {
+          name: t`Batches`,
+          to: path.to.operationBatches,
+          icon: <LuLayers />,
+          table: "jobOperationBatch"
+        },
+        ...(hasOeeProvider
+          ? [
+              {
+                name: t`Unattributed Time`,
+                to: path.to.unattributedMachineTimes,
+                icon: <LuTimerOff />,
+                role: "employee" as const
+              }
+            ]
+          : [])
+      ]
+    },
+    {
+      name: t`Planning`,
+      routes: [
+        {
+          name: t`Demand Forecasts`,
+          to: path.to.demandProjections,
+          icon: <LuChartLine />,
+          table: "demand-projection"
+        },
+        {
+          name: t`Material Planning`,
+          to: path.to.productionPlanning,
+          icon: <LuListTodo />,
+          table: "production-planning"
+        },
+        {
+          name: t`Resource Planning`,
+          to: path.to.priorityPeople,
+          icon: <LuChartBarBig />
+        }
+      ]
+    },
+    {
+      name: t`Scheduling`,
+      routes: [
+        {
+          name: t`Forecast`,
+          to: path.to.scheduleForecast,
+          icon: <LuSquareChartGantt />
+        },
+        {
+          name: t`Priorities`,
+          to: path.to.priorityDates,
+          icon: <LuSquareKanban />
+        },
+        {
+          name: t`Outbound`,
+          to: path.to.scheduleOutbound,
+          icon: <LuTruck />
+        }
+      ]
+    },
+    {
+      name: t`Work Instructions`,
+      routes: [
+        {
+          name: t`Assemblies`,
+          to: path.to.assemblyInstructions,
+          icon: <LuStepForward />,
+          role: "employee"
+        },
+        {
+          name: t`Procedures`,
+          to: path.to.procedures,
+          icon: <LuListChecks />,
+          table: "procedure",
+          role: "employee"
+        }
+      ]
+    },
+    {
+      name: t`Configure`,
+      routes: [
+        {
+          name: t`Scrap Reasons`,
+          to: path.to.scrapReasons,
+          role: "employee",
+          icon: <LuTrash />
+        }
+      ]
+    }
+  ];
+  const { addSavedViewsToRoutes } = useSavedViews();
+
+  const isRouteVisible = (route: AuthenticatedRouteGroup["routes"][number]) => {
+    if (route.role && !permissions.is(route.role)) return false;
+    if (route.permission && !permissions.can("view", route.permission))
+      return false;
+    return true;
+  };
+
+  return {
+    groups: productionRoutes
+      .filter((group) => group.routes.some(isRouteVisible))
+      .map((group) => ({
+        ...group,
+        routes: group.routes.filter(isRouteVisible).map(addSavedViewsToRoutes)
+      }))
+  };
+}
+
+/** Phones: the module's section switcher, for routes outside the module's
+ *  own layout (`handle.compactSidebar`). */
+export function ProductionSections() {
+  const { groups } = useProductionSubmodules();
+  return <GroupedContentSidebar groups={groups} />;
+}

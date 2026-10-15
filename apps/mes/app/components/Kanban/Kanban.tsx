@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { ClientOnly } from "@carbon/react";
+import { withUnorderedLast } from "@carbon/utils";
+import type {
+  Announcements,
+  DragEndEvent,
+  DragStartEvent
+} from "@dnd-kit/core";
+import {
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  MouseSensor,
+  TouchSensor,
+  useSensor,
+  useSensors
+} from "@dnd-kit/core";
+import { arrayMove, SortableContext } from "@dnd-kit/sortable";
+import { useLingui } from "@lingui/react/macro";
+import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
+import { BoardContainer, ColumnCard } from "./components/ColumnCard";
+import type { Column, DisplaySettings, Item } from "./types";
+import { coordinateGetter, hasDraggableData } from "./utils";
+
+// Module constants: a new options object makes a new sensor, and with it new
+// listeners for every draggable on every render.
+const KEYBOARD_SENSOR_OPTIONS = { coordinateGetter };
+
+interface Progress {
+  totalDuration: number;
+  progress: number;
+  active: boolean;
+  employees?: Set<string>;
+}
+
+type KanbanProps = {
+  columns: Column[];
+  items: Item[];
+  progressByItemId?: Record<string, Progress>;
+} & DisplaySettings;
+
+const COLUMN_ORDER_KEY = "kanban-column-order";
+
+const Kanban = ({
+  columns,
+  items,
+  progressByItemId,
+  ...displaySettings
+}: KanbanProps) => {
+  const { t } = useLingui();
+  // Only the order the user chose is state. The columns come from the loader
+  // and change while the board is open (a filter, a work center's first
+  // operation): one copied in at mount never showed a column that arrived later.
+  const [storedOrder, setStoredOrder] = useState<string[]>(() => {
+    const stored = localStorage.getItem(COLUMN_ORDER_KEY);
+    return stored ? (JSON.parse(stored) as string[]) : [];
+  });
+  const columnOrder = useMemo(
+    () =>
+      withUnorderedLast(
+        storedOrder,
+        columns.map((col) => col.id)
+      ),
+    [storedOrder, columns]
+  );
+
+  useEffect(() => {
+    localStorage.setItem(COLUMN_ORDER_KEY, JSON.stringify(storedOrder));
+  }, [storedOrder]);
+
+  const [activeColumn, setActiveColumn] = useState<Column | null>(null);
+
+  const sensors = useSensors(
+    useSensor(MouseSensor),
+    useSensor(TouchSensor),
+    useSensor(KeyboardSensor, KEYBOARD_SENSOR_OPTIONS)
+  );
+
+  const announcements: Announcements = {
+    onDragStart({ active }) {
+      if (!hasDraggableData(active)) return;
+      if (active.data.current?.type === "column") {
+        const startIndex = columnOrder.findIndex((id) => id === active.id);
+        const startColumn = columns.find((col) => col.id === active.id);
+        return t`Picked up Column ${startColumn?.title} at position: ${
+          startIndex + 1
+        } of ${columnOrder.length}`;
+      }
+    },
+    onDragOver({ active, over }) {
+      if (!hasDraggableData(active) || !hasDraggableData(over)) return;
+
+      if (
+        active.data.current?.type === "column" &&
+        over.data.current?.type === "column"
+      ) {
+        const overIndex = columnOrder.findIndex((id) => id === over.id);
+        return t`Column ${active.data.current.column.title} was moved over ${
+          over.data.current.column.title
+        } at position ${overIndex + 1} of ${columnOrder.length}`;
+      }
+    },
+    onDragEnd({ active, over }) {
+      if (!hasDraggableData(active) || !hasDraggableData(over)) return;
+
+      if (
+        active.data.current?.type === "column" &&
+        over.data.current?.type === "column"
+      ) {
+        const overColumnPosition = columnOrder.findIndex(
+          (id) => id === over.id
+        );
+
+        return t`Column ${
+          active.data.current.column.title
+        } was dropped into position ${overColumnPosition + 1} of ${
+          columnOrder.length
+        }`;
+      }
+    },
+    onDragCancel({ active }) {
+      if (!hasDraggableData(active)) return;
+      return t`Dragging ${active.data.current?.type} cancelled.`;
+    }
+  };
+
+  return (
+    <DndContext
+      accessibility={{
+        announcements
+      }}
+      sensors={sensors}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+    >
+      <BoardContainer>
+        <SortableContext items={columnOrder}>
+          {columnOrder.map((colId) => {
+            const col = columns.find((c) => c.id === colId);
+            if (!col) return null;
+            return (
+              <ColumnCard
+                key={col.id}
+                column={col}
+                items={items.filter((item) => item.columnId === col.id)}
+                progressByItemId={progressByItemId}
+                {...displaySettings}
+              />
+            );
+          })}
+        </SortableContext>
+      </BoardContainer>
+
+      <ClientOnly fallback={null}>
+        {() =>
+          createPortal(
+            <DragOverlay>
+              {activeColumn && (
+                <ColumnCard
+                  isOverlay
+                  column={activeColumn}
+                  items={items.filter(
+                    (item) => item.columnId === activeColumn.id
+                  )}
+                  progressByItemId={progressByItemId}
+                  {...displaySettings}
+                />
+              )}
+            </DragOverlay>,
+            document.body
+          )
+        }
+      </ClientOnly>
+    </DndContext>
+  );
+
+  function onDragStart(event: DragStartEvent) {
+    if (!hasDraggableData(event.active)) return;
+    const data = event.active.data.current;
+    if (data?.type === "column") {
+      setActiveColumn(data.column);
+    }
+  }
+
+  function onDragEnd(event: DragEndEvent) {
+    setActiveColumn(null);
+
+    const { active, over } = event;
+
+    if (!over) return;
+
+    const activeId = active.id;
+    const overId = over.id;
+
+    if (!hasDraggableData(active)) return;
+
+    const activeData = active.data.current;
+
+    if (activeId === overId) return;
+
+    const isActiveAColumn = activeData?.type === "column";
+    if (!isActiveAColumn) return;
+
+    const activeColumnIndex = columnOrder.findIndex((id) => id === activeId);
+    const overColumnIndex = columnOrder.findIndex((id) => id === overId);
+    if (activeColumnIndex < 0 || overColumnIndex < 0) return;
+    setStoredOrder(arrayMove(columnOrder, activeColumnIndex, overColumnIndex));
+  }
+};
+
+export default Kanban;

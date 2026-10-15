@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { ComboboxProps } from "@carbon/form";
+import { Combobox, CreatableCombobox } from "@carbon/form";
+import { useLoaderQuery } from "@carbon/query";
+import { useDisclosure } from "@carbon/react";
+import { useMemo, useRef, useState } from "react";
+import { usePermissions } from "~/hooks";
+import type { getShippingMethodsList } from "~/modules/inventory";
+import { ShippingMethodForm } from "~/modules/inventory";
+import { path } from "~/utils/path";
+import { useEmptyState } from "./emptyStates";
+
+type ShippingMethodSelectProps = Omit<ComboboxProps, "options">;
+
+const ShippingMethod = (props: ShippingMethodSelectProps) => {
+  const options = useShippingMethod();
+  const permissions = usePermissions();
+
+  const newShippingMethodModal = useDisclosure();
+  const [created, setCreated] = useState<string>("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const emptyMessage = useEmptyState("shippingMethod", {
+    onCreate: () => newShippingMethodModal.onOpen()
+  });
+
+  return permissions.can("create", "inventory") ? (
+    <>
+      <CreatableCombobox
+        ref={triggerRef}
+        options={options}
+        emptyMessage={emptyMessage}
+        {...props}
+        label={props?.label ?? "Shipping Method"}
+        onCreateOption={(option) => {
+          newShippingMethodModal.onOpen();
+          setCreated(option);
+        }}
+      />
+      {newShippingMethodModal.isOpen && (
+        <ShippingMethodForm
+          type="modal"
+          onClose={() => {
+            setCreated("");
+            newShippingMethodModal.onClose();
+            triggerRef.current?.click();
+          }}
+          initialValues={{
+            name: created,
+            carrier: "" as "FedEx"
+          }}
+        />
+      )}
+    </>
+  ) : (
+    <Combobox
+      options={options}
+      emptyMessage={emptyMessage}
+      {...props}
+      label={props?.label ?? "Shipping Method"}
+    />
+  );
+};
+
+ShippingMethod.displayName = "ShippingMethod";
+
+export default ShippingMethod;
+
+export const useShippingMethod = () => {
+  const shippingMethodFetcher = useLoaderQuery<
+    Awaited<ReturnType<typeof getShippingMethodsList>>
+  >(path.to.api.shippingMethods);
+
+  const options = useMemo(() => {
+    return (shippingMethodFetcher.data?.data ?? []).map((c) => ({
+      value: c.id,
+      label: c.name
+    }));
+  }, [shippingMethodFetcher.data?.data]);
+
+  return options;
+};

@@ -1,0 +1,474 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { readdirSync, readFileSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
+import { log } from "@clack/prompts";
+import { execa } from "execa";
+import { join } from "pathe";
+import pg from "pg";
+import { waitForPort } from "../helpers.js";
+
+// ---------------------------------------------------------------------------
+// Readiness gates
+// ---------------------------------------------------------------------------
+
+// Block until each tcp:<port> accepts on 127.0.0.1. `onProgress` fires once
+// per port as it opens — caller streams these into a spinner subtitle so a
+// stuck service (e.g. inngest pulling its container) is visible instead of a
+// 60s silent hang.
+export async function waitForTcp(
+  targets: string[],
+  opts: { onProgress?: (line: string) => void } = {}
+) {
+  const ports = targets.map((t) => {
+    const m = t.match(/^tcp:(\d+)$/);
+    if (!m)
+      throw new Error(`waitForTcp: bad target "${t}" (expected tcp:<port>)`);
+    return Number(m[1]);
+  });
+  const total = ports.length;
+  let opened = 0;
+  await Promise.all(
+    ports.map(async (p) => {
+      await waitForPort(p, 60_000);
+      opened += 1;
+      opts.onProgress?.(`tcp:${p} open (${opened}/${total})`);
+    })
+  );
+}
+
+// Block until postgres accepts queries (TCP-open ≠ ready — init scripts run
+// after the port opens).
+export async function waitForPostgres(port: number, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await withClient(port, (c) => c.query("SELECT 1"));
+      return;
+    } catch {
+      // postgres still initializing — retry until deadline
+    }
+    await sleep(1000);
+  }
+  throw new Error(`postgres did not accept queries within ${timeoutMs}ms`);
+}
+
+// Block until Kong answers for both PostgREST and GoTrue. After a hibernated
+// stack is started again the ports open well before these two can serve, and
+// the request that woke the stack is waiting on exactly them.
+export async function waitForApi(
+  port: number,
+  anonKey: string,
+  timeoutMs = 60_000
+) {
+  const deadline = Date.now() + timeoutMs;
+  const up = async (path: string) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+        headers: { apikey: anonKey },
+        signal: AbortSignal.timeout(2000)
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  };
+  while (Date.now() < deadline) {
+    if ((await up("/rest/v1/")) && (await up("/auth/v1/health"))) return;
+    await sleep(500);
+  }
+  throw new Error(`the API did not answer within ${timeoutMs}ms`);
+}
+
+/**
+ * Block until supabase storage-api has bootstrapped `storage.buckets`. Probes
+ * for 30s first; if missing, invokes `onHeal` (re-apply init.sql + restart
+ * dependent services) then polls again with a 150s budget.
+ *
+ * The heal path recovers worktrees whose pgdata volume predates the current
+ * init.sql — Docker only runs init scripts on a fresh data dir, so role
+ * passwords drift and storage-api auth-fails forever otherwise.
+ */
+export async function waitForStorageReady(
+  port: number,
+  opts: {
+    onHeal?: () => Promise<void>;
+    onProgress?: (line: string) => void;
+    onTimeout?: () => Promise<void>;
+  } = {}
+) {
+  const start = Date.now();
+  const elapsed = () => Math.floor((Date.now() - start) / 1000);
+
+  opts.onProgress?.("waiting for storage.buckets");
+  if (await pollBuckets(port, start + 30_000)) {
+    opts.onProgress?.(`storage.buckets ready (${elapsed()}s)`);
+    return;
+  }
+
+  if (opts.onHeal) {
+    opts.onProgress?.("storage stuck — running heal");
+    await opts.onHeal();
+  }
+
+  if (await pollBuckets(port, start + 180_000)) {
+    opts.onProgress?.(`storage.buckets ready (${elapsed()}s)`);
+    return;
+  }
+
+  if (opts.onTimeout) {
+    try {
+      await opts.onTimeout();
+    } catch {
+      // diagnostics are best-effort; original error below is what matters
+    }
+  }
+  throw new Error("storage.buckets did not appear within 180s");
+}
+
+// Re-apply `packages/dev/docker/init.sql` as the cluster superuser role.
+// Docker's `docker-entrypoint-initdb.d` only runs on a fresh pgdata volume —
+// a worktree with a pre-existing volume from before init.sql evolved keeps the
+// old role passwords forever, so storage-api / gotrue / postgrest auth-fail on
+// every boot. Re-applying is idempotent (`ALTER USER ... PASSWORD`, `CREATE
+// SCHEMA IF NOT EXISTS`).
+//
+// Connect as `supabase_admin` (not `postgres`): current supabase/postgres
+// images treat `supabase_admin` as a reserved role; only a superuser may
+// `ALTER` it, and the host TCP `postgres` role is no longer sufficient.
+export async function applyBootstrapSql(root: string, port: number) {
+  const sql = readFileSync(join(root, "packages/dev/docker/init.sql"), "utf8");
+  await withClient(port, (c) => c.query(sql), {
+    user: "supabase_admin",
+    password: "postgres"
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Schema migrations
+// ---------------------------------------------------------------------------
+
+// --include-all: supabase bootstrap inserts a sentinel into schema_migrations
+// that makes earlier-timestamp migrations look "out of order" without it.
+// Returns `applied: true` when at least one migration ran — callers gate
+// type/swagger regen on this so a re-run against an up-to-date DB stays cheap.
+//
+// Use `supabase_admin`, not `postgres`: current supabase/postgres images mark
+// `session_authorization=postgres` as non-superuser (`is_superuser=off`), so
+// the CLI cannot INSERT migration bookkeeping rows into
+// `supabase_migrations.schema_migrations` as `postgres`.
+export async function applyMigrations(
+  root: string,
+  dbPort: number
+): Promise<{ applied: boolean }> {
+  const dbUrl = `postgresql://supabase_admin:postgres@localhost:${dbPort}/postgres`;
+  const args = ["migration", "up", "--include-all", "--db-url", dbUrl];
+  const cwd = join(root, "packages/database");
+
+  // Retry up to 3 times on deadlock — background services (PostgREST,
+  // Realtime) hold catalog locks that race with CREATE POLICY / ALTER TABLE.
+  const MAX_RETRIES = 3;
+  const execOpts = { cwd, reject: false, preferLocal: true };
+  // Inferred from the call so `r` is the string-encoded result (not execa's
+  // buffer overload) and is definitely assigned after the loop.
+  let r = await execa("supabase", args, execOpts);
+  for (let attempt = 1; attempt < MAX_RETRIES && r.exitCode !== 0; attempt++) {
+    const output = `${r.stderr ?? ""}\n${r.stdout ?? ""}`;
+    if (!/deadlock detected/i.test(output)) break;
+    log.warn(
+      `deadlock during migration (attempt ${attempt}/${MAX_RETRIES}) — retrying in 3s`
+    );
+    await sleep(3000);
+    r = await execa("supabase", args, execOpts);
+  }
+  if (r.exitCode !== 0) {
+    const output = `${r.stderr ?? ""}\n${r.stdout ?? ""}`;
+    // Auto-repair: DB has migration versions not present locally (stale from
+    // another branch or incomplete volume wipe). Remove them and retry.
+    if (/remote migration versions not found in local/i.test(output)) {
+      const repaired = await repairStaleMigrations(root, dbPort);
+      if (repaired > 0) {
+        log.warn(`repaired ${repaired} stale migration(s) — retrying`);
+        const retry = await execa("supabase", args, {
+          cwd,
+          reject: false,
+          preferLocal: true
+        });
+        if (retry.exitCode === 0) {
+          return { applied: didApplyMigrations(retry) };
+        }
+        process.stderr.write(retry.stderr?.toString() ?? "");
+        process.stdout.write(retry.stdout?.toString() ?? "");
+        throw new Error(
+          `supabase ${args.join(" ")} failed after repair (exit ${retry.exitCode})`
+        );
+      }
+    }
+    process.stderr.write(r.stderr?.toString() ?? "");
+    process.stdout.write(r.stdout?.toString() ?? "");
+    throw new Error(`supabase ${args.join(" ")} failed (exit ${r.exitCode})`);
+  }
+  return { applied: didApplyMigrations(r) };
+}
+
+// Make every table's RLS policies match packages/database/src/authz/manifest.ts — the
+// one place policies are authored; migrations only create tables. Callers run it after
+// migrations (which create the tables) and after type regen, so a manifest problem
+// fails loudly without leaving the generated types stale.
+export async function syncAuthz(root: string, dbPort: number): Promise<string> {
+  const r = await execa(
+    "pnpm",
+    ["--silent", "--filter", "@carbon/database", "run", "authz", "sync"],
+    {
+      cwd: root,
+      reject: false,
+      env: {
+        ...process.env,
+        SUPABASE_DB_URL: `postgresql://supabase_admin:postgres@localhost:${dbPort}/postgres`
+      }
+    }
+  );
+  if (r.exitCode !== 0) {
+    process.stderr.write(r.stderr?.toString() ?? "");
+    process.stdout.write(r.stdout?.toString() ?? "");
+    throw new Error(
+      "authz sync failed: fix the rule or function file named above (packages/database/src/authz, src/event-system/functions), then migrate again"
+    );
+  }
+  const counts = (r.stdout ?? "").match(/changed \d+ (helper|table)\(s\)/g);
+  return counts?.join(", ") ?? "policies in sync";
+}
+
+// supabase prints "Applying migration <ts>_<name>.sql..." per applied
+// migration — on STDERR (stdout says "Local database is up to date." even
+// while applying), so both streams must be checked.
+function didApplyMigrations(r: { stdout?: string; stderr?: string }): boolean {
+  return /Applying migration/i.test(`${r.stderr ?? ""}\n${r.stdout ?? ""}`);
+}
+
+// Find migration versions in DB that have no corresponding local file and
+// remove them from supabase_migrations.schema_migrations.
+async function repairStaleMigrations(
+  root: string,
+  dbPort: number
+): Promise<number> {
+  const migrationsDir = join(root, "packages/database/supabase/migrations");
+  const localVersions = new Set(
+    readdirSync(migrationsDir)
+      .filter((f) => f.endsWith(".sql"))
+      .map((f) => f.split("_")[0]!)
+  );
+
+  const remoteVersions = await withClient(
+    dbPort,
+    async (c) => {
+      const res = await c.query<{ version: string }>(
+        "SELECT version FROM supabase_migrations.schema_migrations ORDER BY version"
+      );
+      return res.rows.map((r) => r.version);
+    },
+    { user: "supabase_admin", password: "postgres" }
+  );
+
+  const stale = remoteVersions.filter((v) => !localVersions.has(v));
+  if (stale.length === 0) return 0;
+
+  await withClient(
+    dbPort,
+    async (c) => {
+      for (const version of stale) {
+        await c.query(
+          "DELETE FROM supabase_migrations.schema_migrations WHERE version = $1",
+          [version]
+        );
+      }
+    },
+    { user: "supabase_admin", password: "postgres" }
+  );
+
+  return stale.length;
+}
+
+// ---------------------------------------------------------------------------
+// Config row (pg_net push targets)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the Supabase service schemas are initialized, not just present.
+ *
+ * GoTrue and Storage build `auth`/`storage` through their OWN migrations, which
+ * only run when those containers boot. A postgres-only stack leaves stubs — and
+ * restoring a dump into that state silently no-ops the dump's `CREATE TABLE
+ * auth.users` (the stub already exists), leaving a users table missing most of
+ * its columns. `email_confirmed_at` is GoTrue's, so its presence proves GoTrue
+ * migrated rather than that the table merely exists.
+ *
+ * Storage is checked separately rather than assumed from GoTrue: the restore
+ * script guards its storage TRUNCATEs with `to_regclass` so a partially booted
+ * stack can't abort the run, which means a missing `storage.objects` would let
+ * the restore finish "successfully" with no buckets seeded. Both services must
+ * have booted.
+ *
+ * Realtime is the third: `realtime.messages` is built by the Realtime service,
+ * and Carbon's migrations put policies on it.
+ */
+export async function serviceSchemasReady(dbPort: number): Promise<boolean> {
+  return withClient(dbPort, async (c) => {
+    const r = await c.query(
+      `SELECT to_regclass('auth.users') IS NOT NULL
+                AND to_regclass('storage.objects') IS NOT NULL
+                AND to_regclass('storage.buckets') IS NOT NULL
+                AND to_regclass('realtime.messages') IS NOT NULL
+                AND EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'auth' AND table_name = 'users'
+                    AND column_name = 'email_confirmed_at'
+                ) AS ready`
+    );
+    return r.rows[0]?.ready === true;
+  });
+}
+
+// Carbon's migrations write into schemas GoTrue, Storage and Realtime build on
+// their first boot, so a fresh volume can't be migrated until all three have.
+export async function waitForServiceSchemas(port: number, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await serviceSchemasReady(port).catch(() => false)) return;
+    await sleep(1000);
+  }
+  throw new Error(
+    `auth / storage / realtime schemas not ready within ${timeoutMs}ms — check the gotrue, storage and realtime containers`
+  );
+}
+
+// The singleton "config" row (the API URL and anon key some database
+// functions read), and the Vault `inngest_event_url` that
+// util.send_inngest_event posts database events to. Without the URL the
+// event-queue wake never fires in dev — and since webhooks ride the event
+// system, they don't either. Both URLs are in-network (Kong, Inngest): pg_net
+// runs inside the postgres container, which can't reach host ports.
+export async function ensureConfigRow(
+  dbPort: number,
+  anonKey: string
+): Promise<void> {
+  await withClient(dbPort, (c) =>
+    c.query(
+      `INSERT INTO "config" ("id", "apiUrl", "anonKey")
+       VALUES (TRUE, 'http://kong:8000', $1)
+       ON CONFLICT ("id") DO UPDATE
+         SET "apiUrl" = EXCLUDED."apiUrl", "anonKey" = EXCLUDED."anonKey"`,
+      [anonKey]
+    )
+  );
+  // Postgres sends its Inngest events to the dev server on the compose network.
+  await withClient(dbPort, (c) =>
+    c.query(
+      `SELECT public.set_inngest_event_url('http://inngest:8288/e/NO_EVENT_KEY_SET')`
+    )
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Smoke-test user
+// ---------------------------------------------------------------------------
+
+const SMOKE_TEST_EMAIL = "test@carbon.ms";
+
+export async function ensureSmokeTestUser(
+  root: string,
+  dbPort: number,
+  apiPort: number
+): Promise<{ seeded: boolean }> {
+  const exists = await withClient(dbPort, async (c) => {
+    const r = await c.query<{ count: string }>(
+      `SELECT count(*)::text FROM "user" WHERE email = $1`,
+      [SMOKE_TEST_EMAIL]
+    );
+    return Number(r.rows[0]?.count) > 0;
+  });
+
+  if (exists) return { seeded: false };
+
+  const dbUrl = `postgresql://postgres:postgres@localhost:${dbPort}/postgres`;
+  const supabaseUrl = `http://localhost:${apiPort}`;
+  await execa(
+    "pnpm",
+    [
+      "--filter",
+      "@carbon/database",
+      "run",
+      "db:seed:dev",
+      "--",
+      "--email",
+      SMOKE_TEST_EMAIL
+    ],
+    {
+      cwd: root,
+      env: {
+        ...process.env,
+        SUPABASE_DB_URL: dbUrl,
+        SUPABASE_URL: supabaseUrl,
+        NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      },
+      stdio: "pipe"
+    }
+  );
+
+  return { seeded: true };
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+type HostPgOpts = {
+  user?: string;
+  password?: string;
+  database?: string;
+};
+
+// Host-side Postgres connection. `pg` avoids a host `psql` install —
+// previously a hidden requirement that bit at least one engineer.
+async function withClient<T>(
+  port: number,
+  fn: (c: pg.Client) => Promise<T>,
+  opts: HostPgOpts = {}
+): Promise<T> {
+  const client = new pg.Client({
+    host: "127.0.0.1",
+    port,
+    user: opts.user ?? "postgres",
+    password: opts.password ?? "postgres",
+    database: opts.database ?? "postgres"
+  });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.end();
+  }
+}
+
+async function pollBuckets(port: number, deadline: number): Promise<boolean> {
+  while (Date.now() < deadline) {
+    if (await storageBucketsExists(port)) return true;
+    await sleep(1000);
+  }
+  return false;
+}
+
+async function storageBucketsExists(port: number): Promise<boolean> {
+  try {
+    return await withClient(port, async (c) => {
+      const r = await c.query<{ regclass: string | null }>(
+        "SELECT to_regclass('storage.buckets')::text AS regclass"
+      );
+      return r.rows[0]?.regclass === "storage.buckets";
+    });
+  } catch {
+    return false;
+  }
+}

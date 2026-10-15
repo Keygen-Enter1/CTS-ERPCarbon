@@ -1,0 +1,1227 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { Constants } from "@carbon/database";
+import { z } from "zod";
+import { zfd } from "zod-form-data";
+import { months } from "~/modules/shared";
+import {
+  itemLedgerDocumentTypes,
+  itemLedgerTypes
+} from "../inventory/inventory.models";
+import { macrsConventions, macrsPropertyClasses } from "./accounting.utils";
+
+export { macrsConventions, macrsPropertyClasses };
+
+export const accountTypes = [
+  "Bank",
+  "Cash",
+  "Accounts Receivable",
+  "Accounts Payable",
+  "Inventory",
+  "Fixed Asset",
+  "Accumulated Depreciation",
+  "Other Current Asset",
+  "Other Asset",
+  "Other Current Liability",
+  "Long Term Liability",
+  "Equity - No Close",
+  "Equity - Close",
+  "Retained Earnings",
+  "Income",
+  "Cost of Goods Sold",
+  "Expense",
+  "Other Income",
+  "Other Expense",
+  "Tax",
+  "Investments"
+] as const;
+
+export const consolidatedRateTypes = [
+  "Average",
+  "Current",
+  "Historical"
+] as const;
+
+const costLedgerTypes = [
+  "Direct Cost",
+  "Revaluation",
+  "Rounding",
+  "Indirect Cost",
+  "Variance",
+  "Total"
+] as const;
+
+export const journalLineDocumentType = [
+  "Receipt",
+  "Invoice",
+  "Credit Memo",
+  "Blanket Order",
+  "Return Order"
+] as const;
+
+export const incomeBalanceTypes = [
+  "Balance Sheet",
+  "Income Statement"
+] as const;
+export const accountClassTypes = [
+  "Asset",
+  "Liability",
+  "Equity",
+  "Revenue",
+  "Expense"
+] as const;
+
+export const financialReportColumns = ["month", "quarter", "year"] as const;
+
+// Pin/unpin toggle on the reports hub (/x/accounting/reports)
+export const reportPinValidator = z.object({
+  reportKey: z.string().min(1),
+  pinned: z.enum(["true", "false"])
+});
+
+// URL search params for the /x/reports financial statements. Parsed with
+// safeParse in the loaders — invalid params fall back to defaults rather than
+// failing the report.
+export const financialReportParamsValidator = z.object({
+  companies: z.string().optional(),
+  startDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional(),
+  endDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional(),
+  columns: z.enum(financialReportColumns).catch("month").default("month"),
+  showTranslated: z
+    .string()
+    .optional()
+    .transform((v) => v === "true")
+});
+
+// -- Dimensional analytics (pivot) reports --
+// Spec: .ai/specs/2026-08-09-dimensional-pivot-reporting.md
+
+export const analyticsReportKeys = [
+  "revenue",
+  "expenses",
+  "assets",
+  "inventory-change",
+  "scrap"
+] as const;
+export type AnalyticsReportKey = (typeof analyticsReportKeys)[number];
+
+// Account scope: exactly one selector. "scrapAccounts" resolves at runtime to
+// accountDefault.scrapAccount (getScrapAccountIds in accounting.service.ts).
+export type AnalyticsAccountScope =
+  | { classes: (typeof accountClassTypes)[number][] }
+  | { types: (typeof accountTypes)[number][] }
+  | { source: "scrapAccounts" };
+
+export type AnalyticsReportDefinition = {
+  key: AnalyticsReportKey;
+  accountScope: AnalyticsAccountScope;
+  // Row selections applied when the URL has no pivot params. Entries use the
+  // "et:<entityType>" alias the analytics loader resolves to a dimension id.
+  defaultRows: string[];
+};
+
+export const analyticsReports: Record<
+  AnalyticsReportKey,
+  AnalyticsReportDefinition
+> = {
+  revenue: {
+    key: "revenue",
+    accountScope: { classes: ["Revenue"] },
+    defaultRows: ["et:Customer"]
+  },
+  expenses: {
+    key: "expenses",
+    accountScope: { classes: ["Expense"] },
+    defaultRows: ["et:Location"]
+  },
+  assets: {
+    key: "assets",
+    accountScope: { classes: ["Asset"] },
+    defaultRows: ["et:Location"]
+  },
+  "inventory-change": {
+    key: "inventory-change",
+    accountScope: { types: ["Inventory"] },
+    defaultRows: ["et:Location"]
+  },
+  scrap: {
+    key: "scrap",
+    accountScope: { source: "scrapAccounts" },
+    defaultRows: ["et:ScrapReason"]
+  }
+};
+
+export const pivotMeasures = ["amount", "quantity", "count"] as const;
+export type PivotMeasure = (typeof pivotMeasures)[number];
+
+// Purchases report — grouping fields (columns on the purchase invoice line /
+// its header), NOT journal dimensions. The purchases pivot RPC resolves each
+// to a value id; the report reuses the shared PivotState (rows/columnAxis hold
+// these field keys).
+export const purchaseGroupingFields = [
+  "supplier",
+  "supplierType",
+  "item",
+  "itemPostingGroup",
+  "costCenter"
+] as const;
+export type PurchaseGroupingField = (typeof purchaseGroupingFields)[number];
+
+export const pivotColumnAxisValidator = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("period"),
+    bucket: z.enum(financialReportColumns)
+  }),
+  z.object({ type: z.literal("dimension"), dimensionId: z.string().min(1) })
+]);
+export type PivotColumnAxis = z.infer<typeof pivotColumnAxisValidator>;
+
+// Pivot state, encoded in the URL as:
+//   rows    = comma-separated dimension ids (or "et:<entityType>" aliases), max 2
+//   col     = "period:month|quarter|year" or "dim:<dimensionId>"
+//   measure = amount|quantity|count; pct=1 for percent-of-column-total
+//   filters = URL-encoded JSON [{dimensionId, valueIds}]
+//   accounts = comma-separated account ids narrowing the report's account scope
+//   sort    = "<columnKey|__total__|__label__>:asc|desc" (row sort; omit for the
+//             default ABS(measure) descending)
+//   startDate/endDate — same params ReportFilters writes
+export const pivotStateValidator = z.object({
+  rows: z.array(z.string().min(1)).max(2).default([]),
+  columnAxis: pivotColumnAxisValidator.default({
+    type: "period",
+    bucket: "month"
+  }),
+  measure: z.enum(pivotMeasures).default("amount"),
+  percentOfTotal: z.boolean().default(false),
+  // Row sort. null (the default) means ABS(measure) descending, Unassigned last.
+  sort: z
+    .object({
+      key: z.string().min(1),
+      direction: z.enum(["asc", "desc"])
+    })
+    .nullable()
+    .default(null),
+  filters: z
+    .array(
+      z.object({
+        dimensionId: z.string().min(1),
+        valueIds: z.array(z.string()).min(1)
+      })
+    )
+    .default([]),
+  // Optional narrowing to specific accounts WITHIN the report's account scope
+  // (base classes/types define the universe; these intersect it).
+  accountIds: z.array(z.string().min(1)).default([])
+});
+export type PivotState = z.infer<typeof pivotStateValidator>;
+
+/**
+ * Overlay the client-only display params (`measure` / `pct` / `sort`) from the
+ * URL onto a loader-derived PivotState. The analytics report loaders skip
+ * revalidation when only these change (see `revalidateIgnoringPivotDisplay`), so
+ * the route component re-derives them here to stay in sync without a refetch.
+ * A server-affecting change always re-runs the loader, so the passed `state` is
+ * the correct base (saved view / default) for any display param absent from the
+ * URL — including after the user clears a sort.
+ */
+export function applyPivotDisplayParams(
+  state: PivotState,
+  searchParams: URLSearchParams
+): PivotState {
+  const measureParam = searchParams.get("measure");
+  const measure = (pivotMeasures as readonly string[]).includes(
+    measureParam ?? ""
+  )
+    ? (measureParam as PivotMeasure)
+    : state.measure;
+
+  const pctParam = searchParams.get("pct");
+  const percentOfTotal =
+    pctParam !== null ? pctParam === "1" : state.percentOfTotal;
+
+  const sortParam = searchParams.get("sort");
+  let sort = state.sort;
+  if (sortParam !== null) {
+    const separator = sortParam.lastIndexOf(":");
+    const key = separator > 0 ? sortParam.slice(0, separator) : "";
+    const direction = separator > 0 ? sortParam.slice(separator + 1) : "";
+    sort =
+      key && (direction === "asc" || direction === "desc")
+        ? { key, direction }
+        : state.sort;
+  }
+
+  return { ...state, measure, percentOfTotal, sort };
+}
+
+export const reportViewVisibilities = ["Private", "Company"] as const;
+
+// Save-view modal on the analytics reports; config is a JSON-encoded
+// PivotState re-parsed with pivotStateValidator in the route action.
+export const reportViewValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  reportKey: z.enum(analyticsReportKeys),
+  name: z
+    .string()
+    .min(1, { message: "Name is required" })
+    .max(100, { message: "Name must be 100 characters or fewer" }),
+  visibility: z.enum(reportViewVisibilities, {
+    error: "Visibility is required"
+  }),
+  config: z.string().min(2, { message: "Config is required" })
+});
+
+export const groupAccountValidator = z
+  .object({
+    id: zfd.text(z.string().optional()),
+    name: z.string().trim().min(1, { message: "Name is required" }),
+    parentId: zfd.text(z.string().optional()),
+    accountType: z
+      .enum(accountTypes, {
+        error: "Account type is required"
+      })
+      .optional(),
+    incomeBalance: z.enum(incomeBalanceTypes, {
+      error: "Income balance is required"
+    }),
+    class: z.enum(accountClassTypes, {
+      error: "Class is required"
+    })
+  })
+  .refine(
+    (data) => {
+      if (["Asset", "Liability", "Equity"].includes(data.class)) {
+        return data.incomeBalance === "Balance Sheet";
+      }
+      return true;
+    },
+    {
+      message: "Asset, Liability and Equity are Balance Sheet accounts",
+      path: ["class"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (["Revenue", "Expense"].includes(data.class)) {
+        return data.incomeBalance === "Income Statement";
+      }
+      return true;
+    },
+    {
+      message: "Revenue and Expense are Income Statement accounts",
+      path: ["class"]
+    }
+  );
+
+export const moveAccountValidator = z.object({
+  id: z.string().min(1),
+  parentId: zfd.text(z.string().optional())
+});
+
+export const accountValidator = z
+  .object({
+    id: zfd.text(z.string().optional()),
+    number: z.string().min(1, { message: "Number is required" }).nullish(),
+    name: z.string().trim().min(1, { message: "Name is required" }),
+    parentId: zfd.text(z.string().optional()),
+    isGroup: zfd.checkbox(),
+    accountType: z
+      .enum(accountTypes, {
+        error: "Account type is required"
+      })
+      .optional(),
+    incomeBalance: z.enum(incomeBalanceTypes, {
+      error: "Income balance is required"
+    }),
+    class: z.enum(accountClassTypes, {
+      error: "Class is required"
+    }),
+    consolidatedRate: z.enum(consolidatedRateTypes)
+  })
+  .refine(
+    (data) => {
+      if (["Asset", "Liability", "Equity"].includes(data.class)) {
+        return data.incomeBalance === "Balance Sheet";
+      }
+      return true;
+    },
+    {
+      message: "Asset, Liability and Equity are Balance Sheet accounts",
+      path: ["class"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (["Revenue", "Expense"].includes(data.class)) {
+        return data.incomeBalance === "Income Statement";
+      }
+      return true;
+    },
+    {
+      message: "Revenue and Expense are Income Statement accounts",
+      path: ["class"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (!data.isGroup) {
+        return !!data.accountType;
+      }
+      return true;
+    },
+    {
+      message: "Account type is required for ledger accounts",
+      path: ["accountType"]
+    }
+  );
+
+export const fiscalYearSettingsValidator = z.object({
+  startMonth: z.enum(months, {
+    error: "Start month is required"
+  }),
+  taxStartMonth: z.enum(months, {
+    error: "Tax start month is required"
+  })
+});
+
+export const journalLineValidator = z.object({
+  postingDate: zfd.text(z.string().optional()),
+  accountId: z.string().min(1, { message: "Account is required" }),
+  description: z.string().optional(),
+  amount: z.number(),
+  documentType: z.union([z.enum(journalLineDocumentType), z.undefined()]),
+  documentId: z.string().optional(),
+  externalDocumentId: z.string().optional()
+});
+
+export const currencyValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  code: z.string().trim().min(1, { message: "Code is required" }),
+  decimalPlaces: zfd.numeric(z.number().min(0).max(4)),
+  historicalExchangeRate: zfd.numeric(
+    z.number().positive({ message: "Rate must be positive" }).optional()
+  )
+});
+
+// The currency drawer saves its config and its exchange rate with one button.
+// The rate is pinned as an override only when it differs from the rate in
+// effect, so saving the config never freezes the market rate.
+export const currencyFormValidator = currencyValidator.extend({
+  rate: zfd.numeric(
+    z.number().positive({ message: "Rate must be positive" }).optional()
+  ),
+  // The rate the drawer opened with. A submitted rate equal to it was not
+  // edited, so it is never pinned — even if the market moved meanwhile.
+  displayedRate: zfd.numeric(z.number().optional())
+});
+
+export const exchangeRateOverrideValidator = z.object({
+  currencyCode: z.string().trim().min(1, { message: "Currency is required" }),
+  rate: zfd.numeric(z.number().positive({ message: "Rate must be positive" }))
+});
+
+export const defaultBalanceSheetAccountValidator = z.object({
+  rawMaterialsAccount: z.string().min(1, {
+    message: "Raw materials account is required"
+  }),
+  finishedGoodsAccount: z.string().min(1, {
+    message: "Finished goods account is required"
+  }),
+  goodsReceivedNotInvoicedAccount: z.string().min(1, {
+    message: "GR/IR clearing account is required"
+  }),
+  workInProgressAccount: z.string().min(1, {
+    message: "Work in progress account is required"
+  }),
+  receivablesAccount: z.string().min(1, {
+    message: "Receivables account is required"
+  }),
+  bankCashAccount: z.string().min(1, {
+    message: "Bank cash account is required"
+  }),
+  bankLocalCurrencyAccount: z.string().min(1, {
+    message: "Bank local currency account is required"
+  }),
+  bankForeignCurrencyAccount: z.string().min(1, {
+    message: "Bank foreign currency account is required"
+  }),
+  assetAquisitionCostAccount: z.string().min(1, {
+    message: "Aquisition cost account is required"
+  }),
+  assetAquisitionCostOnDisposalAccount: z.string().min(1, {
+    message: "Aquisition cost on disposal account is required"
+  }),
+  accumulatedDepreciationAccount: z.string().min(1, {
+    message: "Accumulated depreciation account is required"
+  }),
+  accumulatedDepreciationOnDisposalAccount: z.string().min(1, {
+    message: "Accumulated depreciation on disposal account is required"
+  }),
+  prepaymentAccount: z.string().min(1, {
+    message: "Prepayment account is required"
+  }),
+  supplierPrepaymentAccount: z.string().min(1, {
+    message: "Supplier prepayment account is required"
+  }),
+  payablesAccount: z.string().min(1, {
+    message: "Payables account is required"
+  }),
+  // Optional BY DESIGN: the column is nullable with a runtime fallback to
+  // `payablesAccount`, and a required field would break saves on every company
+  // whose chart has no Employee Reimbursements Payable account.
+  employeeReimbursementsPayableAccount: z.string().optional(),
+  salesTaxPayableAccount: z.string().min(1, {
+    message: "Sales tax payable account is required"
+  }),
+  purchaseTaxPayableAccount: z.string().min(1, {
+    message: "Purchase tax payable account is required"
+  }),
+  reverseChargeSalesTaxPayableAccount: z.string().min(1, {
+    message: "Reverse charge sales tax payable account is required"
+  }),
+  retainedEarningsAccount: z.string().min(1, {
+    message: "Retained earnings account is required"
+  }),
+  currencyTranslationAccount: z.string().min(1, {
+    message: "Currency translation account is required"
+  }),
+  deferredTaxLiabilityAccountId: z.string().min(1, {
+    message: "Deferred tax liability account is required"
+  }),
+  // Optional here: a company may not have the account yet. The accounting
+  // enable wizard's readiness step requires it.
+  migrationClearingAccount: z.string().optional(),
+  deferredRevenueAccount: z.string().optional(),
+  contractAssetAccount: z.string().optional(),
+  netInvestmentInLeasesAccount: z.string().optional(),
+  rightOfUseAssetAccount: z.string().optional(),
+  accumulatedRightOfUseAmortizationAccount: z.string().optional(),
+  leaseLiabilityAccount: z.string().optional()
+});
+
+export const defaultIncomeAcountValidator = z.object({
+  salesAccount: z.string().min(1, { message: "Sales account is required" }),
+  salesShippingRevenueAccount: z
+    .string()
+    .min(1, {
+      message: "Shipping revenue account is required"
+    })
+    .optional(),
+  salesDiscountAccount: z.string().min(1, {
+    message: "Sales discount account is required"
+  }),
+  costOfGoodsSoldAccount: z.string().min(1, {
+    message: "Cost of goods sold account is required"
+  }),
+  purchaseVarianceAccount: z.string().min(1, {
+    message: "Purchase price variance account is required"
+  }),
+  inventoryAdjustmentVarianceAccount: z.string().min(1, {
+    message: "Inventory adjustment variance account is required"
+  }),
+  scrapAccount: z.string().optional(),
+  materialVarianceAccount: z.string().min(1, {
+    message: "Material usage variance account is required"
+  }),
+  laborAndMachineVarianceAccount: z.string().min(1, {
+    message: "Labor & machine variance account is required"
+  }),
+  overheadVarianceAccount: z.string().min(1, {
+    message: "Overhead variance account is required"
+  }),
+  lotSizeVarianceAccount: z.string().min(1, {
+    message: "Lot size variance account is required"
+  }),
+  subcontractingVarianceAccount: z.string().min(1, {
+    message: "Subcontracting variance account is required"
+  }),
+  laborAbsorptionAccount: z.string().min(1, {
+    message: "Labor absorption account is required"
+  }),
+  overheadAbsorptionAccount: z.string().optional(),
+  indirectCostAccount: z.string().min(1, {
+    message: "Indirect cost account is required"
+  }),
+  maintenanceAccount: z.string().min(1, {
+    message: "Maintenance account is required"
+  }),
+  assetDepreciationExpenseAccount: z.string().min(1, {
+    message: "Depreciation expense account is required"
+  }),
+  assetGainOnDisposalAccount: z.string().min(1, {
+    message: "Gain on disposal account is required"
+  }),
+  assetLossOnDisposalAccount: z.string().min(1, {
+    message: "Loss on disposal account is required"
+  }),
+  serviceChargeAccount: z.string().min(1, {
+    message: "Service charge account is required"
+  }),
+  interestAccount: z.string().min(1, {
+    message: "Interest account is required"
+  }),
+  supplierPaymentDiscountAccount: z.string().min(1, {
+    message: "Supplier payment discount account is required"
+  }),
+  customerPaymentDiscountAccount: z.string().min(1, {
+    message: "Customer payment discount account is required"
+  }),
+  customerWriteOffAccount: z.string().min(1, {
+    message: "Customer write-off account is required"
+  }),
+  supplierWriteOffAccount: z.string().min(1, {
+    message: "Supplier write-off account is required"
+  }),
+  realizedExchangeGainAccount: z.string().min(1, {
+    message: "Realized exchange gain account is required"
+  }),
+  realizedExchangeLossAccount: z.string().min(1, {
+    message: "Realized exchange loss account is required"
+  }),
+  roundingAccount: z.string().min(1, {
+    message: "Rounding account is required"
+  }),
+  deferredTaxExpenseAccountId: z.string().min(1, {
+    message: "Deferred tax expense account is required"
+  }),
+  rentalIncomeAccount: z.string().optional(),
+  leaseRevenueAccount: z.string().optional(),
+  leaseInterestIncomeAccount: z.string().optional(),
+  operatingLeaseExpenseAccount: z.string().optional(),
+  variableLeaseExpenseAccount: z.string().optional(),
+  rightOfUseAmortizationExpenseAccount: z.string().optional(),
+  leaseInterestExpenseAccount: z.string().optional()
+});
+
+export const defaultAccountValidator =
+  defaultBalanceSheetAccountValidator.merge(defaultIncomeAcountValidator);
+
+export const paymentTermsCalculationMethod = [
+  "Net",
+  "End of Month",
+  "Day of Month"
+] as const;
+
+export const paymentTermValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  daysDue: zfd.numeric(
+    z
+      .number()
+      .min(0, { message: "Days due must be greater than or equal to 0" })
+  ),
+  daysDiscount: zfd.numeric(
+    z
+      .number()
+      .min(0, { message: "Days discount must be greater than or equal to 0" })
+  ),
+  discountPercentage: zfd.numeric(
+    z
+      .number()
+      .min(0, {
+        message: "Discount percent must be greater than or equal to 0"
+      })
+      .max(100, {
+        message: "Discount percent must be less than or equal to 100"
+      })
+  ),
+  calculationMethod: z.enum(["Net", "End of Month", "Day of Month"], {
+    error: "Calculation method is required"
+  })
+});
+
+export const costLedgerValidator = z.object({
+  postingDate: zfd.text(z.string().optional()),
+  itemLedgerType: z.enum(itemLedgerTypes),
+  costLedgerType: z.enum(costLedgerTypes),
+  adjustment: z.boolean(),
+  documentType: z.union([z.enum(itemLedgerDocumentTypes), z.undefined()]),
+  documentId: z.string().optional(),
+  itemId: zfd.text(z.string()),
+  quantity: z.number(),
+  cost: z.number(),
+  costPostedToGL: z.number()
+});
+
+export const costCenterValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  parentCostCenterId: zfd.text(z.string().optional()),
+  ownerId: z.string().min(1, { message: "Owner is required" })
+});
+
+export const projectValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  description: zfd.text(z.string().trim().optional())
+});
+
+export const intercompanyTransactionStatuses = [
+  "Unmatched",
+  "Matched",
+  "Eliminated"
+] as const;
+
+export const intercompanyEliminationRoles = [
+  "Control",
+  "Revenue",
+  "COGS",
+  "Capitalization"
+] as const;
+
+export const intercompanyTransactionValidator = z
+  .object({
+    sourceCompanyId: z
+      .string()
+      .min(1, { message: "Source company is required" }),
+    targetCompanyId: z
+      .string()
+      .min(1, { message: "Target company is required" }),
+    amount: zfd.numeric(
+      z.number().positive({ message: "Amount must be positive" })
+    ),
+    currencyCode: z.string().min(1, { message: "Currency is required" }),
+    description: z.string().min(1, { message: "Description is required" }),
+    debitAccountId: z.string().min(1, { message: "Debit account is required" }),
+    creditAccountId: z
+      .string()
+      .min(1, { message: "Credit account is required" }),
+    postingDate: zfd.text(z.string().optional())
+  })
+  .refine(
+    (data) => {
+      return data.debitAccountId !== data.creditAccountId;
+    },
+    {
+      message: "Debit and credit account must be different"
+    }
+  )
+  .refine(
+    (data) => {
+      return data.sourceCompanyId !== data.targetCompanyId;
+    },
+    {
+      message: "Source and target company must be different"
+    }
+  );
+
+export const journalEntrySourceTypes = [
+  "Manual",
+  "Opening Balance",
+  "Purchase Receipt",
+  "Purchase Invoice",
+  "Purchase Return",
+  "Purchase Return Shipment",
+  "Sales Invoice",
+  "Sales Shipment",
+  "Sales Return",
+  "Sales Return Receipt",
+  "Sales Return Shipment",
+  "Transfer Receipt",
+  "Inventory Adjustment",
+  "Production Order",
+  "Job Consumption",
+  "Job Receipt",
+  "Production Event",
+  "Job Close",
+  "Maintenance Event",
+  "Asset Depreciation",
+  "Asset Disposal",
+  "Asset Transfer",
+  "Payment",
+  "Credit Memo",
+  "Debit Memo",
+  "Non-Conformance",
+  "Inbound Inspection",
+  "Charge",
+  "Reimbursement",
+  "Revenue Recognition",
+  "Lease",
+  "Lease Run"
+] as const;
+
+// Provisional: written before the accounting cutover, counts nowhere.
+// Superseded: a Provisional journal dated before the cutover.
+export const journalEntryStatuses = Constants.public.Enums.journalEntryStatus;
+
+export const periodCloseStatuses = ["Open", "Locked", "Closed"] as const;
+
+export const revenueScheduleTypes = [
+  "Deferral",
+  "Accrual",
+  "Interest",
+  "Amortization"
+] as const;
+
+export const revenueScheduleStatuses = ["Planned", "Posted"] as const;
+
+export const accountingPeriodTransitionValidator = z.object({
+  intent: z.enum(["lock", "unlock", "close", "reopen"]),
+  periodId: z.string().min(1, { message: "Period is required" })
+});
+
+export const generateFiscalYearPeriodsValidator = z.object({
+  intent: z.literal("generate"),
+  fiscalYear: zfd.numeric(z.number().int().min(2000).max(2200))
+});
+
+// --- NetSuite-style period close checklist ---------------------------------
+export const periodCloseTaskTypes = ["Auto", "Action", "Manual"] as const;
+export const periodCloseTaskSeverities = ["Blocker", "Warning"] as const;
+export const periodCloseTaskStatuses = ["Open", "Done", "Skipped"] as const;
+
+// Complete an Action/Manual checklist task (Auto tasks are system-evaluated).
+export const closeTaskCompleteValidator = z.object({
+  intent: z.literal("completeTask"),
+  taskId: z.string().min(1, { message: "Task is required" }),
+  notes: zfd.text(z.string().optional())
+});
+
+// Skip a Warning/Manual task — a non-empty reason is always required, and the
+// service additionally rejects skipping Blocker tasks.
+export const closeTaskSkipValidator = z.object({
+  intent: z.literal("skipTask"),
+  taskId: z.string().min(1, { message: "Task is required" }),
+  skippedReason: z
+    .string()
+    .trim()
+    .min(1, { message: "A reason is required to skip a task" })
+});
+
+// Add an ad-hoc task to a single period's checklist (definitionId stays null).
+export const addCloseTaskValidator = z.object({
+  intent: z.literal("addTask"),
+  periodId: z.string().min(1, { message: "Period is required" }),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  taskType: z.enum(periodCloseTaskTypes, {
+    error: "Task type is required"
+  }),
+  required: zfd.checkbox(),
+  assigneeId: zfd.text(z.string().optional())
+});
+
+// Create/update a company-level close task definition (template row).
+export const periodCloseTaskDefinitionValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  taskType: z.enum(periodCloseTaskTypes, {
+    error: "Task type is required"
+  }),
+  autoCheckKey: zfd.text(z.string().optional()),
+  sortOrder: zfd.numeric(z.number().int().min(0)),
+  required: zfd.checkbox(),
+  severity: zfd.text(z.enum(periodCloseTaskSeverities).optional()),
+  active: zfd.checkbox(),
+  defaultAssigneeId: zfd.text(z.string().optional())
+});
+
+export const journalEntryValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  description: z.string().optional(),
+  postingDate: z.string().min(1, { message: "Posting date is required" })
+});
+
+export const journalEntryLineValidator = z
+  .object({
+    id: zfd.text(z.string().optional()),
+    journalEntryId: zfd.text(z.string().optional()),
+    accountId: z.string().min(1, { message: "Account is required" }),
+    description: z.string().optional(),
+    debit: zfd.numeric(z.number().min(0)),
+    credit: zfd.numeric(z.number().min(0))
+  })
+  .refine((data) => !(data.debit > 0 && data.credit > 0), {
+    message: "A line cannot have both debit and credit",
+    path: ["credit"]
+  })
+  .refine((data) => data.debit > 0 || data.credit > 0, {
+    message: "Either debit or credit is required",
+    path: ["debit"]
+  });
+
+export const dimensionEntityTypes = [
+  "CostCenter",
+  "Custom",
+  "Customer",
+  "CustomerType",
+  "Department",
+  "Employee",
+  "FixedAssetClass",
+  "Item",
+  "ItemPostingGroup",
+  "Location",
+  "Process",
+  "Project",
+  "ScrapReason",
+  "Supplier",
+  "SupplierType",
+  "WorkCenter"
+] as const;
+
+export const dimensionValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  entityType: z.enum(dimensionEntityTypes, {
+    error: "Entity type is required"
+  }),
+  active: zfd.checkbox(),
+  required: zfd.checkbox(),
+  dimensionValues: z.string().min(1).array().optional()
+});
+
+// -- Fixed Asset Models --
+
+/**
+ * Construction in progress (a CIP asset class, Attach Job, Capitalize, Complete
+ * To → Asset Under Construction) is built but hidden until it returns with
+ * projects. Off: no CIP class is listed or offered, so no asset can reach
+ * Under Construction from the app, and the actions and filters for it are not
+ * shown. The engines and schema are untouched.
+ */
+export const CONSTRUCTION_IN_PROGRESS_ENABLED = false;
+
+export const fixedAssetStatuses = [
+  "Draft",
+  "Active",
+  "Fully Depreciated",
+  "Disposed",
+  "Under Construction"
+] as const;
+
+/** The statuses a filter offers; Under Construction only with CIP shown. */
+export const visibleFixedAssetStatuses = fixedAssetStatuses.filter(
+  (status) =>
+    CONSTRUCTION_IN_PROGRESS_ENABLED || status !== "Under Construction"
+);
+
+export const fleetStatuses = [
+  "Available",
+  "Reserved",
+  "On Rent",
+  "In Maintenance",
+  "Under Construction",
+  "Sold",
+  "Returned to Stock"
+] as const;
+
+/** The fleet statuses a filter offers; Under Construction only with CIP shown. */
+export const visibleFleetStatuses = fleetStatuses.filter(
+  (status) =>
+    CONSTRUCTION_IN_PROGRESS_ENABLED || status !== "Under Construction"
+);
+
+export const depreciationMethods = [
+  "Straight Line",
+  "Declining Balance",
+  "Units of Production"
+] as const;
+
+export const taxDepreciationMethods = [
+  "Straight Line",
+  "Declining Balance",
+  "MACRS"
+] as const;
+
+export const disposalMethods = ["Sale", "Scrapping"] as const;
+
+export const fixedAssetClassValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  description: z.string().optional(),
+  depreciationMethod: z.enum(depreciationMethods, {
+    error: "Depreciation method is required"
+  }),
+  usefulLifeMonths: zfd.numeric(
+    z.number().int().positive({ message: "Useful life must be positive" })
+  ),
+  residualValuePercent: zfd.numeric(
+    z
+      .number()
+      .min(0, { message: "Residual value must be >= 0" })
+      .max(100, { message: "Residual value must be <= 100" })
+  ),
+  assetAccountId: z.string().min(1, { message: "Asset account is required" }),
+  accumulatedDepreciationAccountId: z
+    .string()
+    .min(1, { message: "Accumulated depreciation account is required" }),
+  depreciationExpenseAccountId: z
+    .string()
+    .min(1, { message: "Depreciation expense account is required" }),
+  writeOffAccountId: z
+    .string()
+    .min(1, { message: "Write-off account is required" }),
+  writeDownAccountId: z
+    .string()
+    .min(1, { message: "Write-down account is required" }),
+  gainOnDisposalAccountId: z
+    .string()
+    .min(1, { message: "Gain on disposal account is required" }),
+  lossOnDisposalAccountId: z
+    .string()
+    .min(1, { message: "Loss on disposal account is required" }),
+  taxDepreciationMethod: z.preprocess(
+    (val) => (val === "" ? null : val),
+    z.enum(taxDepreciationMethods).nullable().optional()
+  ),
+  taxUsefulLifeMonths: zfd.numeric(
+    z.number().int().positive().nullable().optional()
+  ),
+  taxResidualValuePercent: zfd.numeric(
+    z.number().min(0).max(100).nullable().optional()
+  ),
+  macrsPropertyClass: z.enum(macrsPropertyClasses).nullable().optional(),
+  macrsConvention: z.enum(macrsConventions).nullable().optional(),
+  bonusDepreciationPercent: zfd.numeric(
+    z.number().min(0).max(100).nullable().optional()
+  )
+});
+
+export const fixedAssetValidator = z.object({
+  id: zfd.text(z.string().optional()),
+  fixedAssetClassId: z.string().min(1, { message: "Asset class is required" }),
+  name: z.string().trim().min(1, { message: "Name is required" }),
+  description: z.string().optional(),
+  serialNumber: z.string().optional(),
+  depreciationMethod: z.enum(depreciationMethods, {
+    error: "Depreciation method is required"
+  }),
+  usefulLifeMonths: zfd.numeric(
+    z.number().int().positive({ message: "Useful life must be positive" })
+  ),
+  residualValuePercent: zfd.numeric(
+    z
+      .number()
+      .min(0, { message: "Residual value must be >= 0" })
+      .max(100, { message: "Residual value must be <= 100" })
+  ),
+  assetLifetimeUsage: zfd.numeric(z.number().positive().optional()),
+  locationId: zfd.text(z.string().optional()),
+  workCenterId: zfd.text(z.string().optional()),
+  taxDepreciationMethod: z.preprocess(
+    (val) => (val === "" ? null : val),
+    z.enum(taxDepreciationMethods).nullable().optional()
+  ),
+  taxUsefulLifeMonths: zfd.numeric(
+    z.number().int().positive().nullable().optional()
+  ),
+  taxResidualValuePercent: zfd.numeric(
+    z.number().min(0).max(100).nullable().optional()
+  ),
+  macrsPropertyClass: z.preprocess(
+    (val) => (val === "" ? null : val),
+    z.enum(macrsPropertyClasses).nullable().optional()
+  ),
+  macrsConvention: z.preprocess(
+    (val) => (val === "" ? null : val),
+    z.enum(macrsConventions).nullable().optional()
+  ),
+  bonusDepreciationPercent: zfd.numeric(
+    z.number().min(0).max(100).nullable().optional()
+  )
+});
+
+export const fixedAssetRegisterValidator = z.object({
+  acquisitionCost: zfd.numeric(
+    z.number().positive({ message: "Acquisition cost must be positive" })
+  ),
+  acquisitionDate: z
+    .string()
+    .min(1, { message: "Acquisition date is required" }),
+  accumulatedDepreciation: zfd.numeric(
+    z.number().min(0, { message: "Accumulated depreciation must be >= 0" })
+  ),
+  depreciationStartDate: z
+    .string()
+    .min(1, { message: "Depreciation start date is required" })
+});
+
+export const depreciationRunValidator = z.object({
+  periodEnd: z.string().min(1, { message: "Period end date is required" })
+});
+
+export const revenueRecognitionRunValidator = z.object({
+  periodEnd: z.string().min(1, { message: "Period end is required" })
+});
+
+export const fixedAssetUsageLogValidator = z.object({
+  fixedAssetId: z.string().min(1, { message: "Asset is required" }),
+  periodStart: z.string().min(1, { message: "Period start is required" }),
+  periodEnd: z.string().min(1, { message: "Period end is required" }),
+  unitsProduced: zfd.numeric(
+    z.number().positive({ message: "Units must be positive" })
+  )
+});
+
+export const fixedAssetDisposalValidator = z.object({
+  disposalDate: z.string().min(1, { message: "Disposal date is required" })
+});
+
+export const fixedAssetCapitalizeValidator = z.object({
+  fixedAssetClassId: z.string().min(1, { message: "Asset class is required" }),
+  itemId: z.string().min(1, { message: "Item is required" }),
+  trackedEntityId: z.string().min(1, { message: "Tracked entity is required" }),
+  locationId: z.string().min(1, { message: "Location is required" }),
+  storageUnitId: zfd.text(z.string().optional()),
+  transferDate: z.string().min(1, { message: "Transfer date is required" }),
+  name: zfd.text(z.string().optional()),
+  // Only for a unit inventory carries at nothing: what it cost, and the
+  // account that value was booked to when it was spent.
+  cost: zfd.numeric(
+    z.number().positive({ message: "Cost must be more than zero" }).optional()
+  ),
+  offsetAccountId: zfd.text(z.string().optional())
+});
+
+export const fixedAssetAdjustCostValidator = z.object({
+  amount: zfd.numeric(
+    z.number().positive({ message: "The increase must be more than zero" })
+  ),
+  offsetAccountId: zfd.text(z.string().optional()),
+  locationId: z.string().min(1, { message: "Location is required" }),
+  transferDate: z.string().min(1, { message: "Transfer date is required" })
+});
+
+export const fixedAssetReturnToInventoryValidator = z.object({
+  transferDate: z.string().min(1, { message: "Transfer date is required" }),
+  locationId: z.string().min(1, { message: "Location is required" }),
+  storageUnitId: zfd.text(z.string().optional())
+});
+
+export const fixedAssetAttachJobValidator = z.object({
+  jobId: z.string().min(1, { message: "Job is required" })
+});
+
+export const fixedAssetCapitalizeCipValidator = z.object({
+  toClassId: z.string().min(1, { message: "Asset class is required" }),
+  inServiceDate: z.string().min(1, { message: "In-service date is required" })
+});
+
+export const fixedAssetOutOfServiceValidator = z.object({
+  reason: z.string().trim().min(1, { message: "Reason is required" })
+});
+
+const cutoverDateField = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, { message: "Cutover date is required" });
+
+/** The accounting cutover date the enable wizard works against. */
+export const activationCutoverValidator = z.object({
+  cutoverDate: cutoverDateField
+});
+
+/** The prior system's trial balance as of the day before the cutover. `lines`
+ *  is a JSON array of `{ accountId, debit, credit }` from the form's hidden
+ *  input; rows with neither a debit nor a credit are dropped. */
+export const openingTrialBalanceValidator = z.object({
+  cutoverDate: cutoverDateField,
+  lines: z.string().transform((val, ctx) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(val);
+    } catch {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid lines" });
+      return z.NEVER;
+    }
+    if (!Array.isArray(parsed)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid lines" });
+      return z.NEVER;
+    }
+    const result: Array<{ accountId: string; debit: number; credit: number }> =
+      [];
+    for (const row of parsed) {
+      const { accountId, debit, credit } = (row ?? {}) as {
+        accountId?: unknown;
+        debit?: unknown;
+        credit?: unknown;
+      };
+      if (typeof accountId !== "string" || accountId.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "A trial balance row is missing its account"
+        });
+        return z.NEVER;
+      }
+      const amounts = [debit ?? 0, credit ?? 0];
+      if (
+        amounts.some(
+          (amount) =>
+            typeof amount !== "number" || !Number.isFinite(amount) || amount < 0
+        )
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "A trial balance row has an invalid debit or credit"
+        });
+        return z.NEVER;
+      }
+      const [rowDebit, rowCredit] = amounts as [number, number];
+      if (rowDebit !== 0 || rowCredit !== 0) {
+        result.push({ accountId, debit: rowDebit, credit: rowCredit });
+      }
+    }
+    return result;
+  })
+});
+
+/** The prior system's trial balance as a CSV (`accountNumber, debit, credit`),
+ *  uploaded in the wizard. The route action parses it and maps the account
+ *  numbers to accounts. */
+export const openingTrialBalanceImportValidator = z.object({
+  cutoverDate: cutoverDateField,
+  csv: z.string().min(1, { message: "The CSV file is empty" })
+});
+
+/** Ignore an invoice on Migration Clearing, or stop ignoring it. */
+export const cutoverIgnoredInvoiceValidator = z.object({
+  cutoverDate: cutoverDateField,
+  invoiceId: z.string().min(1, { message: "Invoice is required" }),
+  ignored: z.enum(["true", "false"]).transform((value) => value === "true")
+});
+
+/** A trial balance step action that needs only the cutover date: apply
+ *  Carbon's totals, or pull the provider's trial balance. */
+export const cutoverStepValidator = z.object({
+  cutoverDate: cutoverDateField
+});
+
+/** The enable: the cutover date and the company name typed to confirm. */
+export const activateAccountingValidator = z.object({
+  cutoverDate: cutoverDateField,
+  confirmation: z
+    .string()
+    .trim()
+    .min(1, { message: "Type the company name to confirm" })
+});
+
+/** An asset's accumulated depreciation at the cutover, set in the wizard. */
+export const cutoverAccumulatedDepreciationValidator = z.object({
+  fixedAssetId: z.string().min(1, { message: "Asset is required" }),
+  accumulatedDepreciation: zfd.numeric(
+    z
+      .number()
+      .min(0, { message: "Accumulated depreciation must be zero or more" })
+  )
+});
+
+/** Journal source types that only their period run may reverse: a plain
+ *  reversal would leave the revenue schedule or the assets behind. */
+/** Business refusal threshold for a journal's debits-vs-credits drift — looser
+ *  than EPSILON because multi-currency entries carry real cross-rate residuals.
+ *  Shared by the manual-JE validator, the period-close checklist and the
+ *  journal entry form, so none of them disagrees about which journals are
+ *  unbalanced. */
+export const JOURNAL_BALANCE_TOLERANCE = 0.001;
+
+export const RUN_JOURNAL_SOURCES: Record<string, string> = {
+  "Revenue Recognition": "revenue recognition",
+  "Lease Run": "lease",
+  "Asset Depreciation": "depreciation"
+};

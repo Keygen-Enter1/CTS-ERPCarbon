@@ -1,0 +1,1 @@
+ALTER TABLE "nonConformanceActionTask" ADD COLUMN "externalId" JSON;

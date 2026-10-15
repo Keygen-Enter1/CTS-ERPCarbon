@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { assertIsPost, error, notFound } from "@carbon/auth";
+import { requirePermissions } from "@carbon/auth/auth.server";
+import { getCarbonServiceRole } from "@carbon/auth/client.server";
+import { flash } from "@carbon/auth/session.server";
+import {
+  dedupeViolations,
+  evaluateSalesRuleLines,
+  isBlocked,
+  resolveSalesInvoiceShipTo,
+  resolveSalesOrderShipTo
+} from "@carbon/ee/rules.server";
+import { validationError, validator } from "@carbon/form";
+import type { JSONContent } from "@carbon/react";
+import { RecordOutlet } from "@carbon/react";
+import { getItemReadableId, redirect, round } from "@carbon/utils";
+import { useLingui } from "@lingui/react/macro";
+import { Fragment } from "react/jsx-runtime";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useParams } from "react-router";
+import { DeferredFiles } from "~/components";
+import {
+  getSalesInvoice,
+  getSalesInvoiceLine,
+  isSalesInvoiceLocked,
+  salesInvoiceLineValidator,
+  upsertSalesInvoiceLine
+} from "~/modules/invoicing";
+import SalesInvoiceLineForm from "~/modules/invoicing/ui/SalesInvoice/SalesInvoiceLineForm";
+import { getOpportunityLineDocuments } from "~/modules/sales";
+import { recordSalesRuleOutcome } from "~/modules/sales/sales.server";
+import {
+  OpportunityLineDocuments,
+  OpportunityLineNotes
+} from "~/modules/sales/ui/Opportunity";
+import { useItems } from "~/stores";
+import { getCustomFields, setCustomFields } from "~/utils/form";
+import { requireUnlocked } from "~/utils/lockedGuard.server";
+import { path } from "~/utils/path";
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const { client, companyId } = await requirePermissions(request, {
+    view: "invoicing",
+    role: "employee"
+  });
+
+  const { lineId } = params;
+  if (!lineId) throw notFound("lineId not found");
+
+  const salesInvoiceLine = await getSalesInvoiceLine(client, lineId);
+
+  const itemId = salesInvoiceLine?.data?.itemId;
+
+  return {
+    salesInvoiceLine: salesInvoiceLine?.data ?? null,
+    files: getOpportunityLineDocuments(client, companyId, lineId, itemId)
+  };
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  assertIsPost(request);
+
+  const { invoiceId, lineId } = params;
+  if (!invoiceId) throw new Error("Could not find invoiceId");
+  if (!lineId) throw new Error("Could not find lineId");
+
+  // Check if SI is locked
+  const { client: viewClient } = await requirePermissions(request, {
+    view: "invoicing"
+  });
+
+  const invoice = await getSalesInvoice(viewClient, invoiceId);
+  if (invoice.error) {
+    throw redirect(
+      path.to.salesInvoiceLine(invoiceId, lineId),
+      await flash(request, error(invoice.error, "Failed to load sales invoice"))
+    );
+  }
+
+  await requireUnlocked({
+    request,
+    isLocked: isSalesInvoiceLocked(invoice.data?.status),
+    redirectTo: path.to.salesInvoiceLine(invoiceId, lineId),
+    message: "Cannot modify a locked sales invoice. Reopen it first."
+  });
+
+  const { client, companyId, userId } = await requirePermissions(request, {
+    create: "invoicing"
+  });
+
+  const formData = await request.formData();
+  const validation = await validator(salesInvoiceLineValidator).validate(
+    formData
+  );
+
+  if (validation.error) {
+    return validationError(validation.error);
+  }
+
+  // biome-ignore lint/correctness/noUnusedVariables: suppressed due to migration
+  const { id, ...d } = validation.data;
+
+  // The form types percent points; the column holds the 0–1 fraction.
+  if (d.discountPercent !== undefined) {
+    d.discountPercent = round(d.discountPercent / 100);
+  }
+
+  if (d.invoiceLineType === "Fixed Asset") {
+    d.accountId = undefined;
+    d.itemId = undefined;
+  } else {
+    d.accountId = undefined;
+    d.assetId = undefined;
+  }
+
+  // Sales-rule enforcement — only for lines that reference an item. A line
+  // converted from a sales order resolves its ship-to through that order
+  // (drop-ship included); a standalone line uses the invoice's own ship-to.
+  // None may be invented — the bill-to is a different address — so with no
+  // ship-to set a null location flows into the engine's required-field
+  // semantics and a destination rule blocks rather than passes.
+  let acknowledgedViolations: ReturnType<typeof dedupeViolations> = [];
+  let acknowledgedRuleNames: Record<string, string> = {};
+  if (d.itemId) {
+    const serviceRole = getCarbonServiceRole();
+    const acknowledged = formData.get("acknowledged") === "true";
+
+    const existingLine = await serviceRole
+      .from("salesInvoiceLine")
+      .select("salesOrderId")
+      .eq("id", lineId)
+      .eq("companyId", companyId)
+      .maybeSingle();
+    if (existingLine.error) {
+      // A failed read must not evaluate the wrong destination.
+      throw new Error(
+        `Sales rule evaluation could not load sales invoice line ${lineId}: ${existingLine.error.message}`
+      );
+    }
+
+    const shipTo = existingLine.data?.salesOrderId
+      ? await resolveSalesOrderShipTo(
+          serviceRole,
+          existingLine.data.salesOrderId,
+          companyId
+        )
+      : await resolveSalesInvoiceShipTo(serviceRole, invoiceId, companyId);
+
+    const { violations, ruleNames } = await evaluateSalesRuleLines({
+      client: serviceRole,
+      companyId,
+      userId,
+      surface: "salesInvoiceLine",
+      lines: [{ lineId, itemId: d.itemId, quantity: d.quantity ?? 1 }],
+      customerId: shipTo.customerId,
+      customerLocationId: shipTo.customerLocationId
+    });
+    const deduped = dedupeViolations(violations);
+    if (deduped.length > 0) {
+      if (isBlocked(deduped, acknowledged)) {
+        await recordSalesRuleOutcome(serviceRole, {
+          companyId,
+          userId,
+          documentType: "salesInvoice",
+          documentId: invoiceId,
+          documentLineId: lineId,
+          itemId: d.itemId ?? null,
+          outcome: "blocked",
+          violations: deduped,
+          ruleNames
+        });
+        return { error: null, data: null, violations: deduped, ruleNames };
+      }
+      acknowledgedViolations = deduped;
+      acknowledgedRuleNames = ruleNames;
+    }
+  }
+
+  const updateSalesInvoiceLine = await upsertSalesInvoiceLine(client, {
+    id: lineId,
+    ...d,
+    updatedBy: userId,
+    customFields: setCustomFields(formData)
+  });
+
+  if (updateSalesInvoiceLine.error) {
+    throw redirect(
+      path.to.salesInvoiceLine(invoiceId, lineId),
+      await flash(
+        request,
+        error(
+          updateSalesInvoiceLine.error,
+          "Failed to update sales invoice line"
+        )
+      )
+    );
+  }
+
+  // Acknowledged proceed: record only after the write committed — evidence
+  // (and its notification) must describe a change that actually landed.
+  if (acknowledgedViolations.length > 0) {
+    await recordSalesRuleOutcome(getCarbonServiceRole(), {
+      companyId,
+      userId,
+      documentType: "salesInvoice",
+      documentId: invoiceId,
+      documentLineId: lineId,
+      itemId: d.itemId ?? null,
+      outcome: "acknowledged",
+      violations: acknowledgedViolations,
+      ruleNames: acknowledgedRuleNames
+    });
+  }
+
+  throw redirect(path.to.salesInvoiceLine(invoiceId, lineId));
+}
+
+export default function EditSalesInvoiceLineRoute() {
+  const { t } = useLingui();
+  const { invoiceId, lineId } = useParams();
+  if (!invoiceId) throw notFound("invoiceId not found");
+  if (!lineId) throw notFound("lineId not found");
+
+  const { salesInvoiceLine, files } = useLoaderData<typeof loader>();
+
+  const initialValues = {
+    id: salesInvoiceLine?.id ?? undefined,
+    invoiceId: salesInvoiceLine?.invoiceId ?? "",
+    invoiceLineType: (salesInvoiceLine?.invoiceLineType ?? "Part") as "Part",
+    methodType: (salesInvoiceLine?.methodType ??
+      "Pull from Inventory") as "Pull from Inventory",
+    itemId: salesInvoiceLine?.itemId ?? "",
+    accountId: salesInvoiceLine?.accountId ?? "",
+    addOnCost: salesInvoiceLine?.addOnCost ?? 0,
+    nonTaxableAddOnCost: salesInvoiceLine?.nonTaxableAddOnCost ?? 0,
+    assetId: salesInvoiceLine?.assetId ?? "",
+    description: salesInvoiceLine?.description ?? "",
+    quantity: salesInvoiceLine?.quantity ?? 1,
+    unitPrice: salesInvoiceLine?.unitPrice ?? 0,
+    discountPercent: round((salesInvoiceLine?.discountPercent ?? 0) * 100),
+    shippingCost: salesInvoiceLine?.shippingCost ?? 0,
+    taxPercent: salesInvoiceLine?.taxPercent ?? 0,
+    exchangeRate: salesInvoiceLine?.exchangeRate ?? 1,
+    unitOfMeasureCode: salesInvoiceLine?.unitOfMeasureCode ?? "",
+    storageUnitId: salesInvoiceLine?.storageUnitId ?? "",
+    serviceStartDate: salesInvoiceLine?.serviceStartDate ?? "",
+    serviceEndDate: salesInvoiceLine?.serviceEndDate ?? "",
+    assetReadableId: (salesInvoiceLine as any)?.assetReadableId ?? undefined,
+    assetName: (salesInvoiceLine as any)?.assetName ?? undefined,
+    ...getCustomFields(salesInvoiceLine?.customFields)
+  };
+
+  const [items] = useItems();
+
+  return (
+    <Fragment key={salesInvoiceLine?.id}>
+      <SalesInvoiceLineForm
+        key={initialValues.id}
+        initialValues={initialValues}
+        isSalesOrderLine={salesInvoiceLine?.salesOrderLineId !== undefined}
+      />
+      <OpportunityLineNotes
+        id={salesInvoiceLine?.id ?? ""}
+        table="salesInvoiceLine"
+        title={t`Notes`}
+        subTitle={getItemReadableId(items, salesInvoiceLine?.itemId) ?? ""}
+        internalNotes={salesInvoiceLine?.internalNotes as JSONContent}
+      />
+
+      <DeferredFiles resolve={files}>
+        {(resolvedFiles) => (
+          <OpportunityLineDocuments
+            files={resolvedFiles ?? []}
+            id={invoiceId}
+            lineId={lineId}
+            itemId={salesInvoiceLine?.itemId}
+            type="Sales Invoice"
+          />
+        )}
+      </DeferredFiles>
+
+      <RecordOutlet />
+    </Fragment>
+  );
+}

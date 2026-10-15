@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import type { IconType } from "react-icons";
+import {
+  LuBlocks,
+  LuClipboardCheck,
+  LuFactory,
+  LuForklift,
+  LuPackageCheck,
+  LuPackageMinus,
+  LuPackageOpen,
+  LuPackagePlus,
+  LuPackageX,
+  LuPause,
+  LuRotateCw,
+  LuShoppingCart,
+  LuTruck,
+  LuWrench
+} from "react-icons/lu";
+
+export type EntityStatus =
+  | "Available"
+  | "Reserved"
+  | "On Hold"
+  | "Rejected"
+  | "Consumed";
+
+export type EntityStatusMeta = {
+  color: string;
+  icon: IconType;
+  label: string;
+};
+
+export const ENTITY_STATUS_META: Record<EntityStatus, EntityStatusMeta> = {
+  Available: {
+    color: "hsl(142 71% 45%)",
+    icon: LuPackageCheck,
+    label: "Available"
+  },
+  Reserved: {
+    color: "hsl(220 9% 46%)",
+    icon: LuPackageOpen,
+    label: "Reserved"
+  },
+  "On Hold": { color: "hsl(25 95% 53%)", icon: LuPause, label: "On Hold" },
+  Rejected: { color: "hsl(0 84% 60%)", icon: LuPackageX, label: "Rejected" },
+  Consumed: {
+    color: "hsl(217 91% 60%)",
+    icon: LuPackageMinus,
+    label: "Consumed"
+  }
+};
+
+export const DEFAULT_ENTITY_STATUS: EntityStatus = "Consumed";
+
+export function entityStatusMeta(
+  status: string | null | undefined
+): EntityStatusMeta {
+  return (
+    ENTITY_STATUS_META[(status ?? DEFAULT_ENTITY_STATUS) as EntityStatus] ??
+    ENTITY_STATUS_META[DEFAULT_ENTITY_STATUS]
+  );
+}
+
+export type ActivityKind =
+  | "Receipt"
+  | "Manufacturing"
+  | "Assembly"
+  | "Shipment"
+  | "Pick"
+  | "Transfer"
+  | "Rework"
+  | "Inspection"
+  | "Other";
+
+export type ActivityKindMeta = {
+  label: string;
+  color: string;
+  icon: IconType;
+};
+
+export const ACTIVITY_KIND_META: Record<ActivityKind, ActivityKindMeta> = {
+  Receipt: { label: "Receipt", color: "hsl(173 80% 40%)", icon: LuPackagePlus },
+  Manufacturing: {
+    label: "Manufacturing",
+    color: "hsl(280 65% 60%)",
+    icon: LuFactory
+  },
+  Assembly: { label: "Assembly", color: "hsl(265 70% 65%)", icon: LuWrench },
+  Shipment: { label: "Shipment", color: "hsl(20 90% 55%)", icon: LuTruck },
+  // Same blue as Transfer: both are moves, the icon carries the distinction.
+  Pick: { label: "Pick", color: "hsl(200 80% 55%)", icon: LuShoppingCart },
+  Transfer: { label: "Transfer", color: "hsl(200 80% 55%)", icon: LuForklift },
+  Rework: { label: "Rework", color: "hsl(45 95% 55%)", icon: LuRotateCw },
+  Inspection: {
+    label: "Inspection",
+    color: "hsl(330 70% 60%)",
+    icon: LuClipboardCheck
+  },
+  Other: { label: "Other", color: "hsl(280 65% 60%)", icon: LuBlocks }
+};
+
+export function activityKindFor(type: string | undefined | null): ActivityKind {
+  if (!type) return "Other";
+  const t = type.toLowerCase();
+  if (t.includes("receipt") || t.includes("receive")) return "Receipt";
+  if (t.includes("ship")) return "Shipment";
+  // Its own kind so picks and transfers don't render identically, but still a
+  // movement — see isMovementActivity.
+  if (t.includes("pick")) return "Pick";
+  if (t.includes("transfer")) return "Transfer";
+  if (t.includes("rework")) return "Rework";
+  if (t.includes("inspect") || t.includes("qc") || t.includes("quality"))
+    return "Inspection";
+  if (t.includes("assembly") || t.includes("assemble")) return "Assembly";
+  if (t.includes("manufactur") || t.includes("mfg") || t.includes("production"))
+    return "Manufacturing";
+  return "Other";
+}
+
+// A move relocates an entity without transforming it — same id, still Available.
+// Such activities record only an input, so they read as a consumption unless
+// callers distinguish them. Shipments don't qualify: those really do consume.
+export function isMovementActivity(type: string | null | undefined): boolean {
+  const kind = activityKindFor(type);
+  return kind === "Transfer" || kind === "Pick";
+}

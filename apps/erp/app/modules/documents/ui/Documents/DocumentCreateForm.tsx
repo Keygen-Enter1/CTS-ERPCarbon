@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import { useCarbon } from "@carbon/auth";
+import { getCompanyPrivateBucket, storage } from "@carbon/files";
+import { convertHeicToJpeg, isHeic } from "@carbon/files/media";
+import { getLogger } from "@carbon/logger";
+import { File, toast, useViewport } from "@carbon/react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { nanoid } from "nanoid";
+import type { ChangeEvent } from "react";
+import { LuPlus, LuUpload } from "react-icons/lu";
+import { useSubmit } from "react-router";
+import { AppBarAction } from "~/components/New";
+import { useUser } from "~/hooks";
+import { path } from "~/utils/path";
+
+const logger = getLogger("erp", "documentcreateform");
+
+const DocumentCreateForm = () => {
+  const { t } = useLingui();
+  const { isPhone } = useViewport();
+  const submit = useSubmit();
+  const { carbon } = useCarbon();
+  const {
+    company: { id: companyId }
+  } = useUser();
+
+  const uploadFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && carbon) {
+      let file = e.target.files[0];
+      toast.info(t`Uploading ${file.name}`);
+
+      if (isHeic(file.name, file.type)) {
+        try {
+          file = await convertHeicToJpeg(carbon, {
+            bucket: getCompanyPrivateBucket(companyId),
+            directory: `${companyId}/tmp`,
+            file
+          });
+        } catch {
+          toast.error(t`Failed to convert image`);
+          return;
+        }
+      }
+
+      const fileExtension = file.name.substring(file.name.lastIndexOf(".") + 1);
+      const fileName = `${companyId}/${nanoid()}.${fileExtension}`;
+
+      const fileUpload = await storage(carbon)
+        .company(companyId)
+        .upload(fileName, file, {
+          cacheControl: `${12 * 60 * 60}`,
+          upsert: true
+        });
+
+      if (fileUpload.error) {
+        logger.error(fileUpload.error);
+        toast.error(t`Failed to upload file`);
+      }
+
+      if (fileUpload.data?.path) {
+        submitFileData({
+          path: fileUpload.data.path,
+          name: file.name,
+          size: file.size
+        });
+      }
+    }
+  };
+
+  const submitFileData = ({
+    path: filePath,
+    name,
+    size
+  }: {
+    path: string;
+    name: string;
+    size: number;
+  }) => {
+    const formData = new FormData();
+    formData.append("path", filePath);
+    formData.append("name", name);
+    formData.append("size", Math.round(size / 1024).toString());
+    submit(formData, {
+      method: "post",
+      action: path.to.newDocument,
+      navigate: false
+    });
+  };
+
+  // Phones: a "+" in the app bar, like New on every other list.
+  if (isPhone) {
+    return (
+      <AppBarAction>
+        <File
+          isIcon
+          variant="ghost"
+          size="lg"
+          aria-label={t`Upload`}
+          onChange={uploadFile}
+        >
+          <LuPlus className="size-6" />
+        </File>
+      </AppBarAction>
+    );
+  }
+
+  return (
+    <File leftIcon={<LuUpload />} onChange={uploadFile}>
+      <Trans>Upload</Trans>
+    </File>
+  );
+};
+
+export default DocumentCreateForm;

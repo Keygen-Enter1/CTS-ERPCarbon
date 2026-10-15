@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Carbon (github.com/crbnos/carbon). Modified or adapted versions of this file,
+// including ports, remain AGPLv3; serving them over a network requires releasing their source.
+
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Button,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuIcon,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  HStack,
+  IconButton,
+  MENU_ITEM_SHORTCUTS,
+  PrefetchLink,
+  useDisclosure,
+  VStack
+} from "@carbon/react";
+import { distinctItemText, getItemReadableId } from "@carbon/utils";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useState } from "react";
+import {
+  LuCirclePlus,
+  LuEllipsisVertical,
+  LuSettings2,
+  LuTrash
+} from "react-icons/lu";
+import { Link, useParams } from "react-router";
+import { Empty, ItemThumbnail, MethodItemTypeIcon } from "~/components";
+import type { DragHandleBindings } from "~/components/LineReorder";
+import {
+  ReorderableLineList,
+  ReorderableRow,
+  ReorderEditBar,
+  useLineOrderEditMode
+} from "~/components/LineReorder";
+import {
+  useOptimisticLocation,
+  usePermissions,
+  useRouteData,
+  useUser
+} from "~/hooks";
+import { getLinkToItemDetails } from "~/modules/items/ui/Item/ItemForm";
+import type { Supplier } from "~/modules/purchasing/types";
+import type { ItemType } from "~/modules/shared";
+import { itemType } from "~/modules/shared";
+import { EXPLORER_SHORTCUTS } from "~/shortcuts";
+import { useItems } from "~/stores";
+import { path } from "~/utils/path";
+import type { PurchaseInvoice, PurchaseInvoiceLine } from "../../types";
+import DeletePurchaseInvoiceLine from "./DeletePurchaseInvoiceLine";
+import MapExtractedInvoiceLinesModal from "./MapExtractedInvoiceLinesModal";
+import PurchaseInvoiceLineForm from "./PurchaseInvoiceLineForm";
+
+export default function PurchaseInvoiceExplorer() {
+  const { defaults } = useUser();
+  const { invoiceId } = useParams();
+  if (!invoiceId) throw new Error("Could not find invoiceId");
+  const purchaseInvoiceData = useRouteData<{
+    purchaseInvoice: PurchaseInvoice;
+    purchaseInvoiceLines: PurchaseInvoiceLine[];
+    supplier: Supplier;
+  }>(path.to.purchaseInvoice(invoiceId));
+  const permissions = usePermissions();
+
+  const purchaseInvoiceLineInitialValues = {
+    invoiceId: invoiceId,
+    // "Item" is the picker's generic mode, not a member of the line-type
+    // enum; posting it failed validation with "Type is required".
+    invoiceLineType: "Part" as ItemType,
+    purchaseQuantity: 1,
+    locationId:
+      purchaseInvoiceData?.purchaseInvoice?.locationId ??
+      defaults.locationId ??
+      "",
+    supplierUnitPrice: 0,
+    supplierShippingCost: 0,
+    supplierTaxAmount: 0,
+    taxPercent: 0,
+    exchangeRate: purchaseInvoiceData?.purchaseInvoice?.exchangeRate ?? 1
+  };
+
+  const newPurchaseInvoiceLineDisclosure = useDisclosure();
+  const deleteLineDisclosure = useDisclosure();
+  const mapLinesDisclosure = useDisclosure();
+  const [deleteLine, setDeleteLine] = useState<PurchaseInvoiceLine | null>(
+    null
+  );
+  const isDisabled = purchaseInvoiceData?.purchaseInvoice?.status !== "Draft";
+
+  const onDeleteLine = (line: PurchaseInvoiceLine) => {
+    setDeleteLine(line);
+    deleteLineDisclosure.onOpen();
+  };
+
+  const onDeleteCancel = () => {
+    setDeleteLine(null);
+    deleteLineDisclosure.onClose();
+  };
+
+  const lines = purchaseInvoiceData?.purchaseInvoiceLines ?? [];
+  const unmappedLines = lines.filter(
+    (line) => !line.itemId && line.invoiceLineType === "Comment"
+  );
+  const canReorder =
+    !isDisabled && permissions.can("update", "invoicing") && lines.length > 1;
+
+  const editMode = useLineOrderEditMode<PurchaseInvoiceLine>({
+    actionPath: path.to.purchaseInvoiceLineOrder(invoiceId),
+    lines
+  });
+
+  return (
+    <>
+      <VStack className="w-full h-[calc(100dvh-var(--topbar-height)-var(--header-height)-var(--content-inset))] justify-between">
+        <VStack
+          className="flex-1 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-accent"
+          spacing={0}
+        >
+          {unmappedLines.length > 0 && !editMode.isEditing && (
+            <div className="p-2 border-b">
+              <Alert variant="warning">
+                <AlertTitle>
+                  <Trans>Unmapped Extracted Lines</Trans>
+                </AlertTitle>
+                <AlertDescription className="mt-1">
+                  <Trans>
+                    You have {unmappedLines.length} lines extracted from a PDF
+                    that are not mapped to any inventory items.
+                  </Trans>
+                  <div className="mt-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={mapLinesDisclosure.onOpen}
+                    >
+                      <Trans>Map Lines Now</Trans>
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
+            </div>
+          )}
+          {lines.length > 0 ? (
+            editMode.isEditing ? (
+              <ReorderableLineList<PurchaseInvoiceLine>
+                lines={editMode.draft}
+                activeLine={editMode.activeLine}
+                onDragStart={editMode.handleDragStart}
+                onDragEnd={editMode.handleDragEnd}
+                renderRow={(line, dragHandle) => (
+                  <PurchaseInvoiceLineBody
+                    line={line}
+                    dragHandle={dragHandle}
+                  />
+                )}
+                renderOverlay={(line) => (
+                  <PurchaseInvoiceLineBody line={line} isOverlay />
+                )}
+              />
+            ) : (
+              lines.map((line) => (
+                <PurchaseInvoiceLineItem
+                  key={line.id}
+                  isDisabled={isDisabled}
+                  line={line}
+                  onDelete={onDeleteLine}
+                />
+              ))
+            )
+          ) : (
+            <Empty>
+              {permissions.can("update", "sales") && (
+                <Button
+                  isDisabled={isDisabled}
+                  leftIcon={<LuCirclePlus />}
+                  variant="secondary"
+                  onClick={newPurchaseInvoiceLineDisclosure.onOpen}
+                >
+                  <Trans>Add Line Item</Trans>
+                </Button>
+              )}
+            </Empty>
+          )}
+        </VStack>
+        <div className="w-full flex border-t border-border p-4 gap-2">
+          {editMode.isEditing ? (
+            <ReorderEditBar
+              isSaving={editMode.isSaving}
+              isDirty={editMode.isDirty}
+              onSave={editMode.save}
+              onCancel={editMode.cancelEditMode}
+            />
+          ) : (
+            <>
+              <Button
+                className="flex-1"
+                shortcut={EXPLORER_SHORTCUTS.addLine}
+                isDisabled={isDisabled || !permissions.can("update", "sales")}
+                leftIcon={<LuCirclePlus />}
+                variant="secondary"
+                onClick={newPurchaseInvoiceLineDisclosure.onOpen}
+              >
+                <Trans>Add Line Item</Trans>
+              </Button>
+              {canReorder && lines.length > 0 && (
+                <IconButton
+                  aria-label="Reorder lines"
+                  icon={<LuSettings2 />}
+                  variant="ghost"
+                  className="text-muted-foreground"
+                  onClick={editMode.enterEditMode}
+                />
+              )}
+            </>
+          )}
+        </div>
+      </VStack>
+      {newPurchaseInvoiceLineDisclosure.isOpen && (
+        <PurchaseInvoiceLineForm
+          initialValues={purchaseInvoiceLineInitialValues}
+          type="modal"
+          onClose={newPurchaseInvoiceLineDisclosure.onClose}
+        />
+      )}
+      {deleteLineDisclosure.isOpen && (
+        <DeletePurchaseInvoiceLine
+          line={deleteLine!}
+          onCancel={onDeleteCancel}
+        />
+      )}
+      {mapLinesDisclosure.isOpen && (
+        <MapExtractedInvoiceLinesModal
+          invoiceId={invoiceId}
+          supplierId={
+            purchaseInvoiceData?.purchaseInvoice?.supplierId ?? undefined
+          }
+          onClose={mapLinesDisclosure.onClose}
+        />
+      )}
+    </>
+  );
+}
+
+function PurchaseInvoiceLineBody({
+  line,
+  dragHandle,
+  isOverlay
+}: {
+  line: PurchaseInvoiceLine;
+  dragHandle?: DragHandleBindings;
+  isOverlay?: boolean;
+}) {
+  const [items] = useItems();
+  const subtitle =
+    line.invoiceLineType === "G/L Account"
+      ? "G/L Account"
+      : line.invoiceLineType === "Lease"
+        ? line.description
+        : distinctItemText(
+            getItemReadableId(items, line.itemId),
+            line.description
+          );
+  return (
+    <ReorderableRow dragHandle={dragHandle} isOverlay={isOverlay}>
+      <HStack spacing={2} className="flex-grow min-w-0 p-2 pr-10">
+        <ItemThumbnail thumbnailPath={line.thumbnailPath} type="Part" />
+        <VStack spacing={0} className="min-w-0">
+          <span className="font-semibold line-clamp-1">
+            {line.invoiceLineType === "G/L Account"
+              ? line.description || "Indirect Expense"
+              : line.invoiceLineType === "Lease"
+                ? line.leaseReadableId || "Lease"
+                : getItemReadableId(items, line.itemId)}
+          </span>
+          {subtitle && (
+            <span className="text-muted-foreground text-xs truncate line-clamp-1">
+              {subtitle}
+            </span>
+          )}
+        </VStack>
+      </HStack>
+    </ReorderableRow>
+  );
+}
+
+type PurchaseInvoiceLineItemProps = {
+  line: PurchaseInvoiceLine;
+  isDisabled: boolean;
+  onDelete: (line: PurchaseInvoiceLine) => void;
+};
+
+function PurchaseInvoiceLineItem({
+  line,
+  isDisabled,
+  onDelete
+}: PurchaseInvoiceLineItemProps) {
+  const { t } = useLingui();
+  const { invoiceId } = useParams();
+  if (!invoiceId) throw new Error("Could not find invoiceId");
+  const permissions = usePermissions();
+  const location = useOptimisticLocation();
+  const [items] = useItems();
+
+  const isSelected =
+    location.pathname === path.to.purchaseInvoiceLine(invoiceId, line.id!);
+
+  const subtitle =
+    line.invoiceLineType === "G/L Account"
+      ? "G/L Account"
+      : line.invoiceLineType === "Fixed Asset"
+        ? line.assetName || line.description
+        : line.invoiceLineType === "Lease"
+          ? line.description
+          : distinctItemText(
+              getItemReadableId(items, line.itemId),
+              line.description
+            );
+
+  return (
+    <VStack spacing={0} className="border-b">
+      <PrefetchLink
+        to={path.to.purchaseInvoiceLine(invoiceId, line.id!)}
+        className="w-full"
+      >
+        <HStack
+          className={cn(
+            "group w-full p-2 items-center hover:bg-accent/30 cursor-pointer relative",
+            isSelected && "bg-accent/60 hover:bg-accent/50"
+          )}
+        >
+          <HStack spacing={2} className="flex-grow min-w-0 pr-10">
+            <ItemThumbnail thumbnailPath={line.thumbnailPath} type="Part" />
+            <VStack spacing={0} className="min-w-0">
+              <span className="font-semibold line-clamp-1">
+                {line.invoiceLineType === "G/L Account"
+                  ? line.description || "G/L Account"
+                  : line.invoiceLineType === "Fixed Asset"
+                    ? (line as any).assetReadableId || "Fixed Asset"
+                    : line.invoiceLineType === "Lease"
+                      ? line.leaseReadableId || "Lease"
+                      : getItemReadableId(items, line.itemId)}
+              </span>
+              {subtitle && (
+                <span className="text-muted-foreground text-xs truncate line-clamp-1">
+                  {subtitle}
+                </span>
+              )}
+            </VStack>
+          </HStack>
+          <div className="absolute right-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  aria-label={t`More`}
+                  className="md:opacity-0 group-hover:opacity-100 group-active:opacity-100 data-[state=open]:opacity-100"
+                  icon={<LuEllipsisVertical />}
+                  variant="solid"
+                  onClick={(e) => e.stopPropagation()}
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem
+                  shortcut={MENU_ITEM_SHORTCUTS.delete}
+                  destructive
+                  disabled={isDisabled || !permissions.can("update", "sales")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(line);
+                  }}
+                >
+                  <DropdownMenuIcon icon={<LuTrash />} />
+                  <Trans>Delete Line</Trans>
+                </DropdownMenuItem>
+                {/* @ts-expect-error */}
+                {itemType.includes(line.invoiceLineType ?? "") && (
+                  <DropdownMenuItem
+                    shortcut={MENU_ITEM_SHORTCUTS.view}
+                    asChild
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Link
+                      to={getLinkToItemDetails(
+                        line.invoiceLineType as ItemType,
+                        line.itemId!
+                      )}
+                    >
+                      <DropdownMenuIcon
+                        icon={<MethodItemTypeIcon type={"Part"} />}
+                      />
+                      <Trans>View Item Master</Trans>
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </HStack>
+      </PrefetchLink>
+    </VStack>
+  );
+}
