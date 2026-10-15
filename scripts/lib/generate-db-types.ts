@@ -122,8 +122,11 @@ export function generateDatabaseTypes(databaseUrl: string | undefined): void {
     try {
       // File-backed stdout avoids truncating large schemas or a maxBuffer cap.
       // Do not inherit stderr: CLI failures can echo the credential-bearing URL.
+      const repoRoot = resolve(".");
+      const isWin = process.platform === "win32";
+      const binDir = join(repoRoot, "node_modules", ".bin");
       const result = spawnSync(
-        "supabase",
+        isWin ? "supabase.cmd" : "supabase",
         [
           "gen",
           "types",
@@ -137,7 +140,19 @@ export function generateDatabaseTypes(databaseUrl: string | undefined): void {
           "--schema",
           "graphql_public"
         ],
-        { stdio: ["ignore", out, "pipe"] }
+        {
+          stdio: ["ignore", out, "pipe"],
+          cwd: repoRoot,
+          ...(isWin
+            ? {
+                shell: true,
+                env: {
+                  ...process.env,
+                  PATH: `${binDir};${process.env.PATH ?? ""}`
+                }
+              }
+            : {})
+        }
       );
       if (result.error || result.status !== 0) {
         const status =

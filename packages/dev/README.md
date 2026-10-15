@@ -34,7 +34,7 @@ source ./setup.sh   # adds crbn to PATH + installs shell wrapper
 |---|---|
 | `crbn up` | Boot compose stack + apps. Picker includes opt-in apps: Assembler, Email previews (react-email server for every email template at `email.<branch>.dev`), Studio (the Supabase dashboard at `studio.<branch>.dev`, with the Postgres-Meta it reads through). |
 | `crbn up --all` | Launch all apps without the picker (ERP, MES, email previews, Studio; assembler when its OCCT build exists). |
-| `crbn up --no-portless` | Localhost mode: fixed ports (API `:54321`, ERP `:3000`, MES `:3001`). |
+| `crbn up --no-portless` | Localhost mode: fixed 30xxx ports (ERP `:30000`, MES `:30001`, API `:30003`, …). |
 | `crbn up --borrow` | Reuse another worktree's running containers (DB, API, etc). |
 | `crbn up --no-apps` | Services only (postgres, kong, supabase, inngest, mail). |
 | `crbn up --full` | Also start Studio, Postgres-Meta, the edge runtime and imgproxy (HEIC conversion). They are off by default; `crbn reload studio` or `crbn reload imgproxy` starts one on a running stack. |
@@ -61,15 +61,21 @@ are dropped silently. Shell-level only; it is not read from `.env.local`.
 
 ## Portless vs Localhost
 
-By default, `crbn up` uses [portless](https://github.com/nicholasgasior/portless) for `.dev` TLS URLs (e.g. `https://erp.dev.dev`). Pass `--no-portless` (or set `CARBON_PORTLESS=0`) for localhost mode with fixed ports:
+By default, `crbn up` uses [portless](https://github.com/nicholasgasior/portless) for `.dev` TLS URLs (e.g. `https://erp.dev.dev`). Pass `--no-portless` (or set `CARBON_PORTLESS=0`) for localhost mode with fixed 5-digit ports in the `30xxx` range:
 
 | Service | Port |
 |---|---|
-| Supabase API (Kong) | `54321` |
-| ERP | `3000` |
-| MES | `3001` |
+| ERP | `30000` |
+| MES | `30001` |
+| Postgres (host) | `30002` |
+| Supabase API (Kong) | `30003` |
+| Studio | `30004` |
+| Inbucket (mail) | `30005` |
+| Inngest | `30006` |
+| Assembler | `30007` |
+| Email previews | `30008` |
 
-OAuth redirect URIs in localhost mode use `http://localhost:54321/auth/v1/callback`.
+OAuth redirect URIs in localhost mode use `http://localhost:30003/auth/v1/callback`.
 
 `pnpm dev` defaults to `crbn up --no-portless`.
 

@@ -73,16 +73,19 @@ import {
 } from "../services/portless.js";
 import { progress, summaryLines, tasks } from "../ui.js";
 import {
+  applyLocalhostPinnedPorts,
   ensureSlugAvailable,
   getSlot,
   getWorktreeRoot,
   type JwtCreds,
+  LOCALHOST_PINNED_PORTS,
   type PortMap,
   persistSlug,
   projectName,
   resolveSlot,
   resolveSlug,
-  SHARED_REDIS_PORT
+  SHARED_REDIS_PORT,
+  saveSlotPorts
 } from "../worktree.js";
 import { syncStaleCopyFiles } from "./copy.js";
 import { down } from "./down.js";
@@ -482,12 +485,15 @@ async function provisionSlot(
         // Always resolve own slot so PORT_ERP/PORT_MES are claimed for this
         // worktree and won't collide with the borrowed stack's running dev servers.
         const ownSlot = await resolveSlot(slug, root);
-        // Pin well-known ports in localhost mode so URLs are predictable and
-        // OAuth redirect URIs can be registered once in Google/Azure console.
-        if (!portless && !borrowedEntry) {
-          ownSlot.ports.PORT_API = 54321;
-          ownSlot.ports.PORT_ERP = 3000;
-          ownSlot.ports.PORT_MES = 3001;
+        // Pin well-known 30xxx ports in localhost mode so URLs stay predictable
+        // and clear of other local apps (3000/54321 defaults).
+        if (!portless) {
+          ownSlot.ports.PORT_ERP = LOCALHOST_PINNED_PORTS.PORT_ERP;
+          ownSlot.ports.PORT_MES = LOCALHOST_PINNED_PORTS.PORT_MES;
+          if (!borrowedEntry) {
+            applyLocalhostPinnedPorts(ownSlot.ports);
+          }
+          saveSlotPorts(slug, root, ownSlot.ports);
         }
         const slot = borrowedEntry
           ? {

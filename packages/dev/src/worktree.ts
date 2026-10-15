@@ -39,6 +39,42 @@ const OPTIONAL_PORT_NAMES: readonly PortName[] = ["PORT_EMAIL"];
 
 export type PortMap = Record<PortName, number>;
 export type JwtCreds = { secret: string; anonKey: string; serviceKey: string };
+
+/** Localhost mode (`--no-portless`): fixed 5-digit ports in the 30xxx range. */
+export const LOCALHOST_PINNED_PORTS: PortMap = {
+  PORT_ERP: 30000,
+  PORT_MES: 30001,
+  PORT_DB: 30002,
+  PORT_API: 30003,
+  PORT_STUDIO: 30004,
+  PORT_INBUCKET: 30005,
+  PORT_INNGEST: 30006,
+  PORT_ASSEMBLER: 30007,
+  PORT_EMAIL: 30008
+};
+
+export function applyLocalhostPinnedPorts(ports: PortMap): void {
+  Object.assign(ports, LOCALHOST_PINNED_PORTS);
+}
+
+/** Persist port overrides (e.g. localhost pins) into the slot registry. */
+export function saveSlotPorts(
+  slug: string,
+  worktreeRoot: string,
+  ports: PortMap
+): void {
+  const unlock = lockRegistry();
+  try {
+    const registry = readRegistry();
+    const entry = registry[slug];
+    if (entry && sameWorktreePath(entry.worktreeRoot, worktreeRoot)) {
+      entry.ports = { ...ports };
+      writeRegistry(registry);
+    }
+  } finally {
+    unlock();
+  }
+}
 type RegistryEntry = {
   worktreeRoot: string;
   ports: PortMap;
