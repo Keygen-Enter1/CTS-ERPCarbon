@@ -38,11 +38,12 @@ cd /opt/carbon/contrib/deploying/vps-compose-prebuilt
 cp environments/smartsite/env.template .env
 # Edit .env: CARBON_REPO=/opt/carbon, CARBON_IMAGE_* from build output
 
-./init-secrets.sh
+bash ./init-secrets.sh
 # Edit secrets/smtp_password; set real SMTP in .env if using email auth
 
 chmod +x environments/smartsite/deploy-smartsite.sh init-secrets.sh
-./environments/smartsite/deploy-smartsite.sh
+bash ./environments/smartsite/deploy-smartsite.sh
+# (Do not use `sh script.sh` — use bash or ./script after chmod +x)
 ```
 
 ## 3. Nginx (or existing edge proxy)

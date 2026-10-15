@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Create ./secrets/* for Docker Compose (first-time VPS setup).
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SECRETS="$HERE/secrets"
@@ -16,7 +19,7 @@ if [ ! -f "$SECRETS/postgres_password" ]; then
 fi
 
 if [ ! -f "$SECRETS/jwt_secret" ]; then
-  "$GEN" >"$HERE/.supabase-keys.tmp"
+  bash "$GEN" >"$HERE/.supabase-keys.tmp"
   # shellcheck disable=SC1091
   . "$HERE/.supabase-keys.tmp"
   rm -f "$HERE/.supabase-keys.tmp"

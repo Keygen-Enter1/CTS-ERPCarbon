@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # SmartSite prod: pull images, start stack on 30xxx ports, run migrations (no Carbon Caddy).
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"

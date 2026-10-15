@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # VPS: pull prebuilt images and run the stack (no docker build).
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
