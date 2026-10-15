@@ -12,20 +12,33 @@ mkdir -p "$SECRETS"
 
 rand() { openssl rand -hex 32; }
 
+secret_nonempty() {
+  [ -s "$1" ] 2>/dev/null
+}
+
+mint_jwt_trio() {
+  bash "$GEN" >"$HERE/.supabase-keys.tmp"
+  # shellcheck disable=SC1091
+  . "$HERE/.supabase-keys.tmp"
+  rm -f "$HERE/.supabase-keys.tmp"
+  [ -n "${SUPABASE_JWT_SECRET:-}" ] || {
+    echo "gen-supabase-keys.sh did not produce SUPABASE_JWT_SECRET" >&2
+    exit 1
+  }
+  printf '%s' "$SUPABASE_JWT_SECRET" >"$SECRETS/jwt_secret"
+  printf '%s' "$SUPABASE_ANON_KEY" >"$SECRETS/anon_key"
+  printf '%s' "$SUPABASE_SERVICE_ROLE_KEY" >"$SECRETS/service_role_key"
+}
+
 if [ ! -f "$SECRETS/postgres_password" ]; then
   pw="$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)"
   printf '%s' "$pw" >"$SECRETS/postgres_password"
   printf 'postgres://authenticator:%s@postgres:5432/postgres' "$pw" >"$SECRETS/postgrest_db_uri"
 fi
 
-if [ ! -f "$SECRETS/jwt_secret" ]; then
-  bash "$GEN" >"$HERE/.supabase-keys.tmp"
-  # shellcheck disable=SC1091
-  . "$HERE/.supabase-keys.tmp"
-  rm -f "$HERE/.supabase-keys.tmp"
-  printf '%s' "$SUPABASE_JWT_SECRET" >"$SECRETS/jwt_secret"
-  printf '%s' "$SUPABASE_ANON_KEY" >"$SECRETS/anon_key"
-  printf '%s' "$SUPABASE_SERVICE_ROLE_KEY" >"$SECRETS/service_role_key"
+if ! secret_nonempty "$SECRETS/jwt_secret"; then
+  mint_jwt_trio
+  echo "Minted jwt_secret + anon_key + service_role_key (matched set)"
 fi
 
 for name in session_secret inngest_signing_key inngest_event_key; do
