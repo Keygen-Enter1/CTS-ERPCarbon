@@ -20,6 +20,19 @@ Create **A** (or AAAA) records → IP VPS:
 - `mescarbon.smartsite.vn`
 - `apicarbon.smartsite.vn`
 
+## Build on the VPS (no tar, no registry)
+
+From a full git checkout on the server (~8 GB RAM for ERP build):
+
+```bash
+cd contrib/deploying/vps-compose-prebuilt
+cp environments/smartsite/env.template .env   # set CARBON_REPO
+bash ./init-secrets.sh
+TAG=smartsite-1 bash ./build-on-server.sh
+# paste CARBON_IMAGE_* into .env
+bash ./environments/smartsite/deploy-smartsite.sh
+```
+
 ## 1. Local — build & push images
 
 ```powershell
