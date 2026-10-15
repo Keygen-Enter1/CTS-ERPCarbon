@@ -31,6 +31,13 @@ set +a
   exit 1
 }
 
+SHIM="$CARBON_REPO/contrib/deploying/simple-docker-caddy/bin/secrets-entrypoint.sh"
+if [ ! -f "$SHIM" ]; then
+  echo "Missing secrets entrypoint: $SHIM" >&2
+  exit 1
+fi
+chmod +x "$SHIM"
+
 # Images from build-on-server.sh use tags like carbon/erp:tag — not on Docker Hub.
 should_pull() {
   [ "${SKIP_PULL:-0}" = "1" ] && return 1
