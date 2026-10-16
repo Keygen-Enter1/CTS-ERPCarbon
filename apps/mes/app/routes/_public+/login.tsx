@@ -219,7 +219,9 @@ export async function action({ request }: ActionFunctionArgs) {
       logAuthEvent("login_failed", {
         actor: email,
         ip,
-        reason: "magic link send failed"
+        reason: "magic link send failed",
+        errorCode: magicLink.error.code,
+        errorMessage: magicLink.error.message
       });
       const message = getMagicLinkErrorMessage(magicLink.error);
       return data(

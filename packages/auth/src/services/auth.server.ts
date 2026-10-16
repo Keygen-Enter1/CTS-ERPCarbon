@@ -492,12 +492,32 @@ export {
   verifyBotProtection
 } from "./bot-protection.server";
 
-export function getMagicLinkErrorMessage(error: { code?: string }): string {
+export function getMagicLinkErrorMessage(error: {
+  code?: string;
+  message?: string;
+}): string {
+  const msg = error.message?.toLowerCase() ?? "";
   switch (error.code) {
     case "over_email_send_rate_limit":
     case "over_request_rate_limit":
       return "Too many sign-in attempts. Please try again later.";
+    case "email_address_invalid":
+      return "Invalid email address.";
     default:
+      if (msg.includes("redirect") && msg.includes("allow")) {
+        return "Sign-in redirect URL is not allowed. The MES/ERP callback URL must be in GoTrue URI allow list.";
+      }
+      if (
+        msg.includes("smtp") ||
+        msg.includes("mail") ||
+        msg.includes("535") ||
+        msg.includes("credentials")
+      ) {
+        return "Failed to send sign-in email. Check GoTrue SMTP (secrets/smtp_password and GOTRUE_SMTP_*).";
+      }
+      if (msg.includes("template") || msg.includes("mailer")) {
+        return "Failed to load the magic-link email template. Ensure GoTrue can reach http://erp:3000/templates/magic-link.html.";
+      }
       return "Failed to send magic link";
   }
 }
