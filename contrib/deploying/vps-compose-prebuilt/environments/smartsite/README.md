@@ -54,7 +54,7 @@ cp environments/smartsite/env.template .env
 # Edit .env: CARBON_REPO=/opt/carbon, CARBON_IMAGE_* from build output
 
 bash ./init-secrets.sh
-# Edit secrets/smtp_password; set real SMTP in .env if using email auth
+# Gmail: copy env.template SMTP vars into .env; put the App Password in secrets/smtp_password (never commit it)
 
 chmod +x environments/smartsite/deploy-smartsite.sh init-secrets.sh
 bash ./environments/smartsite/deploy-smartsite.sh

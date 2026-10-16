@@ -46,7 +46,10 @@ for name in session_secret inngest_signing_key inngest_event_key; do
 done
 
 [ -f "$SECRETS/resend_api_key" ] || : >"$SECRETS/resend_api_key"
-[ -f "$SECRETS/smtp_password" ] || printf 'change_me' >"$SECRETS/smtp_password"
+if [ ! -f "$SECRETS/smtp_password" ]; then
+  printf 'change_me' >"$SECRETS/smtp_password"
+  echo "Set secrets/smtp_password to your SMTP app password (e.g. Gmail App Password)"
+fi
 [ -f "$SECRETS/saml_private_key" ] || printf 'change_me' >"$SECRETS/saml_private_key"
 
 chmod 600 "$SECRETS"/* 2>/dev/null || true
