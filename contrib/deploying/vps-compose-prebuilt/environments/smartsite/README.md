@@ -37,6 +37,8 @@ If the message is *“For your security, sign-in for this account is temporarily
 
 **MES only, with `?redirectTo=` on login:** GoTrue must allow `${MES_URL}/**` in `GOTRUE_URI_ALLOW_LIST` (not just `/callback`). After `git pull`, recreate **gotrue**. Quick test: open `http://mescarbon…:30001/login` without query params.
 
+**Magic-link email shows ERP URL after MES login:** The GoTrue HTML template must use `{{ .ConfirmationURL }}` (includes the app’s `emailRedirectTo`, e.g. MES `/callback`), not `{{ .SiteURL }}/magic-link` (`GOTRUE_SITE_URL` is always ERP). Template lives in `apps/erp/public/templates/magic-link.html` (fetched by GoTrue from `http://erp:3000/templates/…`). Recreate **gotrue** after updating the repo on the server; request a **new** magic link.
+
 After changing `.env` or `git pull` (compose updates), recreate app containers:
 
 ```bash
