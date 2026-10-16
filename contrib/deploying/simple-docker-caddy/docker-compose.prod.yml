@@ -321,6 +321,8 @@ services:
     # PostgREST's image is FROM scratch (no shell), so it can't run the
     # secrets-entrypoint shim the other services use. Instead it reads each value
     # straight from its secret file via PostgREST's native @file syntax.
+    # Non-root USER cannot read Compose file secrets (0600) — run as root.
+    user: "0:0"
     networks: [internal]
     secrets:
       - postgrest_db_uri
