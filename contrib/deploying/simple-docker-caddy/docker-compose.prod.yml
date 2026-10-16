@@ -256,6 +256,9 @@ services:
 
   gotrue:
     image: supabase/gotrue:v2.189.0
+    # GoTrue image USER is non-root; Compose file secrets mount as root-only (0600).
+    # carbon-secrets-entrypoint must read /run/secrets before exec — run as root.
+    user: "0:0"
     entrypoint: ["/usr/local/bin/carbon-secrets-entrypoint.sh"]
     command: ["auth"]
     networks: [internal]
