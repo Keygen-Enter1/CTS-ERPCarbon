@@ -7,6 +7,7 @@ import {
   ApiKeyNotFoundError,
   checkApiKeyRateLimit
 } from "@carbon/database/ratelimit";
+import { getAppUrl } from "@carbon/env";
 import { redis } from "@carbon/kv";
 import { getLogger } from "@carbon/logger";
 import { oncePerRequest } from "@carbon/logger/middleware.server";
@@ -22,8 +23,7 @@ import {
   IS_LOCAL_DEV,
   REFRESH_ACCESS_TOKEN_THRESHOLD,
   STRIPE_BYPASS_COMPANY_IDS,
-  SUPABASE_ANON_KEY,
-  VERCEL_URL
+  SUPABASE_ANON_KEY
 } from "../config/env";
 import { getCarbon } from "../lib/supabase";
 import { getCarbonAPIKeyClient, getCarbonClient } from "../lib/supabase/client";
@@ -461,26 +461,25 @@ export async function sendInviteByEmail(
   data?: Record<string, unknown>
 ) {
   return getCarbonServiceRole().auth.admin.inviteUserByEmail(email, {
-    redirectTo: `${VERCEL_URL}/callback`,
+    redirectTo: `${getAppUrl()}/callback`,
     data
   });
 }
 
 export async function sendMagicLink(
   email: string,
-  // The app's own origin. VERCEL_URL is only correct for the app it was set
-  // for — in local dev crbn writes the ERP url (or a localhost fallback) into
-  // .env.local, so an MES started outside `crbn up` would send its first-login
-  // magic link back to the wrong origin. MES passes getMESUrl().
+  // The app's own origin. Self-hosted Docker sets ERP_URL/MES_URL, not APP_URL;
+  // getAppUrl()/getMESUrl() resolve those in production. MES passes getMESUrl().
   origin?: string,
   // Where the user was headed before they were sent to log in.
   redirectTo?: string
 ) {
   const destination = safePath(redirectTo, "");
+  const appOrigin = origin ?? getAppUrl();
   return getCarbonServiceRole().auth.signInWithOtp({
     email,
     options: {
-      emailRedirectTo: `${origin ?? VERCEL_URL}/callback${
+      emailRedirectTo: `${appOrigin}/callback${
         destination ? `?redirectTo=${encodeURIComponent(destination)}` : ""
       }`
     }
@@ -643,7 +642,7 @@ export async function signInWithPasskey(
     await serviceRole.auth.admin.generateLink({
       type: "magiclink",
       email,
-      options: { redirectTo: VERCEL_URL }
+      options: { redirectTo: getAppUrl() }
     });
 
   if (linkError || !linkData.properties?.hashed_token) return null;

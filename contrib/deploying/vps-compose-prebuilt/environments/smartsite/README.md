@@ -33,6 +33,8 @@ docker compose -f docker-compose.smartsite.yml exec redis redis-cli --scan --pat
 
 If the message is *“For your security, sign-in for this account is temporarily paused”*, that is per-email lockout — scan `@carbon/lockout:*` the same way.
 
+**“Failed to send magic link”** (login for an **existing** user on ERP/MES): email is sent by **GoTrue**, not ERP nodemailer. Fix Gmail in `secrets/smtp_password` + `GOTRUE_SMTP_*`, then `docker compose … up -d --force-recreate gotrue erp mes`. Check `docker compose … logs gotrue --tail 80` for SMTP or template errors.
+
 After changing `.env` or `git pull` (compose updates), recreate app containers:
 
 ```bash

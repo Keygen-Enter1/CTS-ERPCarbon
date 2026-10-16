@@ -34,11 +34,12 @@ services:
       CARBON_EDITION: ${CARBON_EDITION:-community}
       AUTH_PROVIDERS: ${AUTH_PROVIDERS:-email,google,azure}
       DOMAIN: ${DOMAIN}
+      APP_URL: ${ERP_URL}
       ERP_URL: ${ERP_URL}
       MES_URL: ${MES_URL}
       SUPABASE_URL: ${SUPABASE_URL}
       # Browser uses SUPABASE_URL; server-side Supabase client uses INTERNAL (Docker DNS).
-      SUPABASE_INTERNAL_URL: http://kong:8000
+      SUPABASE_INTERNAL_URL: ${SUPABASE_INTERNAL_URL:-http://kong:8000}
       SUPABASE_ANON_KEY: __ANON_KEY__
       SUPABASE_SERVICE_ROLE_KEY: __SERVICE_ROLE_KEY__
       SUPABASE_JWT_SECRET: __JWT_SECRET__
@@ -86,16 +87,17 @@ services:
       CARBON_EDITION: ${CARBON_EDITION:-community}
       AUTH_PROVIDERS: ${AUTH_PROVIDERS:-email,google,azure}
       DOMAIN: ${DOMAIN}
+      APP_URL: ${MES_URL}
       ERP_URL: ${ERP_URL}
       MES_URL: ${MES_URL}
       SUPABASE_URL: ${SUPABASE_URL}
-      SUPABASE_INTERNAL_URL: http://kong:8000
+      SUPABASE_INTERNAL_URL: ${SUPABASE_INTERNAL_URL:-http://kong:8000}
       SUPABASE_ANON_KEY: __ANON_KEY__
       SUPABASE_SERVICE_ROLE_KEY: __SERVICE_ROLE_KEY__
       SUPABASE_JWT_SECRET: __JWT_SECRET__
       SUPABASE_DB_URL: postgresql://postgres:__POSTGRES_PASSWORD__@postgres:5432/postgres?sslmode=disable
       REDIS_URL: redis://redis:6379
-      RATE_LIMIT: ${RATE_LIMIT:-5}
+      RATE_LIMIT: ${RATE_LIMIT:-10}
       SESSION_SECRET: __SESSION_SECRET__
       INNGEST_SIGNING_KEY: __INNGEST_SIGNING_KEY__
       INNGEST_EVENT_KEY: __INNGEST_EVENT_KEY__
@@ -250,8 +252,10 @@ services:
       # readable via `docker inspect`. Placeholder until SAML is enabled; set it
       # with `deploy.sh secret saml_private_key "$(base64 -w0 < key.der)"`.
       GOTRUE_SAML_PRIVATE_KEY: __SAML_PRIVATE_KEY__
-      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: ${ERP_URL}/templates/magic-link.html
-      GOTRUE_MAILER_TEMPLATES_INVITE: ${ERP_URL}/templates/invite.html
+      # GoTrue runs inside Docker — fetch templates from ERP on the internal network
+      # (public ERP_URL often hairpins and breaks magic-link / invite emails).
+      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: http://erp:3000/templates/magic-link.html
+      GOTRUE_MAILER_TEMPLATES_INVITE: http://erp:3000/templates/invite.html
       GOTRUE_MFA_TOTP_ENROLL_ENABLED: "true"
       GOTRUE_MFA_TOTP_VERIFY_ENABLED: "true"
       GOTRUE_MFA_MAX_ENROLLED_FACTORS: 10
