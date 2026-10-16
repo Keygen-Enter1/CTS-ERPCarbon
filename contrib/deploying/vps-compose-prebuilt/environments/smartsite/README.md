@@ -22,6 +22,16 @@ Set `ERP_URL`, `MES_URL`, `SUPABASE_URL` in `.env` to those URLs (see `env.templ
 | `GOTRUE_DISABLE_SIGNUP` | `false` until the first admin exists, then `true` |
 | `GOTRUE_SMTP_*` | Gmail (or other SMTP); password only in `secrets/smtp_password` |
 | `INNGEST_*` | As in `env.template` (Inngest on Docker network) |
+| `RATE_LIMIT` | e.g. `30` on self-host (default **5**/hour/IP on login & verify) |
+
+**“Authentication Error — Rate limit exceeded”** — Carbon’s IP limit (Redis), not Postgres. Wait up to 1 hour, or reset counters:
+
+```bash
+docker compose -f docker-compose.smartsite.yml exec redis redis-cli --scan --pattern '@carbon/ratelimit:*' \
+  | xargs -r docker compose -f docker-compose.smartsite.yml exec -T redis redis-cli DEL
+```
+
+If the message is *“For your security, sign-in for this account is temporarily paused”*, that is per-email lockout — scan `@carbon/lockout:*` the same way.
 
 After changing `.env` or `git pull` (compose updates), recreate app containers:
 

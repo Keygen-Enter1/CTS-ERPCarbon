@@ -44,6 +44,7 @@ services:
       SUPABASE_JWT_SECRET: __JWT_SECRET__
       SUPABASE_DB_URL: postgresql://postgres:__POSTGRES_PASSWORD__@postgres:5432/postgres?sslmode=disable
       REDIS_URL: redis://redis:6379
+      RATE_LIMIT: ${RATE_LIMIT:-10}
       SESSION_SECRET: __SESSION_SECRET__
       INNGEST_SIGNING_KEY: __INNGEST_SIGNING_KEY__
       INNGEST_EVENT_KEY: __INNGEST_EVENT_KEY__
@@ -94,6 +95,7 @@ services:
       SUPABASE_JWT_SECRET: __JWT_SECRET__
       SUPABASE_DB_URL: postgresql://postgres:__POSTGRES_PASSWORD__@postgres:5432/postgres?sslmode=disable
       REDIS_URL: redis://redis:6379
+      RATE_LIMIT: ${RATE_LIMIT:-5}
       SESSION_SECRET: __SESSION_SECRET__
       INNGEST_SIGNING_KEY: __INNGEST_SIGNING_KEY__
       INNGEST_EVENT_KEY: __INNGEST_EVENT_KEY__
