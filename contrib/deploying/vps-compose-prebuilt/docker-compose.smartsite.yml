@@ -6,3 +6,4 @@
 include:
   - docker-compose.yml
   - docker-compose.publish-30xxx.yml
+  - docker-compose.supabase-internal.yml

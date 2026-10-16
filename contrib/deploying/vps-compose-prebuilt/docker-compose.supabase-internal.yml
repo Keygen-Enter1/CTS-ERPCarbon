@@ -1,0 +1,10 @@
+# Ensures erp/mes use Kong on the Docker network (required when apicarbon:30003
+# is unreachable from inside containers). Redundant if docker-compose.yml already
+# sets SUPABASE_INTERNAL_URL — safe to include twice with the same value.
+services:
+  erp:
+    environment:
+      SUPABASE_INTERNAL_URL: http://kong:8000
+  mes:
+    environment:
+      SUPABASE_INTERNAL_URL: http://kong:8000

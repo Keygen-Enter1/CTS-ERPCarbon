@@ -12,6 +12,25 @@ Production layout: **prebuilt Docker images**, **30xxx ports** on localhost, **T
 
 Set `ERP_URL`, `MES_URL`, `SUPABASE_URL` in `.env` to those URLs (see `env.template`). TLS/nginx on :443 is optional.
 
+**`.env` checklist (HTTP on 30xxx)**
+
+| Variable | Value |
+|----------|--------|
+| `CARBON_REPO` | Full git checkout on the VPS, e.g. `/home/abinh/CTS-ERPCarbon` |
+| `ERP_URL` / `MES_URL` / `SUPABASE_URL` | `http://…smartsite.vn:30000` / `:30001` / `:30003` |
+| `DOMAIN` | **Empty** until you serve ERP over HTTPS (avoids Secure cookies on plain HTTP) |
+| `GOTRUE_DISABLE_SIGNUP` | `false` until the first admin exists, then `true` |
+| `GOTRUE_SMTP_*` | Gmail (or other SMTP); password only in `secrets/smtp_password` |
+| `INNGEST_*` | As in `env.template` (Inngest on Docker network) |
+
+After changing `.env` or `git pull` (compose updates), recreate app containers:
+
+```bash
+docker compose -f docker-compose.smartsite.yml up -d --force-recreate erp mes gotrue postgrest
+docker compose -f docker-compose.smartsite.yml exec erp sh -c 'echo INTERNAL=$SUPABASE_INTERNAL_URL PUBLIC=$SUPABASE_URL'
+# Expect: INTERNAL=http://kong:8000
+```
+
 Internal only (do **not** expose on firewall): Postgres, Redis, Inngest, etc.
 
 ## DNS
