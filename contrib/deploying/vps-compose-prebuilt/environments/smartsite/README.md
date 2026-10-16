@@ -4,13 +4,15 @@ Production layout: **prebuilt Docker images**, **30xxx ports** on localhost, **T
 
 ## Domains & ports
 
-| Service | Public URL | Upstream (host) |
-|---------|------------|-----------------|
-| ERP | https://erpcarbon.smartsite.vn | `127.0.0.1:30000` |
-| MES | https://mescarbon.smartsite.vn | `127.0.0.1:30001` |
-| API | https://apicarbon.smartsite.vn | `127.0.0.1:30003` |
+| Service | Public URL | Firewall |
+|---------|------------|----------|
+| ERP | **http://erpcarbon.smartsite.vn:30000/** | TCP **30000** |
+| MES | **http://mescarbon.smartsite.vn:30001/** | TCP **30001** |
+| API (Kong) | **http://apicarbon.smartsite.vn:30003/** | TCP **30003** |
 
-Internal only (do **not** expose on firewall): Postgres `30002`, Redis, Inngest, etc.
+Set `ERP_URL`, `MES_URL`, `SUPABASE_URL` in `.env` to those URLs (see `env.template`). TLS/nginx on :443 is optional.
+
+Internal only (do **not** expose on firewall): Postgres, Redis, Inngest, etc.
 
 ## DNS
 
@@ -59,12 +61,12 @@ bash ./environments/smartsite/deploy-smartsite.sh
 # (Do not use `sh script.sh` — use bash or ./script after chmod +x)
 ```
 
-## 3. Nginx (or existing edge proxy)
+## 3. Nginx (optional)
 
-Copy/adapt `nginx-carbon.conf` into your nginx on the same VPS. Issue TLS certs for the three hostnames (certbot, etc.). Reload nginx.
+Default access is **HTTP on ports 30000–30003** (no nginx required). For HTTPS on :443, copy/adapt `nginx-carbon.conf` and proxy to the same host ports.
 
 OAuth providers (Google/Azure): redirect URI  
-`https://apicarbon.smartsite.vn/auth/v1/callback`
+`http://apicarbon.smartsite.vn:30003/auth/v1/callback`
 
 ## 4. Updates
 
@@ -84,6 +86,6 @@ cd contrib/deploying/vps-compose-prebuilt
 | File | Purpose |
 |------|---------|
 | `env.template` | Production `.env` template |
-| `nginx-carbon.conf` | Proxy to 30000 / 30001 / 30003 |
+| `nginx-carbon.conf` | Optional TLS proxy to 30xxx |
 | `deploy-smartsite.sh` | `compose.smartsite.yml` + migrate |
 | `../../docker-compose.smartsite.yml` | Base stack + 30xxx publish |

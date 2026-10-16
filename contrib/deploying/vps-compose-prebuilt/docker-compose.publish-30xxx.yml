@@ -4,21 +4,26 @@
 #   docker compose -f docker-compose.yml -f docker-compose.publish-30xxx.yml up -d
 #   docker compose -f docker-compose.yml -f docker-compose.publish-30xxx.yml --scale caddy=0 up -d
 #
-# Bind to 127.0.0.1 so only the host's nginx/Caddy/Traefik can reach the apps.
-# Change to "30000:3000" if you must hit ERP directly on the public IP (not recommended).
+# Public HTTP on 30xxx (set ERP_URL / MES_URL / SUPABASE_URL in .env; open firewall 30000–30003).
+#
+#   http://erpcarbon.smartsite.vn:30000/
+#   http://mescarbon.smartsite.vn:30001/
+#   http://apicarbon.smartsite.vn:30003/
+#
+# For nginx-only on 127.0.0.1, bind "127.0.0.1:HOST:container" instead.
 
 services:
   erp:
     ports:
-      - "127.0.0.1:30000:3000"
+      - "30000:3000"
 
   mes:
     ports:
-      - "127.0.0.1:30001:3000"
+      - "30001:3000"
 
   kong:
     ports:
-      - "127.0.0.1:30003:8000"
+      - "30003:8000"
 
   # Optional — only if you expose Studio; keep off the public internet.
   # studio:

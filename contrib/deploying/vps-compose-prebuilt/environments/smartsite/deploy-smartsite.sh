@@ -90,11 +90,11 @@ cat <<EOF
 
 Carbon (SmartSite) is up.
 
-  ERP  https://erpcarbon.smartsite.vn  → 127.0.0.1:30000
-  MES  https://mescarbon.smartsite.vn  → 127.0.0.1:30001
-  API  https://apicarbon.smartsite.vn  → 127.0.0.1:30003
+  ERP  http://erpcarbon.smartsite.vn:30000
+  MES  http://mescarbon.smartsite.vn:30001
+  API  http://apicarbon.smartsite.vn:30003
 
-Ensure nginx (or your edge proxy) matches environments/smartsite/nginx-carbon.conf
-and DNS A records for the three hostnames point at this server.
+Set ERP_URL / MES_URL / SUPABASE_URL in .env to match. Open firewall TCP 30000–30003.
+DNS A records for the three hostnames → this server.
 
 EOF
