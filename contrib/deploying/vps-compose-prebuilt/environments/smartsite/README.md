@@ -35,6 +35,8 @@ If the message is *“For your security, sign-in for this account is temporarily
 
 **“Failed to send magic link”** (login for an **existing** user on ERP/MES): email is sent by **GoTrue**, not ERP nodemailer. Fix Gmail in `secrets/smtp_password` + `GOTRUE_SMTP_*`, then `docker compose … up -d --force-recreate gotrue erp mes`. Check `docker compose … logs gotrue --tail 80` for SMTP or template errors.
 
+**MES only, with `?redirectTo=` on login:** GoTrue must allow `${MES_URL}/**` in `GOTRUE_URI_ALLOW_LIST` (not just `/callback`). After `git pull`, recreate **gotrue**. Quick test: open `http://mescarbon…:30001/login` without query params.
+
 After changing `.env` or `git pull` (compose updates), recreate app containers:
 
 ```bash
